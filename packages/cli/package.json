@@ -1,0 +1,24 @@
+{
+  "name": "drost",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "drost": "dist/bin.js"
+  },
+  "main": "dist/bin.js",
+  "types": "dist/bin.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/bin.ts"
+  },
+  "dependencies": {
+    "@drost/core": "workspace:*",
+    "@drost/tui": "workspace:*",
+    "ink": "^6.8.0",
+    "react": "^19.2.4",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,167 @@
+import type { ProviderAdapter, ProviderProfile } from "./providers/types.js";
+import type { ShellToolPolicy, ToolDefinition } from "./tools.js";
+import type { ChatMessage } from "./types.js";
+import type {
+  AgentAfterTurnResult,
+  AgentBeforeTurnResult,
+  AgentDefinition,
+  AgentLifecycleContext
+} from "./agent.js";
+
+export interface ProviderRuntimeConfig {
+  profiles: ProviderProfile[];
+  adapters?: ProviderAdapter[];
+  defaultSessionProvider: string;
+  startupProbe?: {
+    enabled?: boolean;
+    timeoutMs?: number;
+  };
+}
+
+export interface GatewayHooks {
+  onStart?: () => Promise<void> | void;
+  onRestart?: () => Promise<void> | void;
+  onShutdown?: () => Promise<void> | void;
+}
+
+export type GatewayRestartIntent = "manual" | "self_mod" | "config_change" | "signal";
+
+export interface GatewayRestartRequestContext {
+  intent: GatewayRestartIntent;
+  reason?: string;
+  sessionId?: string;
+  providerId?: string;
+  dryRun: boolean;
+  timestamp: string;
+}
+
+export interface GatewayRestartApprovalDecision {
+  approved: boolean;
+  reason?: string;
+}
+
+export interface GatewayRestartBudgetConfig {
+  enabled?: boolean;
+  maxRestarts?: number;
+  windowMs?: number;
+  intents?: GatewayRestartIntent[];
+}
+
+export interface GatewayGitCheckpointResult {
+  ok: boolean;
+  message: string;
+}
+
+export interface GatewayGitSafetyConfig {
+  enabled?: boolean;
+  strict?: boolean;
+  checkpointMessage?: string;
+  checkpoint?: (
+    request: GatewayRestartRequestContext
+  ) => Promise<GatewayGitCheckpointResult> | GatewayGitCheckpointResult;
+}
+
+export interface GatewayRestartPolicyConfig {
+  requireApprovalForSelfModify?: boolean;
+  approval?: (
+    request: GatewayRestartRequestContext
+  ) => Promise<GatewayRestartApprovalDecision> | GatewayRestartApprovalDecision;
+  budget?: GatewayRestartBudgetConfig;
+  gitSafety?: GatewayGitSafetyConfig;
+  sandboxScope?: "tools" | "prompts" | "config" | "full";
+}
+
+export interface GatewayHealthConfig {
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  path?: string;
+}
+
+export interface SessionStoreConfig {
+  enabled?: boolean;
+  directory?: string;
+  lock?: {
+    timeoutMs?: number;
+    staleMs?: number;
+  };
+  history?: {
+    enabled?: boolean;
+    maxMessages?: number;
+    maxChars?: number;
+    preserveSystemMessages?: boolean;
+    summarize?: (params: { sessionId?: string; history: ChatMessage[] }) => ChatMessage[];
+  };
+  retention?: {
+    archiveAfterIdleMs?: number;
+  };
+}
+
+export interface GatewayShellConfig extends ShellToolPolicy {}
+
+export interface GatewayConfig {
+  workspaceDir: string;
+  toolDirectory?: string;
+  builtInTools?: ToolDefinition[];
+  authStorePath?: string;
+  runtime?: GatewayRuntimeConfig;
+  agent?: GatewayAgentConfig;
+  evolution?: GatewayEvolutionConfig;
+  sessionStore?: SessionStoreConfig;
+  health?: GatewayHealthConfig;
+  shell?: GatewayShellConfig;
+  providers?: ProviderRuntimeConfig;
+  restartPolicy?: GatewayRestartPolicyConfig;
+  hooks?: GatewayHooks;
+}
+
+export interface GatewayAgentConfig {
+  entry?: string;
+}
+
+export interface GatewayRuntimeConfig {
+  entry?: string;
+}
+
+export interface GatewayEvolutionValidationConfig {
+  commands?: string[];
+}
+
+export interface GatewayEvolutionHealthGateConfig {
+  enabled?: boolean;
+  timeoutMs?: number;
+  path?: string;
+}
+
+export interface GatewayEvolutionConfig {
+  enabled?: boolean;
+  mutableRoots?: string[];
+  validation?: GatewayEvolutionValidationConfig;
+  healthGate?: GatewayEvolutionHealthGateConfig;
+  rollbackOnFailure?: boolean;
+  strictMode?: boolean;
+}
+
+export interface GatewayAgentHooks {
+  onStart?: (context: AgentLifecycleContext) => Promise<void> | void;
+  onStop?: (context: AgentLifecycleContext) => Promise<void> | void;
+  beforeTurn?: (context: {
+    sessionId: string;
+    input: string;
+    providerId?: string;
+    runtime: AgentLifecycleContext;
+  }) => Promise<AgentBeforeTurnResult | void> | AgentBeforeTurnResult | void;
+  afterTurn?: (context: {
+    sessionId: string;
+    input: string;
+    providerId?: string;
+    runtime: AgentLifecycleContext;
+    output: AgentAfterTurnResult;
+  }) => Promise<void> | void;
+}
+
+export type GatewayAgentDefinition = AgentDefinition;
+
+export function defineConfig<T extends GatewayConfig>(config: T): T {
+  return config;
+}

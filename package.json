@@ -1,0 +1,20 @@
+{
+  "name": "drost-monorepo",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "echo 'lint not configured yet'"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.2.14",
+    "tsx": "^4.20.5",
+    "typescript": "^5.8.2",
+    "vitest": "^2.1.9"
+  }
+}
