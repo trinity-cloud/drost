@@ -1,6 +1,7 @@
 import type { ProviderAdapter, ProviderProfile } from "./providers/types.js";
 import type { ShellToolPolicy, ToolDefinition } from "./tools.js";
 import type { ChatMessage } from "./types.js";
+import type { ChannelAdapter } from "./channels.js";
 import type {
   AgentAfterTurnResult,
   AgentBeforeTurnResult,
@@ -103,6 +104,7 @@ export interface GatewayConfig {
   workspaceDir: string;
   toolDirectory?: string;
   builtInTools?: ToolDefinition[];
+  channels?: ChannelAdapter[];
   authStorePath?: string;
   runtime?: GatewayRuntimeConfig;
   agent?: GatewayAgentConfig;

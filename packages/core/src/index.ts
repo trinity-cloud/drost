@@ -26,6 +26,12 @@ export type {
   GatewayAgentDefinition
 } from "./config.js";
 export type {
+  ChannelAdapter,
+  ChannelAdapterContext,
+  ChannelTurnRequest,
+  ChannelTurnResult
+} from "./channels.js";
+export type {
   AgentDefinition,
   AgentHooks,
   AgentLifecycleContext,

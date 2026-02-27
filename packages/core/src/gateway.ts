@@ -16,6 +16,7 @@ import type {
   GatewayRestartRequestContext,
   GatewayGitCheckpointResult
 } from "./config.js";
+import type { ChannelAdapter, ChannelAdapterContext, ChannelTurnRequest, ChannelTurnResult } from "./channels.js";
 import type { AgentDefinition } from "./agent.js";
 import { loadAgentDefinition } from "./agent.js";
 import { loadAuthStore } from "./auth/store.js";
@@ -184,7 +185,10 @@ export type GatewayRuntimeEventType =
   | "evolution.step.completed"
   | "evolution.step.failed"
   | "evolution.completed"
-  | "evolution.failed";
+  | "evolution.failed"
+  | "channel.connected"
+  | "channel.disconnected"
+  | "channel.connection_failed";
 
 export interface GatewayRuntimeEvent {
   type: GatewayRuntimeEventType;
@@ -279,6 +283,7 @@ export class GatewayRuntime {
   private activeEvolutionTransaction: GatewayEvolutionTransactionState | null = null;
   private runtimeEventHandlers = new Set<(event: GatewayRuntimeEvent) => void>();
   private runtimeEvents: GatewayRuntimeEvent[] = [];
+  private channelAdapters = new Map<string, ChannelAdapter>();
 
   readonly workspaceDir: string;
   readonly toolDirectory: string;
@@ -302,6 +307,9 @@ export class GatewayRuntime {
     this.restartHistoryPath = path.resolve(this.workspaceDir, DEFAULT_RESTART_HISTORY_FILE);
     this.sessionStoreEnabled = this.config.sessionStore?.enabled ?? true;
     this.authStore = loadAuthStore(this.authStorePath);
+    for (const adapter of this.config.channels ?? []) {
+      this.registerChannelAdapter(adapter);
+    }
   }
 
   getStatus(): GatewayStatus {
@@ -633,6 +641,54 @@ export class GatewayRuntime {
     };
   }
 
+  private channelContext(): ChannelAdapterContext {
+    return {
+      runTurn: async (request) => await this.runChannelTurn(request)
+    };
+  }
+
+  private async connectChannels(): Promise<void> {
+    if (this.channelAdapters.size === 0) {
+      return;
+    }
+    const context = this.channelContext();
+    for (const adapter of this.channelAdapters.values()) {
+      try {
+        await adapter.connect(context);
+        this.emitRuntimeEvent("channel.connected", {
+          channelId: adapter.id
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.degradedReasons.push(`Channel ${adapter.id} failed to connect: ${message}`);
+        this.emitRuntimeEvent("channel.connection_failed", {
+          channelId: adapter.id,
+          message
+        });
+      }
+    }
+  }
+
+  private async disconnectChannels(): Promise<void> {
+    if (this.channelAdapters.size === 0) {
+      return;
+    }
+    for (const adapter of this.channelAdapters.values()) {
+      if (!adapter.disconnect) {
+        continue;
+      }
+      try {
+        await adapter.disconnect();
+        this.emitRuntimeEvent("channel.disconnected", {
+          channelId: adapter.id
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.degradedReasons.push(`Channel ${adapter.id} failed to disconnect: ${message}`);
+      }
+    }
+  }
+
   private async loadConfiguredAgentDefinition(): Promise<void> {
     this.agentDefinition = null;
     if (!this.agentEntryPath) {
@@ -860,6 +916,8 @@ export class GatewayRuntime {
       }
     }
 
+    await this.connectChannels();
+
     await this.config.hooks?.onStart?.();
 
     this.startedAt = nowIso();
@@ -885,6 +943,7 @@ export class GatewayRuntime {
       state: this.state
     });
     await this.stopHealthServer();
+    await this.disconnectChannels();
     if (this.agentDefinition?.hooks?.onStop) {
       try {
         await this.agentDefinition.hooks.onStop(this.runtimeContext());
@@ -1537,6 +1596,57 @@ export class GatewayRuntime {
       }
       this.persistSessionState(params.sessionId);
     }
+  }
+
+  async runChannelTurn(params: ChannelTurnRequest): Promise<ChannelTurnResult> {
+    const sessionId = this.resolveChannelSession({
+      identity: params.identity,
+      mapping: params.mapping,
+      title: params.title
+    });
+    const onEvent: StreamEventHandler = params.onEvent ?? (() => undefined);
+    await this.runSessionTurn({
+      sessionId,
+      input: params.input,
+      onEvent,
+      signal: params.signal
+    });
+
+    const history = this.getSessionHistory(sessionId);
+    let response = "";
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const message = history[index];
+      if (message?.role === "assistant") {
+        response = message.content;
+        break;
+      }
+    }
+
+    const state = this.getSessionState(sessionId);
+    return {
+      sessionId,
+      providerId: state?.activeProviderId,
+      response
+    };
+  }
+
+  registerChannelAdapter(adapter: ChannelAdapter): void {
+    const channelId = adapter.id.trim();
+    if (!channelId) {
+      throw new Error("Channel adapter id is required");
+    }
+    if (this.channelAdapters.has(channelId)) {
+      throw new Error(`Channel adapter already registered: ${channelId}`);
+    }
+    this.channelAdapters.set(channelId, adapter);
+  }
+
+  unregisterChannelAdapter(channelId: string): boolean {
+    return this.channelAdapters.delete(channelId.trim());
+  }
+
+  listChannelAdapterIds(): string[] {
+    return Array.from(this.channelAdapters.keys()).sort((left, right) => left.localeCompare(right));
   }
 
   listProviderProfiles(): ProviderProfile[] {
