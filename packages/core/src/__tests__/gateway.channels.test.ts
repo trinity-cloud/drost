@@ -145,6 +145,33 @@ describe("gateway channels", () => {
     expect(channel.disconnected).toBe(true);
   });
 
+  it("provides dispatchCommand on channel context and handles /status", async () => {
+    const workspaceDir = makeTempDir();
+    const channel = new FakeChannelAdapter();
+    const gateway = createGateway(makeConfig(workspaceDir, [channel]));
+
+    await gateway.start();
+    try {
+      expect(channel.context).not.toBeNull();
+      expect(typeof channel.context?.dispatchCommand).toBe("function");
+
+      const result = await channel.context!.dispatchCommand!({
+        identity: {
+          channel: "telegram",
+          workspaceId: "wk-1",
+          chatId: "chat-1"
+        },
+        input: "/status"
+      });
+
+      expect(result.handled).toBe(true);
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain("Gateway: running");
+    } finally {
+      await gateway.stop();
+    }
+  });
+
   it("supports dynamic channel registration and duplicate guardrails", async () => {
     const workspaceDir = makeTempDir();
     const gateway = createGateway(makeConfig(workspaceDir));

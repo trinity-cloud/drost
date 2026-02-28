@@ -133,6 +133,87 @@ describe("codex exec adapter", () => {
     expect(deltas.join("")).toBe("hello");
   });
 
+  it("deduplicates snapshot-style response.output_text.delta and item.completed", async () => {
+    const runner = vi.fn(async () => ({
+      stdout: [
+        "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}",
+        "{\"type\":\"response.output_text.delta\",\"item_id\":\"i-1\",\"delta\":\"When debugg\"}",
+        "{\"type\":\"response.output_text.delta\",\"item_id\":\"i-1\",\"delta\":\"When debugging, I usually do four things.\"}",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"i-1\",\"type\":\"agent_message\",\"text\":\"When debugging, I usually do four things.\"}}",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}"
+      ].join("\n"),
+      stderr: ""
+    }));
+    const adapter = new CodexExecAdapter(runner);
+
+    const deltas: string[] = [];
+    let completedText = "";
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Say one line",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      resolveBearerToken: () => null,
+      emit: (event) => {
+        if (event.type === "response.delta") {
+          deltas.push(event.payload.text ?? "");
+        }
+        if (event.type === "response.completed") {
+          completedText = event.payload.text ?? "";
+        }
+      }
+    });
+
+    expect(deltas.join("")).toBe("When debugging, I usually do four things.");
+    expect(completedText).toBe("When debugging, I usually do four things.");
+  });
+
+  it("deduplicates item.completed when prior response.output_text.delta has no item_id", async () => {
+    const runner = vi.fn(async () => ({
+      stdout: [
+        "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}",
+        "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+        "{\"type\":\"item.completed\",\"item\":{\"id\":\"i-2\",\"type\":\"agent_message\",\"text\":\"hello\"}}",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4}}"
+      ].join("\n"),
+      stderr: ""
+    }));
+    const adapter = new CodexExecAdapter(runner);
+
+    const deltas: string[] = [];
+    let completedText = "";
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Say hello",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      resolveBearerToken: () => null,
+      emit: (event) => {
+        if (event.type === "response.delta") {
+          deltas.push(event.payload.text ?? "");
+        }
+        if (event.type === "response.completed") {
+          completedText = event.payload.text ?? "";
+        }
+      }
+    });
+
+    expect(deltas.join("")).toBe("hello");
+    expect(completedText).toBe("hello");
+  });
+
   it("fails fast and emits provider.error when codex exec fails", async () => {
     const runner = vi.fn(async () => {
       throw new Error("codex exec failed");

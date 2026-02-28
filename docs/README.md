@@ -12,6 +12,7 @@ This folder contains operator and developer documentation for Drost.
 - [Architecture](architecture.md)
 - [Configuration](configuration.md)
 - [Auth & Providers](auth-and-providers.md)
+- [Telegram Channel Setup](telegram.md)
 - [Runtime Operations](runtime-operations.md)
 - [Self-Evolution](self-evolution.md)
 

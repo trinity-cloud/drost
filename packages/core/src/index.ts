@@ -28,9 +28,12 @@ export type {
 export type {
   ChannelAdapter,
   ChannelAdapterContext,
+  ChannelCommandRequest,
+  ChannelCommandResult,
   ChannelTurnRequest,
   ChannelTurnResult
 } from "./channels.js";
+export { isChannelCommand } from "./channel-commands.js";
 export type {
   AgentDefinition,
   AgentHooks,

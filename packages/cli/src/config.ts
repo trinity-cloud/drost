@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { GatewayConfig } from "@drost/core";
+import { parse as parseDotEnv } from "dotenv";
 import { importTypeScriptModule, unwrapModuleDefault } from "./module-loader.js";
 
 export interface LoadedCliConfig {
@@ -34,6 +35,29 @@ function resolveMaybePathList(projectRoot: string, filePaths: string[] | undefin
     return undefined;
   }
   return filePaths.map((entry) => resolveMaybePath(projectRoot, entry) ?? entry);
+}
+
+function loadProjectEnvFiles(projectRoot: string): void {
+  // Keep explicit shell/CI env vars authoritative over local files.
+  const shellDefined = new Set(Object.keys(process.env));
+  const merged: Record<string, string> = {};
+  for (const candidate of [".env", ".env.local"]) {
+    const filePath = path.join(projectRoot, candidate);
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      continue;
+    }
+    const parsed = parseDotEnv(fs.readFileSync(filePath, "utf8"));
+    for (const [key, value] of Object.entries(parsed)) {
+      merged[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(merged)) {
+    if (shellDefined.has(key)) {
+      continue;
+    }
+    process.env[key] = value;
+  }
 }
 
 async function readConfigFile(configPath: string): Promise<GatewayConfig> {
@@ -104,6 +128,7 @@ function normalizeConfig(projectRoot: string, config: GatewayConfig): GatewayCon
 
 export async function loadCliConfig(projectRoot = process.cwd()): Promise<LoadedCliConfig> {
   const resolvedRoot = path.resolve(projectRoot);
+  loadProjectEnvFiles(resolvedRoot);
   let configPath: string | null = null;
   for (const candidate of CONFIG_CANDIDATES) {
     const absolute = path.join(resolvedRoot, candidate);

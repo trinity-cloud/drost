@@ -203,6 +203,35 @@ function safeJson(value: unknown): string {
   }
 }
 
+function mergeStreamText(existing: string, incoming: string): string {
+  if (incoming.length === 0) {
+    return existing;
+  }
+  if (existing.length === 0) {
+    return incoming;
+  }
+  if (incoming === existing) {
+    return existing;
+  }
+  if (incoming.startsWith(existing)) {
+    // Snapshot-style provider chunk with the full text-so-far.
+    return incoming;
+  }
+  if (existing.startsWith(incoming) || existing.endsWith(incoming)) {
+    // Duplicate or stale chunk.
+    return existing;
+  }
+
+  const maxOverlap = Math.min(existing.length, incoming.length);
+  for (let overlap = maxOverlap; overlap >= 4; overlap -= 1) {
+    if (existing.slice(existing.length - overlap) === incoming.slice(0, overlap)) {
+      return existing + incoming.slice(overlap);
+    }
+  }
+
+  return existing + incoming;
+}
+
 interface ToolRunResult {
   ok: boolean;
   output?: unknown;
@@ -466,7 +495,7 @@ export class ProviderManager {
         let assistantBuffer = "";
         const onEvent: StreamEventHandler = (event) => {
           if (event.type === "response.delta" && typeof event.payload.text === "string") {
-            assistantBuffer += event.payload.text;
+            assistantBuffer = mergeStreamText(assistantBuffer, event.payload.text);
           }
           params.onEvent(event);
         };

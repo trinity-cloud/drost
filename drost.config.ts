@@ -1,3 +1,7 @@
+import { createTelegramChannel } from "./packages/channel-telegram/src/index.ts";
+
+const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+
 export default {
   workspaceDir: ".",
   evolution: {
@@ -64,5 +68,15 @@ export default {
         authProfileId: "openai-compatible:local"
       }
     ]
-  }
+  },
+  channels: telegramToken
+    ? [
+        createTelegramChannel({
+          token: telegramToken,
+          workspaceId: process.env.TELEGRAM_WORKSPACE_ID || "main",
+          pollIntervalMs: Number.parseInt(process.env.TELEGRAM_POLL_INTERVAL_MS || "1000", 10),
+          apiBaseUrl: process.env.TELEGRAM_API_BASE_URL
+        })
+      ]
+    : []
 };

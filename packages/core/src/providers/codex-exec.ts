@@ -141,7 +141,13 @@ function extractAssistantDelta(record: Record<string, unknown>): { text: string;
   if (eventType === "response.output_text.delta") {
     const text = extractDeltaText(record.delta);
     if (text) {
-      return { text };
+      const itemId =
+        typeof record.item_id === "string"
+          ? record.item_id
+          : typeof record.itemId === "string"
+            ? record.itemId
+            : undefined;
+      return { text, itemId };
     }
     return null;
   }
@@ -169,6 +175,33 @@ function extractAssistantDelta(record: Record<string, unknown>): { text: string;
     text,
     itemId
   };
+}
+
+function mergeStreamText(existing: string, incoming: string): string {
+  if (incoming.length === 0) {
+    return existing;
+  }
+  if (existing.length === 0) {
+    return incoming;
+  }
+  if (incoming === existing) {
+    return existing;
+  }
+  if (incoming.startsWith(existing)) {
+    // Snapshot-style chunk with full text-so-far.
+    return incoming;
+  }
+  if (existing.startsWith(incoming) || existing.endsWith(incoming)) {
+    // Duplicate/stale chunk.
+    return existing;
+  }
+  const maxOverlap = Math.min(existing.length, incoming.length);
+  for (let overlap = maxOverlap; overlap >= 4; overlap -= 1) {
+    if (existing.slice(existing.length - overlap) === incoming.slice(0, overlap)) {
+      return existing + incoming.slice(overlap);
+    }
+  }
+  return existing + incoming;
 }
 
 interface CommandResult {
@@ -396,7 +429,6 @@ export class CodexExecAdapter implements ProviderAdapter {
       if (text.length === 0) {
         return;
       }
-      responseText += text;
       request.emit({
         type: "response.delta",
         sessionId: request.sessionId,
@@ -406,6 +438,22 @@ export class CodexExecAdapter implements ProviderAdapter {
           text
         }
       });
+    };
+
+    const ingestAssistantText = (incoming: string): void => {
+      const nextText = mergeStreamText(responseText, incoming);
+      if (nextText === responseText) {
+        return;
+      }
+      const delta = nextText.startsWith(responseText)
+        ? nextText.slice(responseText.length)
+        : incoming;
+      if (delta.length === 0) {
+        responseText = nextText;
+        return;
+      }
+      emitResponseDelta(delta);
+      responseText = nextText;
     };
 
     const processEventLine = (line: string): void => {
@@ -425,7 +473,7 @@ export class CodexExecAdapter implements ProviderAdapter {
         if (assistantDelta.itemId) {
           streamedItemIds.add(assistantDelta.itemId);
         }
-        emitResponseDelta(assistantDelta.text);
+        ingestAssistantText(assistantDelta.text);
         return;
       }
 
@@ -449,8 +497,7 @@ export class CodexExecAdapter implements ProviderAdapter {
         if (itemId) {
           streamedItemIds.add(itemId);
         }
-        const chunk = responseText.length > 0 ? `\n${text}` : text;
-        emitResponseDelta(chunk);
+        ingestAssistantText(text);
       }
     };
 

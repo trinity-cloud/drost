@@ -1,5 +1,8 @@
 import type { StreamEventHandler } from "./events.js";
 import type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
+import type { ChannelCommandResult } from "./channel-commands.js";
+
+export type { ChannelCommandResult } from "./channel-commands.js";
 
 export interface ChannelTurnRequest {
   identity: ChannelSessionIdentity;
@@ -16,8 +19,15 @@ export interface ChannelTurnResult {
   response: string;
 }
 
+export interface ChannelCommandRequest {
+  identity: ChannelSessionIdentity;
+  input: string;
+  mapping?: ChannelSessionMappingOptions;
+}
+
 export interface ChannelAdapterContext {
   runTurn: (request: ChannelTurnRequest) => Promise<ChannelTurnResult>;
+  dispatchCommand?: (request: ChannelCommandRequest) => Promise<ChannelCommandResult>;
 }
 
 export interface ChannelAdapter {

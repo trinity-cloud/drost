@@ -131,6 +131,49 @@ class PrefixedToolCallAdapter implements ProviderAdapter {
   }
 }
 
+class SnapshotDeltaAdapter implements ProviderAdapter {
+  readonly id = "snapshot-delta";
+
+  async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
+    return {
+      providerId: profile.id,
+      ok: true,
+      code: "ok",
+      message: "ok"
+    };
+  }
+
+  async runTurn(request: ProviderTurnRequest): Promise<void> {
+    request.emit({
+      type: "response.delta",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "When debugg"
+      }
+    });
+    request.emit({
+      type: "response.delta",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "When debugging, I usually do four things."
+      }
+    });
+    request.emit({
+      type: "response.completed",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "When debugging, I usually do four things."
+      }
+    });
+  }
+}
+
 function authStore(): AuthStore {
   return {
     version: 1,
@@ -311,5 +354,27 @@ describe("provider tool loop", () => {
         }
       }
     ]);
+  });
+
+  it("deduplicates snapshot-style provider deltas in stored assistant history", async () => {
+    const adapter = new SnapshotDeltaAdapter();
+    const manager = new ProviderManager({
+      profiles: [profile("snapshot-delta")],
+      adapters: [adapter]
+    });
+    manager.ensureSession("s-1", "provider");
+
+    await manager.runTurn({
+      sessionId: "s-1",
+      input: "test snapshots",
+      authStore: authStore(),
+      onEvent: () => {}
+    });
+
+    const history = manager.getSessionHistory("s-1");
+    expect(history.length).toBe(2);
+    expect(history[1]?.role).toBe("assistant");
+    expect(history[1]?.content).toBe("When debugging, I usually do four things.");
+    expect(history[1]?.content).not.toContain("When debuggWhen debugging");
   });
 });

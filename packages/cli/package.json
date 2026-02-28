@@ -16,6 +16,7 @@
   "dependencies": {
     "@drost/core": "workspace:*",
     "@drost/tui": "workspace:*",
+    "dotenv": "^16.4.7",
     "ink": "^6.8.0",
     "react": "^19.2.4",
     "tsx": "^4.21.0",

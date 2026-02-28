@@ -16,7 +16,15 @@ import type {
   GatewayRestartRequestContext,
   GatewayGitCheckpointResult
 } from "./config.js";
-import type { ChannelAdapter, ChannelAdapterContext, ChannelTurnRequest, ChannelTurnResult } from "./channels.js";
+import type {
+  ChannelAdapter,
+  ChannelAdapterContext,
+  ChannelCommandRequest,
+  ChannelTurnRequest,
+  ChannelTurnResult
+} from "./channels.js";
+import type { ChannelCommandResult } from "./channel-commands.js";
+import { dispatchChannelCommand } from "./channel-commands.js";
 import type { AgentDefinition } from "./agent.js";
 import { loadAgentDefinition } from "./agent.js";
 import { loadAuthStore } from "./auth/store.js";
@@ -643,8 +651,19 @@ export class GatewayRuntime {
 
   private channelContext(): ChannelAdapterContext {
     return {
-      runTurn: async (request) => await this.runChannelTurn(request)
+      runTurn: async (request) => await this.runChannelTurn(request),
+      dispatchCommand: async (request) => await this.dispatchChannelCommandRequest(request)
     };
+  }
+
+  private async dispatchChannelCommandRequest(
+    request: ChannelCommandRequest
+  ): Promise<ChannelCommandResult> {
+    const sessionId = this.resolveChannelSession({
+      identity: request.identity,
+      mapping: request.mapping
+    });
+    return dispatchChannelCommand(this, { sessionId }, request.input);
   }
 
   private async connectChannels(): Promise<void> {

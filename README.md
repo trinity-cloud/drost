@@ -89,6 +89,7 @@ drost providers probe 20000
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Auth & Providers](docs/auth-and-providers.md)
+- [Telegram Channel Setup](docs/telegram.md)
 - [Runtime Operations](docs/runtime-operations.md)
 - [Self-Evolution](docs/self-evolution.md)
 - [Troubleshooting](docs/troubleshooting.md)

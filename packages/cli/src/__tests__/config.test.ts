@@ -27,5 +27,28 @@ describe("loadCliConfig", () => {
     expect(loaded.gatewayConfig.workspaceDir).toBe(projectRoot);
     expect(loaded.gatewayConfig.evolution?.mutableRoots).toContain(projectRoot);
   });
-});
 
+  it("loads .env values before evaluating config modules", async () => {
+    const projectRoot = makeTempDir();
+    const envKey = "DROST_TEST_WORKSPACE_DIR";
+    delete process.env[envKey];
+    fs.writeFileSync(path.join(projectRoot, ".env"), `${envKey}=./workspace-from-env\n`, "utf8");
+    fs.writeFileSync(
+      path.join(projectRoot, "drost.config.ts"),
+      [
+        `export default {`,
+        `  workspaceDir: process.env.${envKey} || "."`,
+        `};`,
+        ``
+      ].join("\n"),
+      "utf8"
+    );
+
+    try {
+      const loaded = await loadCliConfig(projectRoot);
+      expect(loaded.gatewayConfig.workspaceDir).toBe(path.join(projectRoot, "workspace-from-env"));
+    } finally {
+      delete process.env[envKey];
+    }
+  });
+});
