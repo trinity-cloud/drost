@@ -487,9 +487,11 @@ export async function runStartLoop(params: {
   config: GatewayConfig;
   pidFilePath: string;
   uiMode?: StartUiMode;
+  reloadConfigOnRestart?: () => Promise<GatewayConfig>;
 }): Promise<number> {
   let restartCount = 0;
   let warnedTuiFallback = false;
+  let runtimeConfig = params.config;
   while (true) {
     const requestedUiMode = params.uiMode ?? "auto";
     const runtimeUiMode = resolveRuntimeUiMode(requestedUiMode);
@@ -501,12 +503,12 @@ export async function runStartLoop(params: {
     const exitCode =
       runtimeUiMode === "tui"
         ? await runGatewayCycleTui({
-            config: params.config,
+            config: runtimeConfig,
             pidFilePath: params.pidFilePath,
             restartCount
           })
         : await runGatewayCyclePlain({
-            config: params.config,
+            config: runtimeConfig,
             pidFilePath: params.pidFilePath,
             restartCount
           });
@@ -514,6 +516,17 @@ export async function runStartLoop(params: {
     if (exitCode === RESTART_EXIT_CODE) {
       restartCount += 1;
       print(`[drost] restart requested (count=${restartCount})`);
+      if (params.reloadConfigOnRestart) {
+        try {
+          runtimeConfig = await params.reloadConfigOnRestart();
+          const providerCount = runtimeConfig.providers?.profiles.length ?? 0;
+          print(`[drost] config reloaded (providers=${providerCount})`);
+        } catch (error) {
+          print(
+            `[drost] config reload failed; continuing with previous config: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
       continue;
     }
     return exitCode;

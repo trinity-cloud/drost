@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 export interface TelegramRenderResult {
   text: string;
   parseMode?: "HTML";
@@ -74,7 +76,7 @@ function stripToolProtocolLines(value: string): string {
   return collapseBlankRuns(kept).join("\n").trim();
 }
 
-function stripInlineMarkdown(value: string): string {
+export function stripInlineMarkdown(value: string): string {
   let next = unescapeSimpleMarkdown(value);
   next = next.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt: string, url: string) => {
     const label = alt.trim() || "image";
@@ -106,7 +108,7 @@ function stripInlineMarkdown(value: string): string {
   return next;
 }
 
-function renderInlineHtml(value: string): string {
+export function renderInlineHtml(value: string): string {
   const placeholders = new Map<string, string>();
   let placeholderId = 0;
 
@@ -123,9 +125,13 @@ function renderInlineHtml(value: string): string {
   });
 
   next = next.replace(
-    /\[([^\]\n]+)\]\(([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^)\s]+)\)/g,
+    /\[([^\]\n]+)\]\(([^)\s]+)\)/g,
     (_all: string, label: string, url: string) => {
-      return stash(`<a href="${escapeHtmlAttribute(url)}">${escapeHtml(label)}</a>`);
+      let href = url;
+      if (!/^[a-zA-Z]+:\/\//.test(href) && !href.startsWith('mailto:') && !href.startsWith('tel:')) {
+        href = 'https://' + href;
+      }
+      return stash(`<a href="${escapeHtmlAttribute(href)}">${escapeHtml(label)}</a>`);
     }
   );
 
@@ -177,12 +183,174 @@ function renderInlineHtml(value: string): string {
   return next;
 }
 
+function isTableBlock(lines: string[]): boolean {
+  if (lines.length < 2) return false;
+  const hasPipe = lines.some(l => l.includes('|'));
+  if (!hasPipe) return false;
+  const hasDivider = lines.some(l => /^[|\s:-]+$/.test(l) && l.includes('-') && l.includes('|'));
+  return hasDivider;
+}
+
+function formatTableHtml(lines: string[]): string {
+  const rows = lines.map(line => {
+    let t = line.trim();
+    if (t.startsWith('|')) t = t.slice(1);
+    if (t.endsWith('|')) t = t.slice(0, -1);
+    return t.split('|').map(c => c.trim());
+  });
+  
+  const numCols = Math.max(...rows.map(r => r.length));
+  
+  const colWidths = new Array<number>(numCols).fill(0);
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i] ?? '';
+      const visibleLength = stripInlineMarkdown(cell).length;
+      if (visibleLength > (colWidths[i] ?? 0)) {
+        colWidths[i] = visibleLength;
+      }
+    }
+  }
+  
+  const formattedLines = rows.map((row, rIdx) => {
+    const isDivider = lines[rIdx]?.replace(/[|\s:-]/g, '') === '';
+    
+    let out = '|';
+    for (let i = 0; i < numCols; i++) {
+      const cell = row[i] ?? '';
+      if (isDivider) {
+        out += '-'.repeat((colWidths[i] ?? 0) + 2) + '|';
+      } else {
+        const visibleLength = stripInlineMarkdown(cell).length;
+        const padding = Math.max(0, (colWidths[i] ?? 0) - visibleLength);
+        out += ' ' + renderInlineHtml(cell) + ' '.repeat(padding) + ' |';
+      }
+    }
+    return out;
+  });
+  
+  return `<pre><code>${formattedLines.join('\n')}</code></pre>`;
+}
+
+function formatTablePreview(lines: string[]): string {
+  const rows = lines.map(line => {
+    let t = line.trim();
+    if (t.startsWith('|')) t = t.slice(1);
+    if (t.endsWith('|')) t = t.slice(0, -1);
+    return t.split('|').map(c => c.trim());
+  });
+  
+  const numCols = Math.max(...rows.map(r => r.length));
+  
+  const colWidths = new Array<number>(numCols).fill(0);
+  for (const row of rows) {
+    for (let i = 0; i < row.length; i++) {
+      const cell = row[i] ?? '';
+      const visibleLength = stripInlineMarkdown(cell).length;
+      if (visibleLength > (colWidths[i] ?? 0)) {
+        colWidths[i] = visibleLength;
+      }
+    }
+  }
+  
+  const formattedLines = rows.map((row, rIdx) => {
+    const isDivider = lines[rIdx]?.replace(/[|\s:-]/g, '') === '';
+    
+    let out = '|';
+    for (let i = 0; i < numCols; i++) {
+      const cell = row[i] ?? '';
+      if (isDivider) {
+        out += '-'.repeat((colWidths[i] ?? 0) + 2) + '|';
+      } else {
+        const visibleLength = stripInlineMarkdown(cell).length;
+        const padding = Math.max(0, (colWidths[i] ?? 0) - visibleLength);
+        out += ' ' + stripInlineMarkdown(cell) + ' '.repeat(padding) + ' |';
+      }
+    }
+    return out;
+  });
+  
+  return formattedLines.join('\n');
+}
+
+function processHtmlParagraphLines(lines: string[]): string[] {
+  if (lines.length === 0) return [];
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i]?.includes('|')) {
+      let j = i;
+      while (j < lines.length && lines[j]?.includes('|')) {
+        j++;
+      }
+      const potentialTable = lines.slice(i, j);
+      if (isTableBlock(potentialTable)) {
+        out.push(formatTableHtml(potentialTable));
+        i = j;
+        continue;
+      }
+    }
+    
+    let textLines: string[] = [];
+    while (i < lines.length && !lines[i]?.includes('|')) {
+      if (lines[i] !== undefined) {
+        textLines.push(lines[i] as string);
+      }
+      i++;
+    }
+    if (textLines.length > 0) {
+      out.push(textLines.map(l => renderInlineHtml(l).trimEnd()).join('\n'));
+    } else if (i < lines.length) {
+      out.push(renderInlineHtml(lines[i] as string).trimEnd());
+      i++;
+    }
+  }
+  return out;
+}
+
+function processPreviewParagraphLines(lines: string[]): string[] {
+  if (lines.length === 0) return [];
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i]?.includes('|')) {
+      let j = i;
+      while (j < lines.length && lines[j]?.includes('|')) {
+        j++;
+      }
+      const potentialTable = lines.slice(i, j);
+      if (isTableBlock(potentialTable)) {
+        out.push(formatTablePreview(potentialTable));
+        i = j;
+        continue;
+      }
+    }
+    
+    let textLines: string[] = [];
+    while (i < lines.length && !lines[i]?.includes('|')) {
+      if (lines[i] !== undefined) {
+        textLines.push(lines[i] as string);
+      }
+      i++;
+    }
+    if (textLines.length > 0) {
+      out.push(textLines.map(l => stripInlineMarkdown(l).trimEnd()).join('\n'));
+    } else if (i < lines.length) {
+      out.push(stripInlineMarkdown(lines[i] as string).trimEnd());
+      i++;
+    }
+  }
+  return out;
+}
+
 function finalizePreviewParagraph(state: MarkdownRenderState): void {
   if (state.paragraphLines.length === 0) {
     return;
   }
-  const rendered = state.paragraphLines.map((line) => stripInlineMarkdown(line).trimEnd()).join("\n");
-  state.output.push(rendered);
+  const blocks = processPreviewParagraphLines(state.paragraphLines);
+  for (const block of blocks) {
+    state.output.push(block);
+  }
   state.paragraphLines = [];
 }
 
@@ -190,8 +358,10 @@ function finalizeHtmlParagraph(state: MarkdownRenderState): void {
   if (state.paragraphLines.length === 0) {
     return;
   }
-  const rendered = state.paragraphLines.map((line) => renderInlineHtml(line).trimEnd()).join("\n");
-  state.output.push(rendered);
+  const blocks = processHtmlParagraphLines(state.paragraphLines);
+  for (const block of blocks) {
+    state.output.push(block);
+  }
   state.paragraphLines = [];
 }
 
@@ -214,7 +384,7 @@ function finalizeHtmlCodeFence(state: MarkdownRenderState): void {
   state.codeFenceLines = [];
 }
 
-function renderPreviewLines(value: string): string {
+function renderPreviewLines(value: string): string[] {
   const lines = normalizeNewlines(value).split("\n");
   const state: MarkdownRenderState = {
     inCodeFence: false,
@@ -291,10 +461,10 @@ function renderPreviewLines(value: string): string {
   }
   finalizePreviewParagraph(state);
 
-  return collapseBlankRuns(state.output).join("\n").trim();
+  return collapseBlankRuns(state.output);
 }
 
-function renderHtmlLines(value: string): string {
+function renderHtmlLines(value: string): string[] {
   const lines = normalizeNewlines(value).split("\n");
   const state: MarkdownRenderState = {
     inCodeFence: false,
@@ -371,7 +541,7 @@ function renderHtmlLines(value: string): string {
   }
   finalizeHtmlParagraph(state);
 
-  return collapseBlankRuns(state.output).join("\n").trim();
+  return collapseBlankRuns(state.output);
 }
 
 export function renderTelegramStreamingPreview(value: string): string {
@@ -379,7 +549,7 @@ export function renderTelegramStreamingPreview(value: string): string {
   if (!visible) {
     return "";
   }
-  return renderPreviewLines(visible);
+  return renderPreviewLines(visible).join("\n").trim();
 }
 
 export function renderTelegramFinalMessage(
@@ -387,26 +557,34 @@ export function renderTelegramFinalMessage(
   options?: {
     maxHtmlChars?: number;
   }
-): TelegramRenderResult {
+): TelegramRenderResult[] {
   const visible = stripToolProtocolLines(value);
   if (!visible) {
-    return {
-      text: ""
-    };
+    return [];
   }
 
-  const html = renderHtmlLines(visible);
+  const htmlBlocks = renderHtmlLines(visible);
   const maxHtmlChars = options?.maxHtmlChars ?? 4000;
-  if (html.length > maxHtmlChars) {
-    return {
-      text: renderPreviewLines(visible)
-    };
+  
+  const results: TelegramRenderResult[] = [];
+  let currentChunk = "";
+
+  for (const block of htmlBlocks) {
+    if (!currentChunk) {
+      currentChunk = block;
+    } else if (currentChunk.length + 1 + block.length <= maxHtmlChars) {
+      currentChunk += "\n" + block;
+    } else {
+      results.push({ text: currentChunk, parseMode: "HTML" });
+      currentChunk = block;
+    }
+  }
+  
+  if (currentChunk) {
+    results.push({ text: currentChunk, parseMode: "HTML" });
   }
 
-  return {
-    text: html,
-    parseMode: "HTML"
-  };
+  return results;
 }
 
 export function stripTelegramHtml(value: string): string {

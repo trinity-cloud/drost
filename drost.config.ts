@@ -60,6 +60,14 @@ export default {
         authProfileId: "anthropic:default"
       },
       {
+        id: "xai",
+        adapterId: "openai-responses",
+        kind: "openai-compatible",
+        baseUrl: "https://api.x.ai/v1",
+        model: "grok-4-1-fast-reasoning",
+        authProfileId: "openai-compatible:xai"
+      },
+      {
         id: "local-openai-compatible",
         adapterId: "openai-responses",
         kind: "openai-compatible",

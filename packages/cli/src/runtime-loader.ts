@@ -10,6 +10,7 @@ export interface ProjectRuntimeStartParams {
   config: GatewayConfig;
   pidFilePath: string;
   uiMode: StartUiMode;
+  reloadConfigOnRestart?: () => Promise<GatewayConfig>;
   runDefault: (overrides?: {
     config?: GatewayConfig;
     pidFilePath?: string;
@@ -70,6 +71,7 @@ export async function runProjectRuntime(params: {
   config: GatewayConfig;
   pidFilePath: string;
   uiMode: StartUiMode;
+  reloadConfigOnRestart?: () => Promise<GatewayConfig>;
   runDefaultStartLoop?: typeof runStartLoop;
 }): Promise<number> {
   const runDefaultStartLoop = params.runDefaultStartLoop ?? runStartLoop;
@@ -81,7 +83,8 @@ export async function runProjectRuntime(params: {
     await runDefaultStartLoop({
       config: overrides?.config ?? params.config,
       pidFilePath: overrides?.pidFilePath ?? params.pidFilePath,
-      uiMode: overrides?.uiMode ?? params.uiMode
+      uiMode: overrides?.uiMode ?? params.uiMode,
+      reloadConfigOnRestart: params.reloadConfigOnRestart
     });
 
   const entryPath = resolveRuntimeEntryPath(params.projectRoot, params.config);
@@ -102,6 +105,7 @@ export async function runProjectRuntime(params: {
     config: params.config,
     pidFilePath: params.pidFilePath,
     uiMode: params.uiMode,
+    reloadConfigOnRestart: params.reloadConfigOnRestart,
     runDefault
   });
   if (!Number.isFinite(code)) {

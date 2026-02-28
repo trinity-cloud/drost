@@ -119,6 +119,10 @@ async function main(): Promise<number> {
       config: loadedConfig.gatewayConfig,
       pidFilePath: loadedConfig.pidFilePath,
       uiMode: parsed.uiMode,
+      reloadConfigOnRestart: async () => {
+        const refreshed = await loadCliConfig(loadedConfig.projectRoot);
+        return refreshed.gatewayConfig;
+      },
       runDefaultStartLoop: runStartLoop
     });
   }

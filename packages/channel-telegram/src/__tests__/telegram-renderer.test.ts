@@ -23,7 +23,7 @@ describe("telegram renderer", () => {
   });
 
   it("renders final markdown as Telegram HTML", () => {
-    const rendered = renderTelegramFinalMessage([
+    const renderedChunks = renderTelegramFinalMessage([
       "## Heading",
       "",
       "Use **bold**, _italics_, ~~strike~~, and `inline code`.",
@@ -31,6 +31,7 @@ describe("telegram renderer", () => {
       "[OpenAI](https://openai.com)"
     ].join("\n"));
 
+    const rendered = renderedChunks[0]!;
     expect(rendered.parseMode).toBe("HTML");
     expect(rendered.text).toContain("<b>Heading</b>");
     expect(rendered.text).toContain("<b>bold</b>");
@@ -40,14 +41,15 @@ describe("telegram renderer", () => {
     expect(rendered.text).toContain("<a href=\"https://openai.com\">OpenAI</a>");
   });
 
-  it("falls back to plain text when HTML output exceeds max size", () => {
+  it("chunks html output when it exceeds max size", () => {
     const source = `# Heading\n\n${"x".repeat(5000)}`;
-    const rendered = renderTelegramFinalMessage(source, {
+    const renderedChunks = renderTelegramFinalMessage(source, {
       maxHtmlChars: 800
     });
 
-    expect(rendered.parseMode).toBeUndefined();
-    expect(rendered.text.length).toBeGreaterThan(0);
+    expect(renderedChunks.length).toBeGreaterThan(1);
+    expect(renderedChunks[0]!.parseMode).toBe("HTML");
+    expect(renderedChunks[0]!.text.length).toBeGreaterThan(0);
   });
 
   it("strips html tags from fallback text", () => {

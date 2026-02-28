@@ -406,23 +406,23 @@ export class TelegramChannelAdapter implements ChannelAdapter {
   }
 
   private buildFinalTelegramPayloads(rawAssistantText: string): TelegramMessagePayload[] {
-    const rendered = renderTelegramFinalMessage(rawAssistantText, {
+    const renderedChunks = renderTelegramFinalMessage(rawAssistantText, {
       maxHtmlChars: TELEGRAM_MAX_MESSAGE_CHARS
     });
-    if (!rendered.text.trim()) {
+    if (renderedChunks.length === 0) {
       return [];
     }
 
-    if (rendered.parseMode === "HTML") {
-      return [
-        {
-          text: rendered.text,
+    return renderedChunks.map(chunk => {
+      if (chunk.parseMode === "HTML") {
+        return {
+          text: chunk.text,
           parseMode: "HTML"
-        }
-      ];
-    }
-
-    return this.chunkPlainMessage(rendered.text);
+        };
+      }
+      // If it somehow returned plain text without HTML parseMode (though our new implementation always returns HTML or chunks it as HTML)
+      return { text: chunk.text };
+    });
   }
 
   private async sleep(ms: number): Promise<void> {
