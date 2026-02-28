@@ -280,7 +280,7 @@ export function renderSessionSummary(sessions: TuiSessionSummary[]): string[] {
 
 export function renderCommandHints(): string {
   return line(
-    "commands: /providers /provider <id> /session <id> /sessions /status /tools /tool <name> [json] /help /restart"
+    "commands: /providers /provider <id> /session <id> /sessions /new /status /tools /tool <name> [json] /help /restart"
   );
 }
 

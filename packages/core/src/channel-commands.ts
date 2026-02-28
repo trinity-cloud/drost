@@ -25,6 +25,7 @@ export interface ChannelCommandGateway {
     intent: "manual";
     reason: string;
   }): Promise<{ ok: boolean; code?: string; message?: string } | void>;
+  deleteSession(sessionId: string): { ok: boolean; message: string; sessionId?: string };
 }
 
 export interface ChannelCommandSessionContext {
@@ -108,6 +109,22 @@ export async function dispatchChannelCommand(
     };
   }
 
+  if (text === "/new") {
+    try {
+      const result = gateway.deleteSession(session.sessionId);
+      if (!result.ok) {
+        return { handled: true, text: `Failed to start new session: ${result.message}`, ok: false };
+      }
+      return {
+        handled: true,
+        text: `Started new session (cleared history for ${session.sessionId}).`,
+        ok: true
+      };
+    } catch (error) {
+      return { handled: true, text: toErrorText(error), ok: false };
+    }
+  }
+
   if (text === "/tools") {
     return {
       handled: true,
@@ -167,6 +184,7 @@ function formatHelp(): string {
     "  /provider <id>   - Switch provider for next turn",
     "  /session         - Current session info",
     "  /sessions        - List all sessions",
+    "  /new             - Start a new session (clear current)",
     "  /tools           - List loaded tools",
     "  /tool <name> [json] - Run a tool",
     "  /restart         - Restart the gateway",

@@ -737,6 +737,27 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
         return;
       }
 
+      if (text === "/new") {
+        if (!props.hasProviders) {
+          pushEvents(["no providers configured in drost.config.*"]);
+          return;
+        }
+        const nextSessionId = `local-${Date.now().toString(36)}`;
+        try {
+          props.gateway.ensureSession(nextSessionId);
+          setActiveSessionId(nextSessionId);
+          activeSessionRef.current = nextSessionId;
+          const session = props.gateway.getSessionState(nextSessionId);
+          pushEvents([
+            `active session switched to ${nextSessionId} (provider=${session?.activeProviderId ?? "n/a"})`
+          ]);
+          forceRender();
+        } catch (error) {
+          pushEvents([error instanceof Error ? error.message : String(error)]);
+        }
+        return;
+      }
+
       if (text === "/status") {
         const status = props.gateway.getStatus();
         const lines = renderGatewayBoot({
@@ -971,7 +992,7 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
         </Box>
         <Box justifyContent="space-between">
           <Text color={theme.faint}>Enter send | Esc clear | Ctrl+C quit</Text>
-          <Text color={theme.faint}>/providers /provider /sessions /session /status /tools /tool /help /restart</Text>
+          <Text color={theme.faint}>/providers /provider /sessions /session /new /status /tools /tool /help /restart</Text>
         </Box>
       </Box>
     </Box>

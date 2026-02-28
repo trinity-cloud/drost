@@ -318,6 +318,27 @@ async function runGatewayCyclePlain(params: {
         return;
       }
 
+      if (text === "/new") {
+        if (!hasProviders) {
+          print("[drost] no providers configured in drost.config.*");
+          rl?.prompt();
+          return;
+        }
+        const nextSessionId = `local-${Date.now().toString(36)}`;
+        try {
+          gateway.ensureSession(nextSessionId);
+          activeSessionId = nextSessionId;
+          const session = gateway.getSessionState(activeSessionId);
+          print(
+            `[drost] active session switched to ${activeSessionId} (provider=${session?.activeProviderId ?? "n/a"})`
+          );
+        } catch (error) {
+          print(`[drost] ${error instanceof Error ? error.message : String(error)}`);
+        }
+        rl?.prompt();
+        return;
+      }
+
       if (text === "/status") {
         const currentStatus = gateway.getStatus();
         for (const line of renderGatewayBoot({

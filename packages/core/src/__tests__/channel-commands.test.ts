@@ -212,6 +212,16 @@ describe("dispatchChannelCommand", () => {
     expect(result.text).toContain("No active sessions");
   });
 
+  it("/new clears current session", async () => {
+    const deleteSessionFn = vi.fn().mockReturnValue({ ok: true, message: "cleared" });
+    const gateway = makeGateway({ deleteSession: deleteSessionFn });
+    const result = await dispatchChannelCommand(gateway, session, "/new");
+    expect(result.handled).toBe(true);
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("Started new session");
+    expect(deleteSessionFn).toHaveBeenCalledWith("session:telegram:wk:chat-1");
+  });
+
   it("/tools lists loaded tools", async () => {
     const result = await dispatchChannelCommand(makeGateway(), session, "/tools");
     expect(result.handled).toBe(true);
