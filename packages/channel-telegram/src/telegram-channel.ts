@@ -2,6 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { isChannelCommand } from "@drost/core";
 import type { ChannelAdapter, ChannelAdapterContext, ChannelTurnRequest } from "@drost/core";
+import {
+  renderTelegramFinalMessage,
+  renderTelegramStreamingPreview,
+  stripTelegramHtml
+} from "./telegram-renderer.js";
 
 interface TelegramUpdateMessage {
   message_id: number;
@@ -37,6 +42,11 @@ interface TelegramChannelState {
   offset: number;
   lastMessageIdsByChat: Record<string, number>;
   updatedAt: string;
+}
+
+interface TelegramMessagePayload {
+  text: string;
+  parseMode?: "HTML";
 }
 
 const TELEGRAM_MAX_MESSAGE_CHARS = 4000;
@@ -389,6 +399,32 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     return chunks;
   }
 
+  private chunkPlainMessage(text: string): TelegramMessagePayload[] {
+    return this.splitTelegramText(text).map((chunk) => ({
+      text: chunk
+    }));
+  }
+
+  private buildFinalTelegramPayloads(rawAssistantText: string): TelegramMessagePayload[] {
+    const rendered = renderTelegramFinalMessage(rawAssistantText, {
+      maxHtmlChars: TELEGRAM_MAX_MESSAGE_CHARS
+    });
+    if (!rendered.text.trim()) {
+      return [];
+    }
+
+    if (rendered.parseMode === "HTML") {
+      return [
+        {
+          text: rendered.text,
+          parseMode: "HTML"
+        }
+      ];
+    }
+
+    return this.chunkPlainMessage(rendered.text);
+  }
+
   private async sleep(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -427,6 +463,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
 
     const typing = this.startTypingSignal(chatId);
     let streamedText = "";
+    let streamedPreviewText = "";
     let leadMessageId: number | null = null;
     let leadText = "";
     let streamTicker: NodeJS.Timeout | null = null;
@@ -437,7 +474,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       if (flushInProgress) {
         return;
       }
-      const chunks = this.splitTelegramText(streamedText);
+      const chunks = this.splitTelegramText(streamedPreviewText);
       let nextLead = chunks[0] ?? "";
       if (!nextLead) {
         return;
@@ -534,6 +571,11 @@ export class TelegramChannelAdapter implements ChannelAdapter {
             return;
           }
           streamedText = nextStreamedText;
+          const nextPreviewText = renderTelegramStreamingPreview(streamedText);
+          if (nextPreviewText === streamedPreviewText) {
+            return;
+          }
+          streamedPreviewText = nextPreviewText;
           if (leadMessageId === null && !pendingFlush) {
             // Ensure the first visible chunk appears immediately, then edit in place.
             pendingFlush = flushLead(false, true).catch((error) => this.reportError(error));
@@ -553,38 +595,44 @@ export class TelegramChannelAdapter implements ChannelAdapter {
       }
       await flushLead(true);
 
-      const finalText = (streamedText.trim().length > 0 ? streamedText : result.response).trim();
-      const finalChunks = this.splitTelegramText(finalText);
-      if (finalChunks.length === 0) {
+      const streamedFinalText = renderTelegramStreamingPreview(streamedText);
+      const fallbackFinalText = renderTelegramStreamingPreview(result.response);
+      const finalRawText =
+        streamedFinalText.trim().length > 0 ? streamedText : result.response;
+      const finalPayloads = this.buildFinalTelegramPayloads(
+        finalRawText.trim().length > 0 ? finalRawText : `${streamedFinalText || fallbackFinalText}`
+      );
+      if (finalPayloads.length === 0) {
         return;
       }
 
-      const firstChunk = finalChunks[0] ?? "";
+      const firstPayload = finalPayloads[0]!;
       const shouldAnimate =
-        firstChunk.length > this.streamPreviewChars &&
-        (leadText.length === 0 || leadText.length < firstChunk.length);
+        firstPayload.parseMode === undefined &&
+        firstPayload.text.length > this.streamPreviewChars &&
+        (leadText.length === 0 || leadText.length < firstPayload.text.length);
       if (shouldAnimate) {
-        await animateLeadTo(firstChunk);
+        await animateLeadTo(firstPayload.text);
       } else if (leadMessageId === null) {
-        leadMessageId = await this.sendMessage(chatId, firstChunk);
-        leadText = firstChunk;
-      } else if (firstChunk !== leadText) {
+        leadMessageId = await this.sendMessage(chatId, firstPayload.text, firstPayload.parseMode);
+        leadText = firstPayload.text;
+      } else if (firstPayload.text !== leadText || firstPayload.parseMode === "HTML") {
         try {
-          await this.editMessage(chatId, leadMessageId, firstChunk);
+          await this.editMessage(chatId, leadMessageId, firstPayload.text, firstPayload.parseMode);
         } catch (error) {
           if (!this.isNotModifiedError(error)) {
             throw error;
           }
         }
-        leadText = firstChunk;
+        leadText = firstPayload.text;
       }
 
-      for (let index = 1; index < finalChunks.length; index += 1) {
-        const chunk = finalChunks[index];
-        if (!chunk) {
+      for (let index = 1; index < finalPayloads.length; index += 1) {
+        const payload = finalPayloads[index];
+        if (!payload || !payload.text) {
           continue;
         }
-        await this.sendMessage(chatId, chunk);
+        await this.sendMessage(chatId, payload.text, payload.parseMode);
       }
     } finally {
       if (streamTicker) {
@@ -746,37 +794,78 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     return Array.isArray(payload.result) ? payload.result : [];
   }
 
-  private async sendMessage(chatId: number, text: string): Promise<number> {
-    const response = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "sendMessage"), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text
-      })
-    });
-    const payload = await parseApiResponse<TelegramSendMessageResult>(response);
-    if (typeof payload.result?.message_id !== "number") {
-      throw new Error("Telegram sendMessage response missing message_id");
+  private async sendMessage(
+    chatId: number,
+    text: string,
+    parseMode?: "HTML",
+    allowFallback = true
+  ): Promise<number> {
+    const payload: Record<string, unknown> = {
+      chat_id: chatId,
+      text
+    };
+    if (parseMode) {
+      payload.parse_mode = parseMode;
+      payload.link_preview_options = {
+        is_disabled: true
+      };
     }
-    return payload.result.message_id;
+
+    try {
+      const response = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "sendMessage"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      const apiPayload = await parseApiResponse<TelegramSendMessageResult>(response);
+      if (typeof apiPayload.result?.message_id !== "number") {
+        throw new Error("Telegram sendMessage response missing message_id");
+      }
+      return apiPayload.result.message_id;
+    } catch (error) {
+      if (!parseMode || !allowFallback) {
+        throw error;
+      }
+      return await this.sendMessage(chatId, stripTelegramHtml(text), undefined, false);
+    }
   }
 
-  private async editMessage(chatId: number, messageId: number, text: string): Promise<void> {
-    const response = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "editMessageText"), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: messageId,
-        text
-      })
-    });
-    await parseApiResponse<Record<string, unknown>>(response);
+  private async editMessage(
+    chatId: number,
+    messageId: number,
+    text: string,
+    parseMode?: "HTML",
+    allowFallback = true
+  ): Promise<void> {
+    const payload: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: messageId,
+      text
+    };
+    if (parseMode) {
+      payload.parse_mode = parseMode;
+      payload.link_preview_options = {
+        is_disabled: true
+      };
+    }
+
+    try {
+      const response = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "editMessageText"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      await parseApiResponse<Record<string, unknown>>(response);
+    } catch (error) {
+      if (!parseMode || !allowFallback) {
+        throw error;
+      }
+      await this.editMessage(chatId, messageId, stripTelegramHtml(text), undefined, false);
+    }
   }
 
   private async sendChatAction(chatId: number, action: "typing"): Promise<void> {

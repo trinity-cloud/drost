@@ -725,6 +725,109 @@ describe("telegram channel adapter", () => {
     expect(sentMessages[0]?.text).toBe("echo:/unknown");
   });
 
+  it("renders final markdown via HTML parse mode and suppresses tool protocol text", async () => {
+    const sentMessages: Array<{ chat_id?: number; text?: string; parse_mode?: string }> = [];
+    const editedMessages: Array<{
+      chat_id?: number;
+      message_id?: number;
+      text?: string;
+      parse_mode?: string;
+    }> = [];
+    const updateBatches: unknown[][] = [
+      [
+        {
+          update_id: 61,
+          message: {
+            message_id: 610,
+            text: "show pretty output",
+            chat: { id: 515 },
+            from: { id: 2 }
+          }
+        }
+      ],
+      []
+    ];
+
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.includes("/getUpdates")) {
+        const next = updateBatches.shift() ?? [];
+        return jsonResponse({ ok: true, result: next });
+      }
+      if (url.includes("/sendChatAction")) {
+        return jsonResponse({ ok: true, result: true });
+      }
+      if (url.includes("/sendMessage")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        sentMessages.push(body);
+        return jsonResponse({
+          ok: true,
+          result: {
+            message_id: 611
+          }
+        });
+      }
+      if (url.includes("/editMessageText")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        editedMessages.push(body);
+        return jsonResponse({ ok: true, result: true });
+      }
+      return jsonResponse({ ok: true, result: [] });
+    };
+
+    const adapter = new TelegramChannelAdapter({
+      token: "test-token",
+      pollIntervalMs: 20,
+      streamFlushIntervalMs: 1,
+      persistState: false,
+      fetchImpl,
+      onError: (error) => {
+        throw error;
+      }
+    });
+    activeAdapters.push(adapter);
+
+    adapter.connect({
+      runTurn: async (request) => {
+        request.onEvent?.({
+          type: "response.delta",
+          sessionId: "session:telegram:global:515",
+          providerId: "provider-a",
+          timestamp: new Date().toISOString(),
+          payload: {
+            text: "TOOL_CALL {\"name\":\"file\",\"input\":{\"action\":\"read\",\"path\":\"README.md\"}}"
+          }
+        });
+        request.onEvent?.({
+          type: "response.delta",
+          sessionId: "session:telegram:global:515",
+          providerId: "provider-a",
+          timestamp: new Date().toISOString(),
+          payload: {
+            text: "\n\n## Final Answer\n\n- **Bold item**\n- [OpenAI](https://openai.com)"
+          }
+        });
+        return {
+          sessionId: "session:telegram:global:515",
+          providerId: "provider-a",
+          response:
+            "TOOL_CALL {\"name\":\"file\",\"input\":{\"action\":\"read\",\"path\":\"README.md\"}}\n\n## Final Answer\n\n- **Bold item**\n- [OpenAI](https://openai.com)"
+        };
+      }
+    });
+
+    await waitFor(
+      () =>
+        sentMessages.length >= 1 &&
+        editedMessages.some((entry) => (entry.parse_mode ?? "").toUpperCase() === "HTML")
+    );
+
+    expect(sentMessages[0]?.text).not.toContain("TOOL_CALL");
+    expect(editedMessages.some((entry) => (entry.text ?? "").includes("TOOL_CALL"))).toBe(false);
+    expect(editedMessages.some((entry) => (entry.parse_mode ?? "").toUpperCase() === "HTML")).toBe(true);
+    expect(editedMessages.some((entry) => (entry.text ?? "").includes("<b>Final Answer</b>"))).toBe(true);
+  });
+
   it("handles empty and non-text updates without sending replies", async () => {
     const sentMessages: unknown[] = [];
     let getUpdatesCount = 0;

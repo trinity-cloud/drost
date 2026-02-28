@@ -56,7 +56,7 @@ export default {
         adapterId: "anthropic-messages",
         kind: "anthropic",
         baseUrl: "https://api.anthropic.com",
-        model: "claude-opus-4-6",
+        model: "claude-sonnet-4-6",
         authProfileId: "anthropic:default"
       },
       {

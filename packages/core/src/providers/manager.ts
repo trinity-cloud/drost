@@ -487,7 +487,7 @@ export class ProviderManager {
 
     const availableToolNames = normalizeToolNames(params.availableToolNames);
     const canRunTools = availableToolNames.length > 0 && typeof params.runTool === "function";
-    const maxToolCalls = Math.max(1, params.maxToolCalls ?? 4);
+    const maxToolCalls = Math.max(1, params.maxToolCalls ?? 50);
     let remainingToolCalls = maxToolCalls;
 
     try {
