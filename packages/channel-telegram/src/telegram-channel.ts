@@ -41,6 +41,7 @@ interface TelegramChannelState {
   version: 1;
   offset: number;
   lastMessageIdsByChat: Record<string, number>;
+  sessionPrefixByChat?: Record<string, string>;
   updatedAt: string;
 }
 
@@ -160,6 +161,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
   private offset = 0;
   private lockFd: number | null = null;
   private readonly lastMessageIdsByChat = new Map<string, number>();
+  private readonly sessionPrefixByChat = new Map<string, string>();
 
   constructor(options: TelegramChannelOptions) {
     const token = options.token.trim();
@@ -336,6 +338,14 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         }
       }
     }
+    this.sessionPrefixByChat.clear();
+    if (record.sessionPrefixByChat && typeof record.sessionPrefixByChat === "object") {
+      for (const [chatId, value] of Object.entries(record.sessionPrefixByChat)) {
+        if (typeof value === "string" && value.length > 0) {
+          this.sessionPrefixByChat.set(chatId, value);
+        }
+      }
+    }
   }
 
   private persistStateToDisk(): void {
@@ -349,10 +359,17 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         lastMessageIdsByChat[chatId] = Math.floor(value);
       }
     }
+    const sessionPrefixByChat: Record<string, string> = {};
+    for (const [chatId, value] of this.sessionPrefixByChat.entries()) {
+      if (value) {
+        sessionPrefixByChat[chatId] = value;
+      }
+    }
     const state: TelegramChannelState = {
       version: 1,
       offset: Math.max(0, Math.floor(this.offset)),
       lastMessageIdsByChat,
+      sessionPrefixByChat,
       updatedAt: new Date().toISOString()
     };
     fs.writeFileSync(this.stateFilePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
@@ -735,9 +752,12 @@ export class TelegramChannelAdapter implements ChannelAdapter {
           userId: message.from?.id !== undefined ? String(message.from.id) : undefined
         };
 
+        const prefix = this.sessionPrefixByChat.get(String(chatId));
+        const mapping = prefix ? { prefix } : undefined;
+
         // Intercept slash commands before routing to the LLM.
         if (isChannelCommand(input) && this.context?.dispatchCommand) {
-          const commandResult = await this.context.dispatchCommand({ identity, input });
+          const commandResult = await this.context.dispatchCommand({ identity, input, mapping });
           if (commandResult.handled && commandResult.text) {
             const chunks = this.splitTelegramText(commandResult.text);
             for (const chunk of chunks) {
@@ -745,6 +765,10 @@ export class TelegramChannelAdapter implements ChannelAdapter {
             }
           }
           if (commandResult.handled) {
+            if (commandResult.action === "new_session") {
+              this.sessionPrefixByChat.set(String(chatId), `s${Date.now().toString(36)}`);
+              stateChanged = true;
+            }
             if (typeof message.message_id === "number" && Number.isFinite(message.message_id) && message.message_id >= 0) {
               this.markMessageProcessed(chatId, Math.floor(message.message_id));
               stateChanged = true;
@@ -757,7 +781,8 @@ export class TelegramChannelAdapter implements ChannelAdapter {
         const request: ChannelTurnRequest = {
           identity,
           title: message.chat?.title,
-          input
+          input,
+          mapping
         };
         await this.handleTurnResponseStreaming(chatId, request);
         if (typeof message.message_id === "number" && Number.isFinite(message.message_id) && message.message_id >= 0) {
