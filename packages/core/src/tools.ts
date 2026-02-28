@@ -693,56 +693,62 @@ function parsePatchPaths(patchText: string): string[] {
   return Array.from(paths).sort((left, right) => left.localeCompare(right));
 }
 
-function extractDuckDuckGoResults(payload: unknown, limit: number): Array<{ title: string; snippet: string; url: string }> {
+function truncateInlineText(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function extractExaResults(payload: unknown, limit: number): Array<{ title: string; snippet: string; url: string }> {
   const results: Array<{ title: string; snippet: string; url: string }> = [];
   if (!payload || typeof payload !== "object") {
     return results;
   }
 
   const record = payload as Record<string, unknown>;
-  const abstractText = typeof record.AbstractText === "string" ? record.AbstractText.trim() : "";
-  const abstractUrl = typeof record.AbstractURL === "string" ? record.AbstractURL.trim() : "";
-  const heading = typeof record.Heading === "string" ? record.Heading.trim() : "";
-  if (abstractText && abstractUrl) {
+  const rawResults = Array.isArray(record.results) ? record.results : [];
+
+  for (const item of rawResults) {
+    if (results.length >= limit || !item || typeof item !== "object") {
+      continue;
+    }
+
+    const entry = item as Record<string, unknown>;
+    const url = typeof entry.url === "string" ? entry.url.trim() : "";
+    if (!url) {
+      continue;
+    }
+
+    const title =
+      typeof entry.title === "string" && entry.title.trim().length > 0
+        ? entry.title.trim()
+        : url;
+
+    const firstHighlight = Array.isArray(entry.highlights)
+      ? entry.highlights.find(
+          (candidate): candidate is string => typeof candidate === "string" && candidate.trim().length > 0
+        ) ?? ""
+      : "";
+    const summary = typeof entry.summary === "string" ? entry.summary : "";
+    const text = typeof entry.text === "string" ? entry.text : "";
+    const snippet =
+      truncateInlineText(summary, 280) ||
+      truncateInlineText(firstHighlight, 280) ||
+      truncateInlineText(text, 280) ||
+      "";
+
     results.push({
-      title: heading || "Instant answer",
-      snippet: abstractText,
-      url: abstractUrl
+      title,
+      snippet,
+      url
     });
   }
-
-  function walk(items: unknown): void {
-    if (results.length >= limit || !Array.isArray(items)) {
-      return;
-    }
-    for (const item of items) {
-      if (results.length >= limit || !item || typeof item !== "object") {
-        continue;
-      }
-      const entry = item as Record<string, unknown>;
-      if (Array.isArray(entry.Topics)) {
-        walk(entry.Topics);
-        continue;
-      }
-      const text = typeof entry.Text === "string" ? entry.Text.trim() : "";
-      const url = typeof entry.FirstURL === "string" ? entry.FirstURL.trim() : "";
-      if (!text || !url) {
-        continue;
-      }
-      const title = text.split(" - ")[0]?.trim() || text;
-      results.push({
-        title,
-        snippet: text,
-        url
-      });
-      if (results.length >= limit) {
-        return;
-      }
-    }
-  }
-
-  walk(record.RelatedTopics);
-  return results.slice(0, limit);
+  return results;
 }
 
 async function collectToolFiles(dirPath: string): Promise<string[]> {
@@ -1420,7 +1426,7 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
 
   const webTool = defineTool({
     name: "web",
-    description: "Fetch a URL or run lightweight web search",
+    description: "Fetch a URL or run web search",
     parameters: webToolSchema,
     execute: async (rawInput) => {
       const input = webToolSchema.parse(rawInput);
@@ -1447,23 +1453,34 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
         };
       }
 
-      const query = new URL("https://api.duckduckgo.com/");
-      query.searchParams.set("q", input.query);
-      query.searchParams.set("format", "json");
-      query.searchParams.set("no_html", "1");
-      query.searchParams.set("skip_disambig", "1");
+      const exaApiKey = process.env.EXA_API_KEY?.trim();
+      if (!exaApiKey) {
+        throw new Error("Web search requires EXA_API_KEY in the environment");
+      }
 
-      const response = await fetchImpl(query.toString());
+      const response = await fetchImpl("https://api.exa.ai/search", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": exaApiKey
+        },
+        body: JSON.stringify({
+          query: input.query,
+          numResults: input.limit
+        })
+      });
       if (!response.ok) {
-        throw new Error(`Web search request failed with status ${response.status}`);
+        const details = truncateInlineText(await response.text(), 200);
+        const detailSuffix = details ? `: ${details}` : "";
+        throw new Error(`Web search request failed with status ${response.status}${detailSuffix}`);
       }
 
       const payload = await response.json();
       return {
         action: input.action,
         query: input.query,
-        provider: "duckduckgo-instant-answer",
-        results: extractDuckDuckGoResults(payload, input.limit)
+        provider: "exa",
+        results: extractExaResults(payload, input.limit)
       };
     }
   });
