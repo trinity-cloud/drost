@@ -66,6 +66,13 @@ function createSessionMetadata(seed?: Partial<SessionMetadata>): SessionMetadata
   if (typeof seed?.providerRouteId === "string" && seed.providerRouteId.trim().length > 0) {
     metadata.providerRouteId = seed.providerRouteId.trim();
   }
+  if (
+    seed?.skillInjectionMode === "off" ||
+    seed?.skillInjectionMode === "all" ||
+    seed?.skillInjectionMode === "relevant"
+  ) {
+    metadata.skillInjectionMode = seed.skillInjectionMode;
+  }
   return metadata;
 }
 

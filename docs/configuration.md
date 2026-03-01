@@ -107,11 +107,15 @@ export default {
 - `failover`: retry/cooldown policy for provider fallback behavior.
 - `controlApi`: authenticated `/control/v1` server options.
 - `observability`: JSONL telemetry stream settings.
+- `plugins`: plugin runtime module loading, trust roots, and allowlist controls.
+- `skills`: skill discovery roots, allow/deny gating, and injection policy.
+- `subagents`: asynchronous delegated-job runtime controls.
+- `optionalModules`: optional memory/graph/scheduler/backup runtime controls.
 - `providers`: provider topology and startup probes.
 - `restartPolicy`: restart policy, budget, and git checkpoint controls.
 - `hooks`: gateway lifecycle hooks.
 
-For full P0 blocks and examples, see [Config Reference (P0)](config-reference.md).
+For full runtime blocks and examples, see [Config Reference](config-reference.md).
 
 ## Provider Profiles
 
@@ -142,6 +146,7 @@ Restart-required examples:
 - `toolDirectory`
 - provider topology
 - `failover`
+- `plugins` / `skills` / `subagents` / `optionalModules`
 - `agent` / `runtime`
 - `evolution`
 

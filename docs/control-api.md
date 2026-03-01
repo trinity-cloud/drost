@@ -49,6 +49,12 @@ Read endpoints:
 - `GET /control/v1/sessions/retention`
 - `GET /control/v1/providers/status`
 - `GET /control/v1/orchestration/lanes`
+- `GET /control/v1/plugins/status`
+- `GET /control/v1/skills`
+- `GET /control/v1/subagents/jobs`
+- `GET /control/v1/subagents/jobs/:id`
+- `GET /control/v1/subagents/jobs/:id/logs`
+- `GET /control/v1/optional/status`
 - `GET /control/v1/events` (SSE)
 
 Mutation endpoints:
@@ -56,8 +62,13 @@ Mutation endpoints:
 - `POST /control/v1/sessions`
 - `POST /control/v1/sessions/:id/switch`
 - `POST /control/v1/sessions/:id/route`
+- `POST /control/v1/sessions/:id/skills`
 - `POST /control/v1/sessions/prune`
+- `POST /control/v1/subagents/start`
+- `POST /control/v1/subagents/jobs/:id/cancel`
 - `POST /control/v1/chat/send`
+- `POST /control/v1/backup/create`
+- `POST /control/v1/backup/restore`
 - `POST /control/v1/runtime/restart`
 
 ## Examples

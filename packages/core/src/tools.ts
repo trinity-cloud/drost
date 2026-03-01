@@ -102,6 +102,27 @@ export interface AgentToolRuntime {
     turnInProgress: boolean;
     historyCount: number;
   }>;
+  startSubagent?: (params: {
+    sessionId: string;
+    input: string;
+    providerId?: string;
+    timeoutMs?: number;
+  }) => {
+    ok: boolean;
+    message: string;
+    job?: unknown;
+  };
+  pollSubagent?: (jobId: string) => unknown | null;
+  listSubagents?: (params?: {
+    sessionId?: string;
+    limit?: number;
+  }) => unknown[];
+  cancelSubagent?: (jobId: string) => {
+    ok: boolean;
+    message: string;
+    job?: unknown;
+  };
+  readSubagentLogs?: (jobId: string, limit?: number) => unknown[];
 }
 
 export interface BuiltInToolFactoryParams {
@@ -195,6 +216,31 @@ const agentToolSchema = z.discriminatedUnion("action", [
     reason: z.string().optional()
   })
 ]);
+
+const subagentStartToolSchema = z.object({
+  sessionId: z.string().min(1).optional(),
+  input: z.string().min(1),
+  providerId: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().optional()
+});
+
+const subagentPollToolSchema = z.object({
+  jobId: z.string().min(1)
+});
+
+const subagentListToolSchema = z.object({
+  sessionId: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(500).optional().default(50)
+});
+
+const subagentCancelToolSchema = z.object({
+  jobId: z.string().min(1)
+});
+
+const subagentLogToolSchema = z.object({
+  jobId: z.string().min(1),
+  limit: z.number().int().positive().max(1000).optional().default(200)
+});
 
 const codeSearchToolSchema = z.object({
   query: z.string().min(1),
@@ -1629,5 +1675,95 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
     }
   });
 
-  return [fileTool, codeSearchTool, codeReadContextTool, codeStatusTool, codeDiffTool, codePatchTool, shellTool, webTool, agentTool];
+  const subagentStartTool = defineTool({
+    name: "subagent.start",
+    description: "Start an asynchronous subagent job",
+    parameters: subagentStartToolSchema,
+    execute: async (rawInput, context) => {
+      const input = subagentStartToolSchema.parse(rawInput);
+      if (!params.agent?.startSubagent) {
+        throw new Error("Subagent runtime is not available");
+      }
+      return params.agent.startSubagent({
+        sessionId: input.sessionId?.trim() || context.sessionId,
+        input: input.input,
+        providerId: input.providerId,
+        timeoutMs: input.timeoutMs
+      });
+    }
+  });
+
+  const subagentPollTool = defineTool({
+    name: "subagent.poll",
+    description: "Read a subagent job status",
+    parameters: subagentPollToolSchema,
+    execute: async (rawInput) => {
+      const input = subagentPollToolSchema.parse(rawInput);
+      if (!params.agent?.pollSubagent) {
+        throw new Error("Subagent runtime is not available");
+      }
+      const job = params.agent.pollSubagent(input.jobId);
+      if (!job) {
+        throw new Error(`Unknown subagent job: ${input.jobId}`);
+      }
+      return {
+        ok: true,
+        job
+      };
+    }
+  });
+
+  const subagentListTool = defineTool({
+    name: "subagent.list",
+    description: "List subagent jobs",
+    parameters: subagentListToolSchema,
+    execute: async (rawInput) => {
+      const input = subagentListToolSchema.parse(rawInput);
+      if (!params.agent?.listSubagents) {
+        throw new Error("Subagent runtime is not available");
+      }
+      return {
+        ok: true,
+        jobs: params.agent.listSubagents({
+          sessionId: input.sessionId,
+          limit: input.limit
+        })
+      };
+    }
+  });
+
+  const subagentCancelTool = defineTool({
+    name: "subagent.cancel",
+    description: "Cancel a subagent job",
+    parameters: subagentCancelToolSchema,
+    execute: async (rawInput) => {
+      const input = subagentCancelToolSchema.parse(rawInput);
+      if (!params.agent?.cancelSubagent) {
+        throw new Error("Subagent runtime is not available");
+      }
+      return params.agent.cancelSubagent(input.jobId);
+    }
+  });
+
+  const subagentLogTool = defineTool({
+    name: "subagent.log",
+    description: "Read subagent logs",
+    parameters: subagentLogToolSchema,
+    execute: async (rawInput) => {
+      const input = subagentLogToolSchema.parse(rawInput);
+      if (!params.agent?.readSubagentLogs) {
+        throw new Error("Subagent runtime is not available");
+      }
+      return {
+        ok: true,
+        logs: params.agent.readSubagentLogs(input.jobId, input.limit)
+      };
+    }
+  });
+
+  const builtIns = [fileTool, codeSearchTool, codeReadContextTool, codeStatusTool, codeDiffTool, codePatchTool, shellTool, webTool, agentTool];
+  if (params.agent?.startSubagent) {
+    builtIns.push(subagentStartTool, subagentPollTool, subagentListTool, subagentCancelTool, subagentLogTool);
+  }
+  return builtIns;
 }

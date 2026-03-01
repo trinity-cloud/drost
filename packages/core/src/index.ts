@@ -6,6 +6,15 @@ export { defineAgent, loadAgentDefinition } from "./agent.js";
 export type {
   GatewayConfig,
   ProviderRuntimeConfig,
+  GatewayPluginsConfig,
+  SkillInjectionMode,
+  GatewaySkillsConfig,
+  GatewaySubagentsConfig,
+  GatewayMemoryModuleConfig,
+  GatewayGraphModuleConfig,
+  GatewaySchedulerModuleConfig,
+  GatewayBackupModuleConfig,
+  GatewayOptionalModulesConfig,
   GatewayHooks,
   GatewayHealthConfig,
   SessionStoreConfig,
@@ -152,3 +161,37 @@ export { SessionContinuityRuntime } from "./continuity.js";
 
 export type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
 export { buildChannelSessionId, createChannelSessionOrigin } from "./session-mapping.js";
+
+export type {
+  PluginDefinition,
+  PluginHooks,
+  PluginRuntimeStatus,
+  PluginLoadDiagnostic,
+  PluginLoadBlockedReason
+} from "./plugins/types.js";
+export { PluginRuntime } from "./plugins/runtime.js";
+
+export type {
+  SkillRecord,
+  SkillBlockedRecord,
+  SkillRuntimeStatus,
+  SkillInjectionPlan,
+  SkillSelection
+} from "./skills/types.js";
+export { SkillRuntime } from "./skills/runtime.js";
+
+export type {
+  SubagentJobStatus,
+  SubagentJobRecord,
+  SubagentLogRecord,
+  SubagentStartRequest,
+  SubagentStartResult,
+  SubagentCancelResult,
+  SubagentManagerStatus,
+  SubagentManagerRuntime,
+  SubagentManagerParams
+} from "./subagents/types.js";
+export { SubagentManager } from "./subagents/manager.js";
+
+export type { OptionalModuleStatus } from "./optional/runtime.js";
+export { OptionalModuleRuntime } from "./optional/runtime.js";

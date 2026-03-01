@@ -85,6 +85,50 @@ export default {
     runtimeEventsEnabled: true,
     toolTracesEnabled: true,
     usageEventsEnabled: true
+  },
+  plugins: {
+    enabled: true,
+    modules: ["./plugins/prefixer.ts"],
+    trustedRoots: ["./plugins"],
+    allowlist: ["prefixer"]
+  },
+  skills: {
+    enabled: true,
+    roots: ["./skills"],
+    allow: [],
+    deny: [],
+    injectionMode: "relevant",
+    maxInjected: 3
+  },
+  subagents: {
+    enabled: true,
+    maxParallelJobs: 2,
+    defaultTimeoutMs: 120000,
+    allowNested: false,
+    lockMode: "none"
+  },
+  optionalModules: {
+    memory: {
+      enabled: false,
+      provider: "filesystem",
+      directory: "./.drost/memory"
+    },
+    graph: {
+      enabled: false,
+      provider: "filesystem",
+      directory: "./.drost/graph"
+    },
+    scheduler: {
+      enabled: false,
+      heartbeatIntervalMs: 10000,
+      heartbeatFile: "./.drost/automation/heartbeat.json"
+    },
+    backup: {
+      enabled: false,
+      directory: "./.drost/backups",
+      includeObservability: true,
+      includeSubagents: true
+    }
   }
 };
 ```
@@ -130,3 +174,26 @@ export default {
 
 - Writes JSONL streams for runtime events, tool traces, and usage events.
 - Supports per-stream enable flags.
+
+`plugins`
+
+- Loads plugin modules with trusted-root and allowlist checks.
+- Supports lifecycle hooks (`init/start/stop`) and hook dispatch (`beforeTurn`, `afterTurn`, `onToolResult`).
+
+`skills`
+
+- Discovers `SKILL.md` trees from configured roots.
+- Supports allow/deny gating and injection modes: `off`, `all`, `relevant`.
+- Supports per-session override via control API.
+
+`subagents`
+
+- Enables async delegated jobs with persistence and restart recovery.
+- Exposes tool commands (`subagent.start`, `subagent.poll`, `subagent.list`, `subagent.cancel`, `subagent.log`).
+- Exposes control API surfaces under `/control/v1/subagents/*`.
+
+`optionalModules`
+
+- Optional memory, graph, scheduler/heartbeat, and backup/restore runtimes.
+- Disabled modules remain inert by design.
+- Status and preflight diagnostics are available via control API.

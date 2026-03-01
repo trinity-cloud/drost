@@ -104,10 +104,6 @@ drost providers probe 20000
 - [Release v0.1.0-rc.1](docs/releases/v0.1.0-rc.1.md)
 - [P0 RC1 Migration](docs/migrations/2026-03-01-p0-rc1.md)
 
-## Planning
-
-- North star: `product-planning/00-north-star/vision.md`
-- Completion matrix: `product-planning/00-north-star-completion/03-acceptance-matrix.md`
 
 ## Contributing
 

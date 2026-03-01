@@ -62,6 +62,13 @@ import {
   type SessionOriginIdentity
 } from "./sessions.js";
 import { SessionContinuityRuntime } from "./continuity.js";
+import { PluginRuntime } from "./plugins/runtime.js";
+import type { PluginRuntimeStatus } from "./plugins/types.js";
+import { SkillRuntime } from "./skills/runtime.js";
+import type { SkillRuntimeStatus } from "./skills/types.js";
+import { SubagentManager } from "./subagents/manager.js";
+import type { SubagentJobRecord, SubagentLogRecord, SubagentManagerStatus } from "./subagents/types.js";
+import { OptionalModuleRuntime, type OptionalModuleStatus } from "./optional/runtime.js";
 import {
   buildChannelSessionId,
   createChannelSessionOrigin,
@@ -69,6 +76,7 @@ import {
   type ChannelSessionMappingOptions
 } from "./session-mapping.js";
 import { normalizeMutableRoots } from "./path-policy.js";
+import type { SkillInjectionMode } from "./config.js";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_RESTART_HISTORY_FILE = path.join(".drost", "restart-history.json");
@@ -124,6 +132,10 @@ export interface GatewayStatus {
   };
   healthUrl?: string;
   controlUrl?: string;
+  plugins?: PluginRuntimeStatus;
+  skills?: SkillRuntimeStatus;
+  subagents?: SubagentManagerStatus;
+  optionalModules?: OptionalModuleStatus[];
 }
 
 export interface SessionSnapshot {
@@ -231,7 +243,13 @@ export type GatewayRuntimeEventType =
   | "orchestration.started"
   | "orchestration.completed"
   | "orchestration.dropped"
-  | "tool.policy.denied";
+  | "tool.policy.denied"
+  | "subagent.job.queued"
+  | "subagent.job.running"
+  | "subagent.job.completed"
+  | "subagent.job.failed"
+  | "subagent.job.cancelled"
+  | "subagent.job.timed_out";
 
 export interface GatewayRuntimeEvent {
   type: GatewayRuntimeEventType;
@@ -590,6 +608,11 @@ export class GatewayRuntime {
   private continuityRuntime: SessionContinuityRuntime | null = null;
   private observabilityDirectory: string;
   private observabilityWriteFailed = false;
+  private pluginRuntime: PluginRuntime | null = null;
+  private skillRuntime: SkillRuntime | null = null;
+  private sessionSkillInjectionOverrides = new Map<string, SkillInjectionMode>();
+  private subagentManager: SubagentManager | null = null;
+  private optionalModuleRuntime: OptionalModuleRuntime | null = null;
 
   readonly workspaceDir: string;
   readonly toolDirectory: string;
@@ -652,7 +675,11 @@ export class GatewayRuntime {
         description: this.agentDefinition?.description
       },
       healthUrl: this.healthUrl,
-      controlUrl: this.controlUrl
+      controlUrl: this.controlUrl,
+      plugins: this.pluginRuntime?.getStatus(),
+      skills: this.skillRuntime?.getStatus(),
+      subagents: this.subagentManager?.getStatus(),
+      optionalModules: this.optionalModuleRuntime?.listStatuses()
     };
   }
 
@@ -1506,6 +1533,100 @@ export class GatewayRuntime {
       return;
     }
 
+    if (method === "GET" && pathname === `${basePath}/plugins/status`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        plugins: this.pluginRuntime?.getStatus() ?? {
+          enabled: false,
+          loaded: [],
+          blocked: [],
+          runtimeErrors: []
+        }
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/skills`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        skills: {
+          status: this.skillRuntime?.getStatus() ?? {
+            enabled: false,
+            roots: [],
+            discovered: 0,
+            allowed: 0,
+            blocked: [],
+            injectionMode: "off",
+            maxInjected: 0
+          },
+          allowed: this.skillRuntime?.listAllowed() ?? [],
+          blocked: this.skillRuntime?.listBlocked() ?? []
+        }
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/subagents/jobs`) {
+      const sessionId = url.searchParams.get("sessionId") ?? undefined;
+      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(500, requestedLimit))
+        : 50;
+      const jobs = this.listSubagentJobs({
+        sessionId: sessionId?.trim() || undefined,
+        limit
+      });
+      this.writeControlJson(response, 200, {
+        ok: true,
+        jobs,
+        total: jobs.length
+      });
+      return;
+    }
+
+    const subagentJobMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)$/);
+    if (method === "GET" && subagentJobMatch) {
+      const jobId = decodeURIComponent(subagentJobMatch[1] ?? "");
+      const job = this.getSubagentJob(jobId);
+      if (!job) {
+        this.writeControlJson(response, 404, {
+          ok: false,
+          error: "subagent_job_not_found",
+          jobId
+        });
+        return;
+      }
+      this.writeControlJson(response, 200, {
+        ok: true,
+        job
+      });
+      return;
+    }
+
+    const subagentLogsMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)\/logs$/);
+    if (method === "GET" && subagentLogsMatch) {
+      const jobId = decodeURIComponent(subagentLogsMatch[1] ?? "");
+      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(1000, requestedLimit))
+        : 200;
+      const logs = this.readSubagentLogs(jobId, limit);
+      this.writeControlJson(response, 200, {
+        ok: true,
+        jobId,
+        logs
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/optional/status`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        modules: this.optionalModuleRuntime?.doctor() ?? []
+      });
+      return;
+    }
+
     let bodyText = "";
     let body: Record<string, unknown> = {};
     if (isMutation) {
@@ -1628,6 +1749,107 @@ export class GatewayRuntime {
         ok: result.ok,
         message: result.message,
         sessionId: result.sessionId
+      });
+      return;
+    }
+
+    const sessionSkillsMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/skills$/);
+    if (method === "POST" && sessionSkillsMatch) {
+      const targetSessionId = decodeURIComponent(sessionSkillsMatch[1] ?? "");
+      const hasMode = Object.prototype.hasOwnProperty.call(body, "injectionMode");
+      let requestedMode: SkillInjectionMode | undefined;
+      if (hasMode) {
+        if (body.injectionMode === null) {
+          requestedMode = undefined;
+        } else if (
+          body.injectionMode === "off" ||
+          body.injectionMode === "all" ||
+          body.injectionMode === "relevant"
+        ) {
+          requestedMode = body.injectionMode;
+        } else {
+          this.writeControlJson(response, 400, {
+            ok: false,
+            error: "injectionMode must be one of off|all|relevant|null"
+          });
+          return;
+        }
+      }
+      const result = this.setSessionSkillInjectionMode(targetSessionId, requestedMode);
+      this.writeControlJson(response, result.ok ? 200 : 400, {
+        ok: result.ok,
+        message: result.message,
+        sessionId: result.sessionId,
+        injectionMode: result.ok ? this.getSessionSkillInjectionMode(targetSessionId) : undefined
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/subagents/start`) {
+      if (!this.subagentManager) {
+        this.writeControlJson(response, 400, {
+          ok: false,
+          error: "subagents_disabled"
+        });
+        return;
+      }
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+      const input = typeof body.input === "string" ? body.input : "";
+      const providerId = typeof body.providerId === "string" ? body.providerId : undefined;
+      const timeoutMs = typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
+      const started = this.subagentManager.startJob({
+        sessionId,
+        input,
+        providerId,
+        timeoutMs
+      });
+      this.writeControlJson(response, started.ok ? 200 : 400, {
+        ok: started.ok,
+        message: started.message,
+        job: started.job
+      });
+      return;
+    }
+
+    const subagentCancelMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)\/cancel$/);
+    if (method === "POST" && subagentCancelMatch) {
+      const jobId = decodeURIComponent(subagentCancelMatch[1] ?? "");
+      const cancelled = this.cancelSubagentJob(jobId);
+      this.writeControlJson(response, cancelled.ok ? 200 : 400, {
+        ok: cancelled.ok,
+        message: cancelled.message,
+        job: cancelled.job
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/backup/create`) {
+      const outputDirectory = typeof body.outputDirectory === "string" ? body.outputDirectory : undefined;
+      const created = this.optionalModuleRuntime?.createBackup({
+        outputDirectory
+      }) ?? {
+        ok: false,
+        message: "Optional modules runtime unavailable"
+      };
+      this.writeControlJson(response, created.ok ? 200 : 400, {
+        ok: created.ok,
+        message: created.message,
+        backupPath: created.backupPath
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/backup/restore`) {
+      const backupPath = typeof body.backupPath === "string" ? body.backupPath : "";
+      const restored = this.optionalModuleRuntime?.restoreBackup({
+        backupPath
+      }) ?? {
+        ok: false,
+        message: "Optional modules runtime unavailable"
+      };
+      this.writeControlJson(response, restored.ok ? 200 : 400, {
+        ok: restored.ok,
+        message: restored.message
       });
       return;
     }
@@ -1792,6 +2014,211 @@ export class GatewayRuntime {
     };
   }
 
+  private configuredSkillMode(): SkillInjectionMode {
+    const mode = this.config.skills?.injectionMode;
+    if (mode === "all" || mode === "relevant") {
+      return mode;
+    }
+    return "off";
+  }
+
+  private skillModeForSession(sessionId: string): SkillInjectionMode {
+    const override = this.sessionSkillInjectionOverrides.get(sessionId);
+    if (override) {
+      return override;
+    }
+    const metadataMode = this.getSessionState(sessionId)?.metadata?.skillInjectionMode;
+    if (metadataMode === "off" || metadataMode === "all" || metadataMode === "relevant") {
+      return metadataMode;
+    }
+    return this.configuredSkillMode();
+  }
+
+  setSessionSkillInjectionMode(
+    sessionId: string,
+    mode?: SkillInjectionMode
+  ): SessionMutationResult {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) {
+      return {
+        ok: false,
+        message: "sessionId is required"
+      };
+    }
+    if (!this.sessionExists(normalizedSessionId)) {
+      return {
+        ok: false,
+        message: `Unknown session: ${normalizedSessionId}`
+      };
+    }
+    this.ensureSession(normalizedSessionId);
+    if (mode !== undefined && mode !== "off" && mode !== "all" && mode !== "relevant") {
+      return {
+        ok: false,
+        message: `Invalid skill injection mode: ${String(mode)}`
+      };
+    }
+
+    if (mode) {
+      this.sessionSkillInjectionOverrides.set(normalizedSessionId, mode);
+    } else {
+      this.sessionSkillInjectionOverrides.delete(normalizedSessionId);
+    }
+
+    const manager = this.ensureProviderManager();
+    manager?.updateSessionMetadata(normalizedSessionId, {
+      skillInjectionMode: mode
+    });
+    this.persistSessionState(normalizedSessionId);
+    return {
+      ok: true,
+      message: mode
+        ? `Session ${normalizedSessionId} skill injection mode set to ${mode}`
+        : `Session ${normalizedSessionId} skill injection mode cleared`,
+      sessionId: normalizedSessionId
+    };
+  }
+
+  getSessionSkillInjectionMode(sessionId: string): SkillInjectionMode {
+    return this.skillModeForSession(sessionId);
+  }
+
+  private applySkillInjection(sessionId: string, input: string): {
+    input: string;
+    mode: SkillInjectionMode;
+    skillIds: string[];
+  } {
+    const runtime = this.skillRuntime;
+    if (!runtime) {
+      return {
+        input,
+        mode: "off",
+        skillIds: []
+      };
+    }
+    const mode = this.skillModeForSession(sessionId);
+    const plan = runtime.buildInjectionPlan({
+      input,
+      mode
+    });
+    const skillIds = plan.selected.map((entry) => entry.skill.id);
+    if (!plan.text || skillIds.length === 0) {
+      return {
+        input,
+        mode: plan.mode,
+        skillIds
+      };
+    }
+    const injectedInput = `${plan.text}\n\n[USER REQUEST]\n${input}`;
+    return {
+      input: injectedInput,
+      mode: plan.mode,
+      skillIds
+    };
+  }
+
+  private createSubagentManager(): SubagentManager | null {
+    if (!(this.config.subagents?.enabled ?? false)) {
+      return null;
+    }
+    return new SubagentManager({
+      workspaceDir: this.workspaceDir,
+      config: this.config.subagents,
+      runtime: {
+        runDelegatedTurn: async (params) => {
+          this.ensureSession(params.subSessionId, {
+            title: `Subagent ${params.jobId}`,
+            origin: {
+              channel: "subagent",
+              threadId: params.sessionId
+            }
+          });
+          if (params.providerId) {
+            try {
+              this.queueSessionProviderSwitch(params.subSessionId, params.providerId);
+            } catch {
+              // provider override is best-effort for delegated run
+            }
+          }
+          await this.runSessionTurn({
+            sessionId: params.subSessionId,
+            input: params.input,
+            onEvent: () => undefined,
+            signal: params.signal
+          });
+          const response =
+            this.getSessionHistory(params.subSessionId)
+              .filter((message) => message.role === "assistant")
+              .at(-1)?.content ?? "";
+          return {
+            response
+          };
+        },
+        onStatusChange: (job) => {
+          const statusEventType = (() => {
+            if (job.status === "queued") {
+              return "subagent.job.queued";
+            }
+            if (job.status === "running") {
+              return "subagent.job.running";
+            }
+            if (job.status === "completed") {
+              return "subagent.job.completed";
+            }
+            if (job.status === "cancelled") {
+              return "subagent.job.cancelled";
+            }
+            if (job.status === "timed_out") {
+              return "subagent.job.timed_out";
+            }
+            return "subagent.job.failed";
+          })();
+          this.emitRuntimeEvent(statusEventType, {
+            jobId: job.jobId,
+            sessionId: job.sessionId,
+            status: job.status,
+            subSessionId: job.subSessionId,
+            error: job.error
+          });
+          this.appendSessionEvent(job.sessionId, "subagent.status", {
+            jobId: job.jobId,
+            status: job.status,
+            subSessionId: job.subSessionId,
+            error: job.error
+          });
+        }
+      }
+    });
+  }
+
+  listSubagentJobs(params?: { sessionId?: string; limit?: number }): SubagentJobRecord[] {
+    if (!this.subagentManager) {
+      return [];
+    }
+    return this.subagentManager.listJobs(params);
+  }
+
+  getSubagentJob(jobId: string): SubagentJobRecord | null {
+    return this.subagentManager?.getJob(jobId) ?? null;
+  }
+
+  cancelSubagentJob(jobId: string): { ok: boolean; message: string; job?: SubagentJobRecord } {
+    if (!this.subagentManager) {
+      return {
+        ok: false,
+        message: "Subagent runtime is disabled"
+      };
+    }
+    return this.subagentManager.cancelJob(jobId);
+  }
+
+  readSubagentLogs(jobId: string, limit = 200): SubagentLogRecord[] {
+    if (!this.subagentManager) {
+      return [];
+    }
+    return this.subagentManager.readJobLogs(jobId, limit);
+  }
+
   private async dispatchChannelCommandRequest(
     request: ChannelCommandRequest
   ): Promise<ChannelCommandResult> {
@@ -1916,6 +2343,7 @@ export class GatewayRuntime {
   }
 
   private buildBootToolList(): ToolDefinition[] {
+    const subagentEnabled = Boolean(this.subagentManager);
     const builtInTools =
       this.config.builtInTools ??
       createDefaultBuiltInTools({
@@ -1932,19 +2360,48 @@ export class GatewayRuntime {
           },
           readStatus: () => this.getStatus(),
           listLoadedToolNames: () => this.listLoadedToolNames(),
-          listSessionSnapshots: () => this.listSessionSnapshots()
+          listSessionSnapshots: () => this.listSessionSnapshots(),
+          startSubagent: subagentEnabled
+            ? (params) => this.subagentManager!.startJob(params)
+            : undefined,
+          pollSubagent: subagentEnabled
+            ? (jobId) => this.subagentManager!.getJob(jobId)
+            : undefined,
+          listSubagents: subagentEnabled
+            ? (params) => this.subagentManager!.listJobs(params)
+            : undefined,
+          cancelSubagent: subagentEnabled
+            ? (jobId) => this.subagentManager!.cancelJob(jobId)
+            : undefined,
+          readSubagentLogs: subagentEnabled
+            ? (jobId, limit) => this.subagentManager!.readJobLogs(jobId, limit)
+            : undefined
         }
       });
-
-    if (!this.agentDefinition?.tools || this.agentDefinition.tools.length === 0) {
-      return builtInTools;
-    }
 
     const names = new Set<string>();
     const merged: ToolDefinition[] = [];
     for (const tool of builtInTools) {
       merged.push(tool);
       names.add(tool.name);
+    }
+
+    for (const pluginTools of this.pluginRuntime?.listTools() ?? []) {
+      for (const tool of pluginTools.tools ?? []) {
+        const normalizedName = tool.name.trim();
+        if (names.has(normalizedName)) {
+          this.degradedReasons.push(
+            `Plugin tool "${normalizedName}" from ${pluginTools.pluginId} collides with existing tool name and was skipped`
+          );
+          continue;
+        }
+        names.add(normalizedName);
+        merged.push(tool);
+      }
+    }
+
+    if (!this.agentDefinition?.tools || this.agentDefinition.tools.length === 0) {
+      return merged;
     }
 
     for (const agentTool of this.agentDefinition.tools) {
@@ -2010,6 +2467,13 @@ export class GatewayRuntime {
     });
     if (loaded.record.metadata.providerRouteId) {
       this.sessionProviderRouteOverrides.set(sessionId, loaded.record.metadata.providerRouteId);
+    }
+    if (
+      loaded.record.metadata.skillInjectionMode === "off" ||
+      loaded.record.metadata.skillInjectionMode === "all" ||
+      loaded.record.metadata.skillInjectionMode === "relevant"
+    ) {
+      this.sessionSkillInjectionOverrides.set(sessionId, loaded.record.metadata.skillInjectionMode);
     }
   }
 
@@ -2093,6 +2557,46 @@ export class GatewayRuntime {
     this.loadRestartHistory();
     this.restoreOrchestrationState();
     await this.loadConfiguredAgentDefinition();
+    this.pluginRuntime =
+      this.config.plugins?.enabled === true
+        ? new PluginRuntime({
+            workspaceDir: this.workspaceDir,
+            context: this.runtimeContext(),
+            config: this.config.plugins
+          })
+        : null;
+    if (this.pluginRuntime) {
+      await this.pluginRuntime.load();
+      for (const blocked of this.pluginRuntime.getStatus().blocked) {
+        this.degradedReasons.push(
+          `Plugin blocked (${blocked.reason}) ${blocked.pluginId ?? blocked.modulePath}: ${blocked.message}`
+        );
+      }
+      for (const pluginChannels of this.pluginRuntime.listChannels()) {
+        for (const channel of pluginChannels.channels ?? []) {
+          try {
+            this.registerChannelAdapter(channel);
+          } catch (error) {
+            this.degradedReasons.push(
+              `Plugin ${pluginChannels.pluginId} channel registration failed (${channel.id}): ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        }
+      }
+    }
+    this.skillRuntime =
+      this.config.skills?.enabled === true
+        ? new SkillRuntime({
+            workspaceDir: this.workspaceDir,
+            config: this.config.skills
+          })
+        : null;
+    this.skillRuntime?.refresh();
+    this.subagentManager = this.createSubagentManager();
+    this.optionalModuleRuntime = new OptionalModuleRuntime({
+      workspaceDir: this.workspaceDir,
+      config: this.config.optionalModules
+    });
 
     const toolRegistryResult = await buildToolRegistry({
       builtInTools: this.buildBootToolList(),
@@ -2150,6 +2654,21 @@ export class GatewayRuntime {
         );
       }
     }
+    if (this.pluginRuntime) {
+      await this.pluginRuntime.start();
+      for (const runtimeError of this.pluginRuntime.getStatus().runtimeErrors) {
+        this.degradedReasons.push(
+          `Plugin ${runtimeError.pluginId} ${runtimeError.phase} error: ${runtimeError.message}`
+        );
+      }
+    }
+    this.optionalModuleRuntime.start();
+    for (const status of this.optionalModuleRuntime.listStatuses()) {
+      if (status.enabled && !status.healthy) {
+        this.degradedReasons.push(`Optional module ${status.module} unhealthy: ${status.message}`);
+      }
+    }
+    this.subagentManager?.start();
 
     await this.connectChannels();
 
@@ -2212,6 +2731,11 @@ export class GatewayRuntime {
     }
     this.channelLanes.clear();
     await this.disconnectChannels();
+    await this.subagentManager?.stop();
+    this.optionalModuleRuntime?.stop();
+    if (this.pluginRuntime) {
+      await this.pluginRuntime.stop();
+    }
     if (this.agentDefinition?.hooks?.onStop) {
       try {
         await this.agentDefinition.hooks.onStop(this.runtimeContext());
@@ -2222,6 +2746,10 @@ export class GatewayRuntime {
       }
     }
     await this.config.hooks?.onShutdown?.();
+    this.subagentManager = null;
+    this.skillRuntime = null;
+    this.pluginRuntime = null;
+    this.optionalModuleRuntime = null;
     this.state = "stopped";
     this.emitRuntimeEvent("gateway.stopped", {
       state: this.state
@@ -2369,6 +2897,34 @@ export class GatewayRuntime {
         path: "failover",
         reason: "restart_required",
         message: "failover configuration requires restart to rebuild provider manager"
+      });
+    }
+    if (patch.plugins !== undefined) {
+      rejected.push({
+        path: "plugins",
+        reason: "restart_required",
+        message: "plugin runtime configuration requires restart"
+      });
+    }
+    if (patch.skills !== undefined) {
+      rejected.push({
+        path: "skills",
+        reason: "restart_required",
+        message: "skills runtime configuration requires restart"
+      });
+    }
+    if (patch.subagents !== undefined) {
+      rejected.push({
+        path: "subagents",
+        reason: "restart_required",
+        message: "subagent runtime configuration requires restart"
+      });
+    }
+    if (patch.optionalModules !== undefined) {
+      rejected.push({
+        path: "optionalModules",
+        reason: "restart_required",
+        message: "optional module configuration requires restart"
       });
     }
 
@@ -2740,6 +3296,7 @@ export class GatewayRuntime {
       };
     }
 
+    const providerId = this.resolveToolProviderId(params.sessionId, params.providerId);
     const policyCheck = this.isToolAllowed(toolName);
     if (!policyCheck.allowed) {
       const deniedReason = policyCheck.reason ?? `Tool "${toolName}" denied by policy`;
@@ -2762,6 +3319,19 @@ export class GatewayRuntime {
         },
         this.config.observability?.usageEventsEnabled
       );
+      await this.pluginRuntime?.runOnToolResult({
+        sessionId: params.sessionId,
+        providerId,
+        toolName,
+        input: params.input,
+        result: {
+          ok: false,
+          error: {
+            code: "policy_denied",
+            message: deniedReason
+          }
+        }
+      });
       return {
         toolName,
         ok: false,
@@ -2771,8 +3341,6 @@ export class GatewayRuntime {
         }
       };
     }
-
-    const providerId = this.resolveToolProviderId(params.sessionId, params.providerId);
     const timestamp = nowIso();
     params.onEvent?.({
       type: "tool.call.started",
@@ -2856,6 +3424,19 @@ export class GatewayRuntime {
       );
 
       if (result.error?.code === "validation_error") {
+        await this.pluginRuntime?.runOnToolResult({
+          sessionId: params.sessionId,
+          providerId,
+          toolName,
+          input: params.input,
+          result: {
+            ok: false,
+            error: {
+              code: "validation_error",
+              message: result.error.message
+            }
+          }
+        });
         return {
           toolName,
           ok: false,
@@ -2867,6 +3448,19 @@ export class GatewayRuntime {
         };
       }
 
+      await this.pluginRuntime?.runOnToolResult({
+        sessionId: params.sessionId,
+        providerId,
+        toolName,
+        input: params.input,
+        result: {
+          ok: false,
+          error: {
+            code: result.error?.code ?? "execution_error",
+            message: result.error?.message ?? "Tool execution failed"
+          }
+        }
+      });
       return {
         toolName,
         ok: false,
@@ -2912,6 +3506,16 @@ export class GatewayRuntime {
       },
       this.config.observability?.toolTracesEnabled
     );
+    await this.pluginRuntime?.runOnToolResult({
+      sessionId: params.sessionId,
+      providerId,
+      toolName,
+      input: params.input,
+      result: {
+        ok: true,
+        output: result.output
+      }
+    });
 
     return {
       toolName,
@@ -3118,17 +3722,31 @@ export class GatewayRuntime {
     const historyBeforeCount = manager.getSessionHistory(params.sessionId).length;
     const session = manager.getSession(params.sessionId);
     const activeProviderId = session?.activeProviderId;
+    const runtimeContext = this.runtimeContext();
     let input = params.input;
+    input = await this.pluginRuntime?.runBeforeTurn({
+      sessionId: params.sessionId,
+      input,
+      providerId: activeProviderId
+    }) ?? input;
     if (this.agentDefinition?.hooks?.beforeTurn) {
       const hookResult = await this.agentDefinition.hooks.beforeTurn({
         sessionId: params.sessionId,
         input,
         providerId: activeProviderId,
-        runtime: this.runtimeContext()
+        runtime: runtimeContext
       });
       if (hookResult && typeof hookResult.input === "string") {
         input = hookResult.input;
       }
+    }
+    const skillInjection = this.applySkillInjection(params.sessionId, input);
+    input = skillInjection.input;
+    if (skillInjection.skillIds.length > 0) {
+      this.appendSessionEvent(params.sessionId, "skills.injected", {
+        mode: skillInjection.mode,
+        skills: skillInjection.skillIds
+      });
     }
 
     let runSucceeded = false;
@@ -3182,7 +3800,9 @@ export class GatewayRuntime {
             inputChars: input.length,
             outputChars: assistantText ? assistantText.length : 0,
             historyBeforeCount,
-            historyAfterCount: history.length
+            historyAfterCount: history.length,
+            skillInjectionMode: skillInjection.mode,
+            skillsInjected: skillInjection.skillIds
           },
           this.config.observability?.usageEventsEnabled
         );
@@ -3193,7 +3813,7 @@ export class GatewayRuntime {
             sessionId: params.sessionId,
             input,
             providerId: activeProviderId,
-            runtime: this.runtimeContext(),
+            runtime: runtimeContext,
             output: {
               historyCount: manager.getSessionHistory(params.sessionId).length
             }
@@ -3204,6 +3824,22 @@ export class GatewayRuntime {
           );
           this.state = "degraded";
         }
+      }
+      if (runSucceeded && this.pluginRuntime) {
+        const history = manager.getSessionHistory(params.sessionId);
+        const assistantResponse =
+          history
+            .filter((message) => message.role === "assistant")
+            .at(-1)?.content;
+        await this.pluginRuntime.runAfterTurn({
+          sessionId: params.sessionId,
+          input,
+          providerId: this.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId,
+          output: {
+            historyCount: history.length,
+            response: assistantResponse
+          }
+        });
       }
       this.persistSessionState(params.sessionId);
     }
@@ -3616,6 +4252,7 @@ export class GatewayRuntime {
       sessionId
     });
     this.sessionProviderRouteOverrides.delete(sessionId);
+    this.sessionSkillInjectionOverrides.delete(sessionId);
     return {
       ok: true,
       message: `Deleted session ${sessionId}`,
@@ -3713,6 +4350,11 @@ export class GatewayRuntime {
     if (routeOverride) {
       this.sessionProviderRouteOverrides.set(params.toSessionId, routeOverride);
     }
+    const skillModeOverride = this.sessionSkillInjectionOverrides.get(params.fromSessionId);
+    this.sessionSkillInjectionOverrides.delete(params.fromSessionId);
+    if (skillModeOverride) {
+      this.sessionSkillInjectionOverrides.set(params.toSessionId, skillModeOverride);
+    }
     return {
       ok: true,
       message: `Renamed session ${params.fromSessionId} -> ${params.toSessionId}`,
@@ -3801,6 +4443,13 @@ export class GatewayRuntime {
       });
       if (imported.metadata.providerRouteId) {
         this.sessionProviderRouteOverrides.set(imported.sessionId, imported.metadata.providerRouteId);
+      }
+      if (
+        imported.metadata.skillInjectionMode === "off" ||
+        imported.metadata.skillInjectionMode === "all" ||
+        imported.metadata.skillInjectionMode === "relevant"
+      ) {
+        this.sessionSkillInjectionOverrides.set(imported.sessionId, imported.metadata.skillInjectionMode);
       }
       return {
         ok: true,

@@ -28,6 +28,7 @@ export interface SessionMetadata {
   title?: string;
   origin?: SessionOriginIdentity;
   providerRouteId?: string;
+  skillInjectionMode?: "off" | "all" | "relevant";
 }
 
 export interface LoadedSessionRecord {
@@ -52,6 +53,7 @@ export interface SessionIndexEntry {
   title?: string;
   origin?: SessionOriginIdentity;
   providerRouteId?: string;
+  skillInjectionMode?: "off" | "all" | "relevant";
 }
 
 interface SessionIndexLine extends SessionIndexEntry {
@@ -301,6 +303,18 @@ function normalizeMetadata(params: {
   if (routeIdCandidate.length > 0) {
     metadata.providerRouteId = routeIdCandidate;
   }
+  const skillInjectionModeCandidate =
+    params.override?.skillInjectionMode ??
+    (raw.skillInjectionMode === "off" || raw.skillInjectionMode === "all" || raw.skillInjectionMode === "relevant"
+      ? raw.skillInjectionMode
+      : previous?.skillInjectionMode);
+  if (
+    skillInjectionModeCandidate === "off" ||
+    skillInjectionModeCandidate === "all" ||
+    skillInjectionModeCandidate === "relevant"
+  ) {
+    metadata.skillInjectionMode = skillInjectionModeCandidate;
+  }
 
   return metadata;
 }
@@ -337,7 +351,8 @@ function toIndexEntry(record: LoadedSessionRecord): SessionIndexEntry {
     lastActivityAt: record.metadata.lastActivityAt,
     title: record.metadata.title,
     origin: record.metadata.origin,
-    providerRouteId: record.metadata.providerRouteId
+    providerRouteId: record.metadata.providerRouteId,
+    skillInjectionMode: record.metadata.skillInjectionMode
   };
 }
 
@@ -393,6 +408,13 @@ function parseIndexLine(value: unknown): SessionIndexEntry | null {
   }
   if (typeof record.providerRouteId === "string" && record.providerRouteId.trim().length > 0) {
     entry.providerRouteId = record.providerRouteId.trim();
+  }
+  if (
+    record.skillInjectionMode === "off" ||
+    record.skillInjectionMode === "all" ||
+    record.skillInjectionMode === "relevant"
+  ) {
+    entry.skillInjectionMode = record.skillInjectionMode;
   }
   return entry;
 }

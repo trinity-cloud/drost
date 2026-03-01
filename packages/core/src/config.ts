@@ -171,6 +171,67 @@ export interface GatewayObservabilityConfig {
   runtimeEventsEnabled?: boolean;
 }
 
+export interface GatewayPluginsConfig {
+  enabled?: boolean;
+  modules?: string[];
+  allowlist?: string[];
+  trustedRoots?: string[];
+}
+
+export type SkillInjectionMode = "off" | "all" | "relevant";
+
+export interface GatewaySkillsConfig {
+  enabled?: boolean;
+  roots?: string[];
+  allow?: string[];
+  deny?: string[];
+  injectionMode?: SkillInjectionMode;
+  maxInjected?: number;
+}
+
+export interface GatewaySubagentsConfig {
+  enabled?: boolean;
+  maxParallelJobs?: number;
+  defaultTimeoutMs?: number;
+  allowNested?: boolean;
+  lockMode?: "none" | "workspace" | "exclusive";
+}
+
+export interface GatewayMemoryModuleConfig {
+  enabled?: boolean;
+  provider?: "filesystem" | "postgres";
+  directory?: string;
+  postgresUrl?: string;
+  vectorEnabled?: boolean;
+}
+
+export interface GatewayGraphModuleConfig {
+  enabled?: boolean;
+  provider?: "filesystem" | "neo4j";
+  directory?: string;
+  neo4jUrl?: string;
+}
+
+export interface GatewaySchedulerModuleConfig {
+  enabled?: boolean;
+  heartbeatIntervalMs?: number;
+  heartbeatFile?: string;
+}
+
+export interface GatewayBackupModuleConfig {
+  enabled?: boolean;
+  directory?: string;
+  includeObservability?: boolean;
+  includeSubagents?: boolean;
+}
+
+export interface GatewayOptionalModulesConfig {
+  memory?: GatewayMemoryModuleConfig;
+  graph?: GatewayGraphModuleConfig;
+  scheduler?: GatewaySchedulerModuleConfig;
+  backup?: GatewayBackupModuleConfig;
+}
+
 export interface GatewayConfig {
   workspaceDir: string;
   toolDirectory?: string;
@@ -189,6 +250,10 @@ export interface GatewayConfig {
   failover?: GatewayFailoverConfig;
   controlApi?: GatewayControlApiConfig;
   observability?: GatewayObservabilityConfig;
+  plugins?: GatewayPluginsConfig;
+  skills?: GatewaySkillsConfig;
+  subagents?: GatewaySubagentsConfig;
+  optionalModules?: GatewayOptionalModulesConfig;
   providers?: ProviderRuntimeConfig;
   restartPolicy?: GatewayRestartPolicyConfig;
   hooks?: GatewayHooks;
