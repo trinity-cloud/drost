@@ -151,4 +151,131 @@ describe("openai responses adapter", () => {
     const firstUrl = String(firstCall[0] ?? "");
     expect(firstUrl).toBe("https://api.x.ai/v1/responses");
   });
+
+  it("sends text and image in a single responses call", async () => {
+    const adapter = new OpenAIResponsesAdapter();
+    const imgB64 = Buffer.from("fake-image").toString("base64");
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"response.completed"}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    const fetchMock = vi.fn(async () =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Describe this image",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      inputImages: [
+        {
+          mimeType: "image/png",
+          dataBase64: imgB64
+        }
+      ],
+      resolveBearerToken: () => "sk-test",
+      emit: () => undefined
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = (fetchMock.mock.calls as Array<unknown[]>)[0] ?? [];
+    const init = (call[1] as { body?: string } | undefined) ?? {};
+    const body = JSON.parse(init.body ?? "{}") as {
+      input?: Array<{
+        role?: string;
+        content?: Array<{ type?: string; text?: string; image_url?: string }>;
+      }>;
+    };
+    const firstMessage = body.input?.[0];
+    expect(firstMessage?.role).toBe("user");
+    expect(Array.isArray(firstMessage?.content)).toBe(true);
+    expect(firstMessage?.content?.[0]).toEqual({
+      type: "input_text",
+      text: "Describe this image"
+    });
+    expect(firstMessage?.content?.[1]?.type).toBe("input_image");
+    expect(firstMessage?.content?.[1]?.image_url).toBe(`data:image/png;base64,${imgB64}`);
+  });
+
+  it("resolves persisted image refs when inputImages are not provided", async () => {
+    const adapter = new OpenAIResponsesAdapter();
+    const imgB64 = Buffer.from("persisted-image").toString("base64");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"response.completed"}\n\n'));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    const fetchMock = vi.fn(async () =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const resolveInputImageRef = vi.fn(() => ({
+      mimeType: "image/png",
+      dataBase64: imgB64
+    }));
+
+    await adapter.runTurn({
+      sessionId: "s-refs",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "What is this?",
+          createdAt: new Date().toISOString(),
+          imageRefs: [
+            {
+              id: "img_1",
+              mimeType: "image/png",
+              sha256: "a".repeat(64),
+              bytes: 12,
+              path: ".drost/media/test/a.png"
+            }
+          ]
+        }
+      ],
+      resolveInputImageRef,
+      resolveBearerToken: () => "sk-test",
+      emit: () => undefined
+    });
+
+    expect(resolveInputImageRef).toHaveBeenCalledTimes(1);
+    const call = (fetchMock.mock.calls as Array<unknown[]>)[0] ?? [];
+    const init = (call[1] as { body?: string } | undefined) ?? {};
+    const body = JSON.parse(init.body ?? "{}") as {
+      input?: Array<{
+        role?: string;
+        content?: Array<{ type?: string; image_url?: string }>;
+      }>;
+    };
+    const firstMessage = body.input?.[0];
+    expect(firstMessage?.role).toBe("user");
+    expect(firstMessage?.content?.[1]?.type).toBe("input_image");
+    expect(firstMessage?.content?.[1]?.image_url).toBe(`data:image/png;base64,${imgB64}`);
+  });
 });

@@ -1,9 +1,23 @@
 export type ChatRole = "system" | "user" | "assistant" | "tool";
 
+export interface ChatImageRef {
+  id: string;
+  mimeType: string;
+  sha256: string;
+  bytes: number;
+  path: string;
+}
+
 export interface ChatMessage {
   role: ChatRole;
   content: string;
   createdAt: string;
+  imageRefs?: ChatImageRef[];
+}
+
+export interface ChatInputImage {
+  mimeType: string;
+  dataBase64: string;
 }
 
 export interface UsageSnapshot {

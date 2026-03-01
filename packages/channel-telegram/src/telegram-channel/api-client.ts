@@ -1,6 +1,9 @@
 import { stripTelegramHtml } from "../telegram-renderer.js";
 import {
   TELEGRAM_BOT_COMMANDS,
+  type TelegramGetFileResult,
+  type TelegramInboundTurnInput,
+  type TelegramPhotoSize,
   type TelegramApiResponse,
   type TelegramSendMessageResult,
   type TelegramUpdate
@@ -19,6 +22,24 @@ async function parseApiResponse<T>(response: Response): Promise<TelegramApiRespo
 
 function buildApiUrl(baseUrl: string, token: string, method: string): string {
   return `${baseUrl.replace(/\/+$/, "")}/bot${token}/${method}`;
+}
+
+function buildFileUrl(baseUrl: string, token: string, filePath: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/file/bot${token}/${filePath.replace(/^\/+/, "")}`;
+}
+
+function inferImageMimeType(filePath: string): string {
+  const normalized = filePath.trim().toLowerCase();
+  if (normalized.endsWith(".png")) {
+    return "image/png";
+  }
+  if (normalized.endsWith(".webp")) {
+    return "image/webp";
+  }
+  if (normalized.endsWith(".gif")) {
+    return "image/gif";
+  }
+  return "image/jpeg";
 }
 
 export class TelegramApiClient {
@@ -69,6 +90,71 @@ export class TelegramApiClient {
     });
     const payload = await parseApiResponse<TelegramUpdate[]>(response);
     return Array.isArray(payload.result) ? payload.result : [];
+  }
+
+  async buildInboundTurnInput(params: {
+    text?: string;
+    caption?: string;
+    photo?: TelegramPhotoSize[];
+  }): Promise<TelegramInboundTurnInput> {
+    const input = (params.text && params.text.trim().length > 0 ? params.text : params.caption ?? "").trim();
+    const photo = params.photo ?? [];
+    if (photo.length === 0) {
+      return {
+        input,
+        inputImages: []
+      };
+    }
+    const largestPhoto = photo
+      .filter((entry) => typeof entry?.file_id === "string" && entry.file_id.trim().length > 0)
+      .sort((left, right) => {
+        const leftSize = (left.width ?? 0) * (left.height ?? 0);
+        const rightSize = (right.width ?? 0) * (right.height ?? 0);
+        if (leftSize !== rightSize) {
+          return rightSize - leftSize;
+        }
+        return (right.file_size ?? 0) - (left.file_size ?? 0);
+      })[0];
+    if (!largestPhoto) {
+      return {
+        input,
+        inputImages: []
+      };
+    }
+    const fileResponse = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "getFile"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        file_id: largestPhoto.file_id
+      })
+    });
+    const filePayload = await parseApiResponse<TelegramGetFileResult>(fileResponse);
+    const filePath = filePayload.result?.file_path?.trim();
+    if (!filePath) {
+      return {
+        input,
+        inputImages: []
+      };
+    }
+
+    const fileBytesResponse = await this.fetchImpl(buildFileUrl(this.apiBaseUrl, this.token, filePath), {
+      method: "GET"
+    });
+    if (!fileBytesResponse.ok) {
+      throw new Error(`Telegram file download failed with status ${fileBytesResponse.status}`);
+    }
+    const fileBytes = Buffer.from(await fileBytesResponse.arrayBuffer());
+    return {
+      input,
+      inputImages: [
+        {
+          mimeType: inferImageMimeType(filePath),
+          dataBase64: fileBytes.toString("base64")
+        }
+      ]
+    };
   }
 
   async sendMessage(

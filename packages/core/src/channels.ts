@@ -1,12 +1,14 @@
 import type { StreamEventHandler } from "./events.js";
 import type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
 import type { ChannelCommandResult } from "./channel-commands.js";
+import type { ChatInputImage } from "./types.js";
 
 export type { ChannelCommandResult } from "./channel-commands.js";
 
 export interface ChannelTurnRequest {
   identity: ChannelSessionIdentity;
   input: string;
+  inputImages?: ChatInputImage[];
   title?: string;
   mapping?: ChannelSessionMappingOptions;
   onEvent?: StreamEventHandler;

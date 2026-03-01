@@ -21,12 +21,13 @@ import type {
 } from "./channels.js";
 import type { ChannelCommandResult } from "./channel-commands.js";
 import type { AgentDefinition } from "./agent.js";
-import { loadAuthStore } from "./auth/store.js";
+import { loadAuthStore, saveAuthStore, upsertAuthProfile } from "./auth/store.js";
 import type { AuthStore } from "./auth/store.js";
 import { ProviderManager, type ProviderRouteSelection } from "./providers/manager.js";
+import { resolveProviderEnvToken } from "./providers/manager/auth-resolution.js";
 import type { ToolDefinition, ToolRegistryDiagnostics } from "./tools.js";
 import type { ProviderProbeResult, ProviderProfile } from "./providers/types.js";
-import type { ChatMessage } from "./types.js";
+import type { ChatInputImage, ChatMessage } from "./types.js";
 import type { LoadedSessionRecord, SessionMetadata, SessionOriginIdentity } from "./sessions.js";
 import { SessionContinuityRuntime } from "./continuity.js";
 import type { PluginRuntime } from "./plugins/runtime.js";
@@ -90,6 +91,7 @@ type OrchestrationDropPolicy = "old" | "new" | "summarize";
 
 interface PendingChannelTurn {
   input: string;
+  inputImages?: ChatInputImage[];
   onEvent: StreamEventHandler;
   resolve: (result: ChannelTurnResult) => void;
   reject: (error: unknown) => void;
@@ -98,6 +100,7 @@ interface PendingChannelTurn {
 
 interface ActiveChannelTurn {
   input: string;
+  inputImages?: ChatInputImage[];
   onEvent: StreamEventHandler;
   resolveMany: Array<(result: ChannelTurnResult) => void>;
   rejectMany: Array<(error: unknown) => void>;
@@ -204,6 +207,7 @@ export class GatewayRuntime {
     this.restartHistoryPath = path.resolve(this.workspaceDir, DEFAULT_RESTART_HISTORY_FILE);
     this.sessionStoreEnabled = this.config.sessionStore?.enabled ?? true;
     this.authStore = loadAuthStore(this.authStorePath);
+    this.bootstrapProviderAuthFromEnv();
     if (this.sessionStoreEnabled && this.config.sessionStore?.continuity?.enabled) {
       this.continuityRuntime = new SessionContinuityRuntime({
         config: this.config.sessionStore?.continuity,
@@ -213,6 +217,69 @@ export class GatewayRuntime {
     }
     for (const adapter of this.config.channels ?? []) {
       this.registerChannelAdapter(adapter);
+    }
+  }
+
+  private bootstrapProviderAuthFromEnv(): void {
+    const profiles = this.config.providers?.profiles ?? [];
+    if (profiles.length === 0) {
+      return;
+    }
+
+    let changed = false;
+    for (const profile of profiles) {
+      const authProfileId = profile.authProfileId?.trim();
+      if (!authProfileId) {
+        continue;
+      }
+      const existing = this.authStore.profiles[authProfileId];
+      const existingToken =
+        existing?.credential.type === "oauth"
+          ? existing.credential.accessToken
+          : existing?.credential.value;
+      if (typeof existingToken === "string" && existingToken.trim().length > 0) {
+        continue;
+      }
+
+      const token = resolveProviderEnvToken(profile, authProfileId);
+      if (!token) {
+        continue;
+      }
+      const lowerProviderId = profile.id.toLowerCase();
+      const lowerAuthProfileId = authProfileId.toLowerCase();
+      const looksXai =
+        lowerProviderId.includes("xai") ||
+        lowerAuthProfileId.includes("xai") ||
+        profile.baseUrl?.toLowerCase().includes("x.ai") ||
+        profile.model.toLowerCase().includes("grok");
+
+      upsertAuthProfile({
+        store: this.authStore,
+        id: authProfileId,
+        provider: profile.kind,
+        credential: looksXai
+          ? {
+              type: "api_key",
+              value: token
+            }
+          : {
+              type: "token",
+              value: token
+            }
+      });
+      changed = true;
+    }
+
+    if (!changed) {
+      return;
+    }
+    try {
+      saveAuthStore(this.authStorePath, this.authStore);
+    } catch (error) {
+      this.degradedReasons.push(
+        `Failed to persist env-backed auth profiles: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
     }
   }
 
@@ -532,6 +599,7 @@ export class GatewayRuntime {
   async runSessionTurn(params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -549,6 +617,7 @@ export class GatewayRuntime {
   private async runChannelTurnDirect(params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }): Promise<ChannelTurnResult> {
@@ -566,6 +635,7 @@ export class GatewayRuntime {
   private submitChannelTurnToLane(params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
   }): Promise<ChannelTurnResult> {
     return orchestration.submitChannelTurnToLane(this, params);

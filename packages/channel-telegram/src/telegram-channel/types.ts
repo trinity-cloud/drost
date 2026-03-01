@@ -1,8 +1,18 @@
-import type { ChannelAdapterContext, ChannelTurnRequest } from "@drost/core";
+import type { ChannelAdapterContext, ChannelTurnRequest, ChatInputImage } from "@drost/core";
+
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id?: string;
+  width?: number;
+  height?: number;
+  file_size?: number;
+}
 
 export interface TelegramUpdateMessage {
   message_id: number;
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
   chat?: {
     id?: number;
     title?: string;
@@ -25,6 +35,11 @@ export interface TelegramApiResponse<T> {
   result: T;
 }
 
+export interface TelegramGetFileResult {
+  file_id: string;
+  file_path?: string;
+}
+
 export interface TelegramSendMessageResult {
   message_id: number;
 }
@@ -40,6 +55,11 @@ export interface TelegramChannelState {
 export interface TelegramMessagePayload {
   text: string;
   parseMode?: "HTML";
+}
+
+export interface TelegramInboundTurnInput {
+  input: string;
+  inputImages: ChatInputImage[];
 }
 
 export const TELEGRAM_MAX_MESSAGE_CHARS = 4000;

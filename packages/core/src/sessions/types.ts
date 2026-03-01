@@ -1,4 +1,4 @@
-import type { ChatMessage } from "../types.js";
+import type { ChatImageRef, ChatMessage } from "../types.js";
 
 export interface SessionOriginIdentity {
   channel: string;
@@ -56,6 +56,7 @@ export interface SessionMessageLine {
   role: ChatMessage["role"];
   content: string;
   createdAt: string;
+  imageRefs?: ChatImageRef[];
 }
 
 export interface SessionEventLine {

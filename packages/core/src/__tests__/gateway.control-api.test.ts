@@ -21,6 +21,7 @@ function makeTempDir(): string {
 
 class EchoAdapter implements ProviderAdapter {
   readonly id = "test-echo-adapter";
+  static lastTurnImageCount = 0;
 
   async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
     return {
@@ -32,6 +33,7 @@ class EchoAdapter implements ProviderAdapter {
   }
 
   async runTurn(request: ProviderTurnRequest): Promise<void> {
+    EchoAdapter.lastTurnImageCount = request.inputImages?.length ?? 0;
     const input =
       request.messages
         .filter((entry) => entry.role === "user")
@@ -147,13 +149,50 @@ describe("gateway control api and observability", () => {
         },
         body: JSON.stringify({
           sessionId: createdPayload.sessionId,
-          input: "hello control api"
+          input: "hello control api",
+          images: [
+            {
+              mimeType: "image/png",
+              dataBase64: Buffer.from("fake-image").toString("base64")
+            }
+          ]
         })
       });
       expect(turn.status).toBe(200);
       const turnPayload = (await turn.json()) as { ok: boolean; response?: string };
       expect(turnPayload.ok).toBe(true);
       expect(turnPayload.response).toContain("echo:hello control api");
+      expect(EchoAdapter.lastTurnImageCount).toBe(1);
+
+      const imageOnlyTurn = await fetch(`${controlUrl}/chat/send`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer admin-token"
+        },
+        body: JSON.stringify({
+          sessionId: createdPayload.sessionId,
+          input: "",
+          images: [
+            {
+              dataBase64: Buffer.from("image-only").toString("base64")
+            }
+          ]
+        })
+      });
+      expect(imageOnlyTurn.status).toBe(200);
+      const imageOnlyPayload = (await imageOnlyTurn.json()) as { ok: boolean };
+      expect(imageOnlyPayload.ok).toBe(true);
+
+      const history = gateway.getSessionHistory(String(createdPayload.sessionId));
+      const lastUserWithImages = [...history]
+        .reverse()
+        .find((message) => message.role === "user" && (message.imageRefs?.length ?? 0) > 0);
+      expect(lastUserWithImages).toBeDefined();
+      expect(lastUserWithImages?.imageRefs?.[0]?.path).toContain(".drost/media/");
+
+      const mediaIndexPath = path.join(workspaceDir, ".drost", "media", "index.jsonl");
+      expect(fs.existsSync(mediaIndexPath)).toBe(true);
 
       const retention = await fetch(`${controlUrl}/sessions/retention`, {
         headers: {

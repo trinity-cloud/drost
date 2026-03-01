@@ -1,10 +1,13 @@
 import type { StreamEventHandler } from "../../events.js";
+import { persistSessionInputImages, resolveInputImageFromRef } from "../../media-store.js";
+import type { ChatImageRef, ChatInputImage } from "../../types.js";
 
 export async function runSessionTurn(
   runtime: any,
   params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }
@@ -66,10 +69,42 @@ export async function runSessionTurn(
     params.onEvent(event);
   };
 
+  let persistedInputImageRefs: ChatImageRef[] = [];
+  if (Array.isArray(params.inputImages) && params.inputImages.length > 0) {
+    try {
+      persistedInputImageRefs = persistSessionInputImages({
+        workspaceDir: runtime.workspaceDir,
+        sessionId: params.sessionId,
+        images: params.inputImages,
+        source: "session_turn"
+      });
+      runtime.appendSessionEvent(params.sessionId, "session.media.attached", {
+        count: persistedInputImageRefs.length,
+        images: persistedInputImageRefs
+      });
+    } catch (error) {
+      runtime.appendSessionEvent(params.sessionId, "session.media.attach_failed", {
+        count: params.inputImages.length,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      runtime.degradedReasons.push(
+        `Failed to persist input images for ${params.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      runtime.state = "degraded";
+    }
+  }
+
   try {
     await manager.runTurn({
       sessionId: params.sessionId,
       input,
+      inputImages: params.inputImages,
+      inputImageRefs: persistedInputImageRefs,
+      resolveInputImageRef: (ref: ChatImageRef) =>
+        resolveInputImageFromRef({
+          workspaceDir: runtime.workspaceDir,
+          ref
+        }),
       authStore: runtime.authStore,
       route: routeSelection ?? undefined,
       onEvent,
@@ -105,6 +140,7 @@ export async function runSessionTurn(
           providerId: runtime.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId ?? "unknown",
           durationMs: Date.now() - turnStartedAtMs,
           inputChars: input.length,
+          inputImageCount: params.inputImages?.length ?? 0,
           outputChars: assistantText ? assistantText.length : 0,
           historyBeforeCount,
           historyAfterCount: history.length,

@@ -165,4 +165,129 @@ describe("anthropic messages adapter", () => {
     expect(headers["anthropic-beta"]).toContain("oauth-2025-04-20");
     expect(headers["anthropic-beta"]).toContain("claude-code-20250219");
   });
+
+  it("sends text and image in one anthropic messages request", async () => {
+    const adapter = new AnthropicMessagesAdapter();
+    const imgB64 = Buffer.from("fake-image").toString("base64");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    const fetchMock = vi.fn(async () =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "What is in this image?",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      inputImages: [
+        {
+          mimeType: "image/jpeg",
+          dataBase64: imgB64
+        }
+      ],
+      resolveBearerToken: () => "anthropic-token",
+      emit: () => undefined
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = (fetchMock.mock.calls as Array<unknown[]>)[0] ?? [];
+    const init = (call[1] as { body?: string } | undefined) ?? {};
+    const body = JSON.parse(init.body ?? "{}") as {
+      messages?: Array<{
+        role?: string;
+        content?: Array<{ type?: string; text?: string; source?: { media_type?: string; data?: string } }>;
+      }>;
+    };
+    const firstMessage = body.messages?.[0];
+    expect(firstMessage?.role).toBe("user");
+    expect(firstMessage?.content?.[0]).toEqual({
+      type: "text",
+      text: "What is in this image?"
+    });
+    expect(firstMessage?.content?.[1]?.type).toBe("image");
+    expect(firstMessage?.content?.[1]?.source?.media_type).toBe("image/jpeg");
+    expect(firstMessage?.content?.[1]?.source?.data).toBe(imgB64);
+  });
+
+  it("resolves persisted image refs when inputImages are not provided", async () => {
+    const adapter = new AnthropicMessagesAdapter();
+    const imgB64 = Buffer.from("persisted-image").toString("base64");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    const fetchMock = vi.fn(async () =>
+      new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const resolveInputImageRef = vi.fn(() => ({
+      mimeType: "image/png",
+      dataBase64: imgB64
+    }));
+
+    await adapter.runTurn({
+      sessionId: "s-refs",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Describe this image",
+          createdAt: new Date().toISOString(),
+          imageRefs: [
+            {
+              id: "img_1",
+              mimeType: "image/png",
+              sha256: "a".repeat(64),
+              bytes: 12,
+              path: ".drost/media/test/a.png"
+            }
+          ]
+        }
+      ],
+      resolveInputImageRef,
+      resolveBearerToken: () => "anthropic-token",
+      emit: () => undefined
+    });
+
+    expect(resolveInputImageRef).toHaveBeenCalledTimes(1);
+    const call = (fetchMock.mock.calls as Array<unknown[]>)[0] ?? [];
+    const init = (call[1] as { body?: string } | undefined) ?? {};
+    const body = JSON.parse(init.body ?? "{}") as {
+      messages?: Array<{
+        role?: string;
+        content?: Array<{ type?: string; source?: { media_type?: string; data?: string } }>;
+      }>;
+    };
+    const firstMessage = body.messages?.[0];
+    expect(firstMessage?.role).toBe("user");
+    expect(firstMessage?.content?.[1]?.type).toBe("image");
+    expect(firstMessage?.content?.[1]?.source?.media_type).toBe("image/png");
+    expect(firstMessage?.content?.[1]?.source?.data).toBe(imgB64);
+  });
 });

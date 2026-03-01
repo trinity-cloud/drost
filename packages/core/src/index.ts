@@ -93,7 +93,13 @@ export {
 } from "./tools.js";
 
 export type { NormalizedStreamEvent, NormalizedStreamEventType } from "./events.js";
-export type { ChatMessage, ChatRole, UsageSnapshot, JsonValue } from "./types.js";
+export type { ChatMessage, ChatRole, ChatImageRef, ChatInputImage, UsageSnapshot, JsonValue } from "./types.js";
+export {
+  normalizeChatInputImages,
+  imageDataUrl,
+  imageBytesFromBase64,
+  imageExtensionForMimeType
+} from "./input-images.js";
 
 export type {
   ProviderAdapter,

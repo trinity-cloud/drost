@@ -1,4 +1,5 @@
 import type { SessionStoreConfig } from "../../config.js";
+import { normalizeChatInputImages } from "../../input-images.js";
 import type { ChannelSessionMappingOptions } from "../../session-mapping.js";
 
 export async function handleControlPostRequest(params: {
@@ -206,10 +207,22 @@ export async function handleControlPostRequest(params: {
   if (pathname === `${basePath}/chat/send`) {
     const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
     const input = typeof body.input === "string" ? body.input : "";
-    if (!sessionId || !input) {
+    let inputImages = [] as Array<{ mimeType: string; dataBase64: string }>;
+    try {
+      inputImages = normalizeChatInputImages(body.images, {
+        cwd: runtime.workspaceDir
+      });
+    } catch (error) {
       runtime.writeControlJson(response, 400, {
         ok: false,
-        error: "sessionId and input are required"
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return true;
+    }
+    if (!sessionId || (input.trim().length === 0 && inputImages.length === 0)) {
+      runtime.writeControlJson(response, 400, {
+        ok: false,
+        error: "sessionId and at least one of input or images are required"
       });
       return true;
     }
@@ -219,6 +232,7 @@ export async function handleControlPostRequest(params: {
     await runtime.runSessionTurn({
       sessionId,
       input,
+      inputImages,
       onEvent: (event: unknown) => {
         if (includeEvents) {
           events.push(event);

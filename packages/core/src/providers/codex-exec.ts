@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { NormalizedStreamEvent } from "../events.js";
-import type { UsageSnapshot } from "../types.js";
+import { imageBytesFromBase64, imageExtensionForMimeType } from "../input-images.js";
+import type { ChatInputImage, UsageSnapshot } from "../types.js";
 import type {
   ProviderAdapter,
   ProviderProbeContext,
@@ -54,18 +58,97 @@ function providerErrorEvent(params: {
   };
 }
 
-function buildCodexPrompt(messages: ProviderTurnRequest["messages"]): string {
+function findLastUserMessage(
+  messages: ProviderTurnRequest["messages"]
+): ProviderTurnRequest["messages"][number] | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "user") {
+      return message;
+    }
+  }
+  return null;
+}
+
+function buildCodexPrompt(messages: ProviderTurnRequest["messages"], hasInputImages = false): string {
   const lines: string[] = [];
   lines.push("Conversation transcript:");
+  let sawTranscriptMessage = false;
+  const latestUserMessage = findLastUserMessage(messages);
+  const latestUserMessageHasText = (latestUserMessage?.content.trim().length ?? 0) > 0;
   for (const message of messages) {
     if (message.content.trim().length === 0) {
       continue;
     }
+    sawTranscriptMessage = true;
     lines.push(`${message.role.toUpperCase()}: ${message.content}`);
+  }
+  if (hasInputImages && !latestUserMessageHasText) {
+    lines.push("USER: Analyze the attached image(s).");
+    sawTranscriptMessage = true;
+  } else if (hasInputImages) {
+    lines.push("NOTE: The final USER message includes attached image(s).");
+  }
+  if (!sawTranscriptMessage) {
+    lines.push("USER: Continue the conversation.");
   }
   lines.push("");
   lines.push("Respond as ASSISTANT to the final USER message.");
   return lines.join("\n");
+}
+
+function writeTempInputImages(images: ChatInputImage[]): {
+  tempDirPath: string;
+  filePaths: string[];
+} | null {
+  const normalized = images;
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  const tempDirPath = fs.mkdtempSync(path.join(os.tmpdir(), "drost-codex-images-"));
+  const filePaths: string[] = [];
+  for (let index = 0; index < normalized.length; index += 1) {
+    const image = normalized[index];
+    if (!image) {
+      continue;
+    }
+    const extension = imageExtensionForMimeType(image.mimeType);
+    const filePath = path.join(tempDirPath, `input-${index + 1}${extension}`);
+    fs.writeFileSync(filePath, imageBytesFromBase64(image.dataBase64));
+    filePaths.push(filePath);
+  }
+  return {
+    tempDirPath,
+    filePaths
+  };
+}
+
+function resolveInputImagesFromMessageRefs(request: ProviderTurnRequest): ChatInputImage[] {
+  if (typeof request.resolveInputImageRef !== "function") {
+    return [];
+  }
+  const latestUserMessage = findLastUserMessage(request.messages);
+  if (!latestUserMessage || !Array.isArray(latestUserMessage.imageRefs)) {
+    return [];
+  }
+
+  const resolved: ChatInputImage[] = [];
+  for (const ref of latestUserMessage.imageRefs) {
+    const image = request.resolveInputImageRef(ref);
+    if (image) {
+      resolved.push(image);
+    }
+  }
+  return resolved;
+}
+
+function resolveTurnInputImages(request: ProviderTurnRequest): ChatInputImage[] {
+  const resolvedFromRefs = resolveInputImagesFromMessageRefs(request);
+  if (resolvedFromRefs.length > 0) {
+    return resolvedFromRefs;
+  }
+  return request.inputImages ?? [];
 }
 
 function parseUsage(value: unknown): UsageSnapshot | undefined {
@@ -404,13 +487,18 @@ export class CodexExecAdapter implements ProviderAdapter {
   }
 
   async runTurn(request: ProviderTurnRequest): Promise<void> {
-    const prompt = buildCodexPrompt(request.messages);
+    const turnImages = resolveTurnInputImages(request);
+    const prompt = buildCodexPrompt(request.messages, turnImages.length > 0);
+    const tempImages = writeTempInputImages(turnImages);
     const args = [
       "exec",
       "--json",
       "--skip-git-repo-check",
       "--dangerously-bypass-approvals-and-sandbox"
     ];
+    for (const imagePath of tempImages?.filePaths ?? []) {
+      args.push("--image", imagePath);
+    }
     const modelArg = resolveModelArg(request.profile.model);
     if (modelArg) {
       args.push("--model", modelArg);
@@ -554,6 +642,10 @@ export class CodexExecAdapter implements ProviderAdapter {
         message
       }));
       throw new Error(message);
+    } finally {
+      if (tempImages?.tempDirPath) {
+        fs.rmSync(tempImages.tempDirPath, { recursive: true, force: true });
+      }
     }
 
     if (responseText.length === 0 && stderr.trim().length > 0) {

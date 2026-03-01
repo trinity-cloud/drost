@@ -1,5 +1,6 @@
 import path from "node:path";
-import type { ChatMessage } from "../types.js";
+import type { ChatImageRef, ChatMessage } from "../types.js";
+import { isChatImageRef } from "../media-store.js";
 import {
   type SessionEventLine,
   type SessionIndexEntry,
@@ -87,10 +88,14 @@ export function parseSessionMessageLine(value: unknown): ChatMessage | null {
   }
 
   const createdAt = safeDate(record.createdAt) ?? nowIso();
+  const imageRefs = Array.isArray(record.imageRefs)
+    ? record.imageRefs.filter((item): item is ChatImageRef => isChatImageRef(item))
+    : [];
   return {
     role: record.role,
     content: record.content,
-    createdAt
+    createdAt,
+    imageRefs: imageRefs.length > 0 ? imageRefs : undefined
   };
 }
 
@@ -128,7 +133,11 @@ export function toSessionMessageLines(history: ChatMessage[]): SessionMessageLin
       type: "message",
       role: message.role,
       content: message.content,
-      createdAt: safeDate(message.createdAt) ?? nowIso()
+      createdAt: safeDate(message.createdAt) ?? nowIso(),
+      imageRefs:
+        Array.isArray(message.imageRefs) && message.imageRefs.length > 0
+          ? message.imageRefs.filter((ref): ref is ChatImageRef => isChatImageRef(ref))
+          : undefined
     });
   }
   return lines;

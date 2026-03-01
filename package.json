@@ -7,6 +7,10 @@
   "packageManager": "pnpm@10.12.4",
   "scripts": {
     "build": "pnpm -r --if-present build",
+    "start": "node packages/cli/dist/bin.js start",
+    "start:build": "pnpm build && node packages/cli/dist/bin.js start",
+    "dev:start": "pnpm exec tsx packages/cli/src/bin.ts start",
+    "dev:start:watch": "pnpm exec tsx watch packages/cli/src/bin.ts start",
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke:cli": "node scripts/smoke/cli-smoke.mjs",

@@ -1,7 +1,6 @@
 import type { StreamEventHandler } from "../events.js";
-import type { ChatMessage } from "../types.js";
+import type { ChatImageRef, ChatInputImage, ChatMessage } from "../types.js";
 import type { AuthStore } from "../auth/store.js";
-import { resolveBearerToken } from "../auth/store.js";
 import type { SessionMetadata } from "../sessions.js";
 import type {
   ProviderAdapter,
@@ -11,6 +10,7 @@ import type {
 } from "./types.js";
 import type { ProviderFailureClass } from "./manager/failure.js";
 import { type ProviderFailoverConfig, type ProviderFailoverStatus, ProviderFailoverState } from "./manager/failover.js";
+import { resolveProviderBearerToken } from "./manager/auth-resolution.js";
 import { createAssistantMessage, createToolMessage, createUserMessage, nowIso } from "./manager/metadata.js";
 import { runProviderTurnWithFailover } from "./manager/run-provider-turn.js";
 import { ProviderSessionRegistry } from "./manager/session-registry.js";
@@ -126,7 +126,12 @@ export class ProviderManager {
       }
 
       const result = await adapter.probe(profile, {
-        resolveBearerToken: (authProfileId) => resolveBearerToken(params.authStore, authProfileId),
+        resolveBearerToken: (authProfileId) =>
+          resolveProviderBearerToken({
+            authStore: params.authStore,
+            profile,
+            authProfileId
+          }),
         timeoutMs: params.timeoutMs
       });
       probes.push(result);
@@ -138,6 +143,9 @@ export class ProviderManager {
   async runTurn(params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
+    inputImageRefs?: ChatImageRef[];
+    resolveInputImageRef?: (ref: ChatImageRef) => ChatInputImage | null;
     authStore: AuthStore;
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
@@ -182,7 +190,7 @@ export class ProviderManager {
       activeProviderId = routeProviderId;
     }
 
-    session.history.push(createUserMessage(params.input));
+    session.history.push(createUserMessage(params.input, params.inputImageRefs));
     session.metadata.lastActivityAt = nowIso();
     if (!session.metadata.title && params.input.trim().length > 0) {
       session.metadata.title = params.input.trim().slice(0, 80);
@@ -203,6 +211,8 @@ export class ProviderManager {
           fallbackProviderIds: params.route?.fallbackProviderIds,
           authStore: params.authStore,
           messages: buildTurnMessages(session.history, canRunTools ? availableToolNames : []),
+          inputImages: params.inputImages,
+          resolveInputImageRef: params.resolveInputImageRef,
           onEvent: params.onEvent,
           signal: params.signal,
           profiles: this.profileById,

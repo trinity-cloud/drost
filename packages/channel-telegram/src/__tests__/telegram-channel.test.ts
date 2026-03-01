@@ -164,6 +164,109 @@ describe("telegram channel adapter", () => {
     expect(calls.some((call) => call.url.includes("/sendChatAction"))).toBe(true);
   });
 
+  it("forwards telegram photo messages as inputImages with caption text", async () => {
+    const turnRequests: ChannelTurnRequest[] = [];
+    const sentMessages: Array<{ chat_id?: number; text?: string }> = [];
+    const updateBatches: unknown[][] = [
+      [
+        {
+          update_id: 2,
+          message: {
+            message_id: 21,
+            caption: "analyze this",
+            photo: [
+              { file_id: "small-photo", width: 50, height: 50, file_size: 100 },
+              { file_id: "large-photo", width: 500, height: 500, file_size: 1000 }
+            ],
+            chat: {
+              id: 77
+            },
+            from: {
+              id: 8
+            }
+          }
+        }
+      ],
+      []
+    ];
+
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.includes("/getUpdates")) {
+        const next = updateBatches.shift() ?? [];
+        return jsonResponse({
+          ok: true,
+          result: next
+        });
+      }
+      if (url.includes("/getFile")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        expect(body.file_id).toBe("large-photo");
+        return jsonResponse({
+          ok: true,
+          result: {
+            file_id: "large-photo",
+            file_path: "photos/image.png"
+          }
+        });
+      }
+      if (url.includes("/file/bottest-token/photos/image.png")) {
+        return new Response(Buffer.from("fake-image-bytes"), {
+          status: 200,
+          headers: {
+            "content-type": "application/octet-stream"
+          }
+        });
+      }
+      if (url.includes("/sendChatAction")) {
+        return jsonResponse({
+          ok: true,
+          result: true
+        });
+      }
+      if (url.includes("/sendMessage")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        sentMessages.push(body);
+        return jsonResponse({
+          ok: true,
+          result: {
+            message_id: 22
+          }
+        });
+      }
+      return jsonResponse({ ok: true, result: true });
+    };
+
+    const adapter = new TelegramChannelAdapter({
+      token: "test-token",
+      pollIntervalMs: 20,
+      ...createStatePaths(),
+      fetchImpl,
+      onError: (error) => {
+        throw error;
+      }
+    });
+    activeAdapters.push(adapter);
+
+    adapter.connect({
+      runTurn: async (request) => {
+        turnRequests.push(request);
+        return {
+          sessionId: "session:telegram:global:77",
+          providerId: "provider-a",
+          response: "ok"
+        };
+      }
+    });
+
+    await waitFor(() => turnRequests.length === 1 && sentMessages.length === 1);
+
+    expect(turnRequests[0]?.input).toBe("analyze this");
+    expect(turnRequests[0]?.inputImages?.length).toBe(1);
+    expect(turnRequests[0]?.inputImages?.[0]?.mimeType).toBe("image/png");
+    expect(turnRequests[0]?.inputImages?.[0]?.dataBase64).toBe(Buffer.from("fake-image-bytes").toString("base64"));
+  });
+
   it("streams response deltas by editing the in-flight telegram message", async () => {
     const sentMessages: Array<{ chat_id?: number; text?: string }> = [];
     const editedMessages: Array<{ chat_id?: number; message_id?: number; text?: string }> = [];

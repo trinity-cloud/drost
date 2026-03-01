@@ -1,9 +1,10 @@
-import { resolveBearerToken, type AuthStore } from "../../auth/store.js";
+import type { AuthStore } from "../../auth/store.js";
 import type { StreamEventHandler } from "../../events.js";
-import type { ChatMessage } from "../../types.js";
+import type { ChatImageRef, ChatInputImage, ChatMessage } from "../../types.js";
 import type { ProviderAdapter, ProviderProfile } from "../types.js";
 import { classifyProviderFailure } from "./failure.js";
 import { ProviderFailoverState } from "./failover.js";
+import { resolveProviderBearerToken } from "./auth-resolution.js";
 import { nowIso } from "./metadata.js";
 import { mergeStreamText } from "./streaming.js";
 
@@ -14,6 +15,8 @@ export async function runProviderTurnWithFailover(params: {
   fallbackProviderIds?: string[];
   authStore: AuthStore;
   messages: ChatMessage[];
+  inputImages?: ChatInputImage[];
+  resolveInputImageRef?: (ref: ChatImageRef) => ChatInputImage | null;
   onEvent: StreamEventHandler;
   signal?: AbortSignal;
   profiles: Map<string, ProviderProfile>;
@@ -49,7 +52,14 @@ export async function runProviderTurnWithFailover(params: {
         providerId: profile.id,
         profile,
         messages: params.messages,
-        resolveBearerToken: (authProfileId) => resolveBearerToken(params.authStore, authProfileId),
+        inputImages: params.inputImages,
+        resolveInputImageRef: params.resolveInputImageRef,
+        resolveBearerToken: (authProfileId) =>
+          resolveProviderBearerToken({
+            authStore: params.authStore,
+            profile,
+            authProfileId
+          }),
         emit: onEvent,
         signal: params.signal
       });

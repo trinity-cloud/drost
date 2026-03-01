@@ -1,5 +1,5 @@
 import type { StreamEventHandler } from "../events.js";
-import type { ChatMessage } from "../types.js";
+import type { ChatImageRef, ChatInputImage, ChatMessage } from "../types.js";
 import type { SessionMetadata } from "../sessions.js";
 
 export type ProviderKind = "openai" | "openai-compatible" | "anthropic" | "openai-codex";
@@ -36,6 +36,8 @@ export interface ProviderTurnRequest {
   providerId: string;
   profile: ProviderProfile;
   messages: ChatMessage[];
+  inputImages?: ChatInputImage[];
+  resolveInputImageRef?: (ref: ChatImageRef) => ChatInputImage | null;
   resolveBearerToken: (authProfileId: string) => string | null;
   emit: StreamEventHandler;
   signal?: AbortSignal;

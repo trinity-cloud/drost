@@ -192,7 +192,17 @@ export function saveSessionRecord(params: {
     const nextHistory = params.history.map((message) => ({
       role: message.role,
       content: message.content,
-      createdAt: safeDate(message.createdAt) ?? nowIso()
+      createdAt: safeDate(message.createdAt) ?? nowIso(),
+      imageRefs:
+        Array.isArray(message.imageRefs) && message.imageRefs.length > 0
+          ? message.imageRefs.map((ref) => ({
+              id: ref.id,
+              mimeType: ref.mimeType,
+              sha256: ref.sha256,
+              bytes: ref.bytes,
+              path: ref.path
+            }))
+          : undefined
     }));
 
     const previousHistory = previous?.history ?? [];

@@ -1,9 +1,11 @@
 import type { ChannelTurnRequest, ChannelTurnResult } from "../channels.js";
 import type { StreamEventHandler } from "../events.js";
+import type { ChatInputImage } from "../types.js";
 import { nowIso } from "./helpers.js";
 
 interface PendingChannelTurn {
   input: string;
+  inputImages?: ChatInputImage[];
   onEvent: StreamEventHandler;
   resolve: (result: ChannelTurnResult) => void;
   reject: (error: unknown) => void;
@@ -12,6 +14,7 @@ interface PendingChannelTurn {
 
 interface ActiveChannelTurn {
   input: string;
+  inputImages?: ChatInputImage[];
   onEvent: StreamEventHandler;
   resolveMany: Array<(result: ChannelTurnResult) => void>;
   rejectMany: Array<(error: unknown) => void>;
@@ -60,6 +63,7 @@ export async function runChannelTurnDirect(
   params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }
@@ -67,6 +71,7 @@ export async function runChannelTurnDirect(
   await runtime.runSessionTurn({
     sessionId: params.sessionId,
     input: params.input,
+    inputImages: params.inputImages,
     onEvent: params.onEvent,
     signal: params.signal
   });
@@ -120,6 +125,12 @@ export function startLaneExecution(runtime: any, sessionId: string, lane: Channe
       const batch = [...lane.queue];
       lane.queue.length = 0;
       const input = batch.map((entry) => entry.input).join("\n\n");
+      const inputImages: ChatInputImage[] = [];
+      for (const entry of batch) {
+        for (const image of entry.inputImages ?? []) {
+          inputImages.push(image);
+        }
+      }
       const onEvent: StreamEventHandler = (event) => {
         for (const entry of batch) {
           entry.onEvent(event);
@@ -127,6 +138,7 @@ export function startLaneExecution(runtime: any, sessionId: string, lane: Channe
       };
       return {
         input,
+        inputImages,
         onEvent,
         resolveMany: batch.map((entry) => entry.resolve),
         rejectMany: batch.map((entry) => entry.reject),
@@ -139,6 +151,7 @@ export function startLaneExecution(runtime: any, sessionId: string, lane: Channe
     }
     return {
       input: next.input,
+      inputImages: next.inputImages,
       onEvent: next.onEvent,
       resolveMany: [next.resolve],
       rejectMany: [next.reject],
@@ -162,6 +175,7 @@ export function startLaneExecution(runtime: any, sessionId: string, lane: Channe
   void runChannelTurnDirect(runtime, {
     sessionId,
     input: active.input,
+    inputImages: active.inputImages,
     onEvent: active.onEvent,
     signal: active.controller.signal
   })
@@ -196,6 +210,7 @@ export function submitChannelTurnToLane(
   params: {
     sessionId: string;
     input: string;
+    inputImages?: ChatInputImage[];
     onEvent: StreamEventHandler;
   }
 ): Promise<ChannelTurnResult> {
@@ -209,6 +224,7 @@ export function submitChannelTurnToLane(
   return new Promise<ChannelTurnResult>((resolve, reject) => {
     const pending: PendingChannelTurn = {
       input: params.input,
+      inputImages: params.inputImages,
       onEvent: params.onEvent,
       resolve,
       reject,
@@ -280,6 +296,7 @@ export async function runChannelTurn(runtime: any, params: ChannelTurnRequest): 
     return await runChannelTurnDirect(runtime, {
       sessionId,
       input: params.input,
+      inputImages: params.inputImages,
       onEvent,
       signal: params.signal
     });
@@ -288,6 +305,7 @@ export async function runChannelTurn(runtime: any, params: ChannelTurnRequest): 
   return await submitChannelTurnToLane(runtime, {
     sessionId,
     input: params.input,
+    inputImages: params.inputImages,
     onEvent
   });
 }

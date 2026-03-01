@@ -128,6 +128,9 @@ function normalizeConfig(projectRoot: string, config: GatewayConfig): GatewayCon
 
 export async function loadCliConfig(projectRoot = process.cwd()): Promise<LoadedCliConfig> {
   const resolvedRoot = path.resolve(projectRoot);
+  if (!process.env.DROST_PROJECT_ROOT || process.env.DROST_PROJECT_ROOT.trim().length === 0) {
+    process.env.DROST_PROJECT_ROOT = resolvedRoot;
+  }
   loadProjectEnvFiles(resolvedRoot);
   let configPath: string | null = null;
   for (const candidate of CONFIG_CANDIDATES) {

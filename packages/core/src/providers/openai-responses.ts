@@ -1,5 +1,6 @@
 import type { NormalizedStreamEvent } from "../events.js";
-import type { UsageSnapshot } from "../types.js";
+import { imageDataUrl } from "../input-images.js";
+import type { ChatInputImage, UsageSnapshot } from "../types.js";
 import { postJsonStreamWithTimeout, postJsonWithTimeout, type SseEvent } from "./http.js";
 import type {
   ProviderAdapter,
@@ -13,8 +14,106 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function joinMessages(messages: ProviderTurnRequest["messages"]): string {
-  return messages.map((message) => `${message.role}: ${message.content}`).join("\n");
+function resolveResponsesRole(
+  role: ProviderTurnRequest["messages"][number]["role"]
+): "system" | "user" | "assistant" {
+  if (role === "assistant") {
+    return "assistant";
+  }
+  if (role === "system") {
+    return "system";
+  }
+  return "user";
+}
+
+function findLastUserMessageIndex(messages: ProviderTurnRequest["messages"]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function resolveMessageImageRefs(
+  request: ProviderTurnRequest,
+  message: ProviderTurnRequest["messages"][number]
+): ChatInputImage[] {
+  if (typeof request.resolveInputImageRef !== "function") {
+    return [];
+  }
+  const refs = message?.imageRefs ?? [];
+  if (!Array.isArray(refs) || refs.length === 0) {
+    return [];
+  }
+  const resolved: ChatInputImage[] = [];
+  for (const ref of refs) {
+    const image = request.resolveInputImageRef(ref);
+    if (image) {
+      resolved.push(image);
+    }
+  }
+  return resolved;
+}
+
+function buildResponsesInput(request: ProviderTurnRequest): Array<Record<string, unknown>> {
+  const messages = request.messages;
+  const fallbackInputImages = request.inputImages ?? [];
+  const lastUserIndex = findLastUserMessageIndex(messages);
+  const input: Array<Record<string, unknown>> = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) {
+      continue;
+    }
+
+    const persistedImages = resolveMessageImageRefs(request, message);
+    const images =
+      message.role === "user"
+        ? persistedImages.length > 0
+          ? persistedImages
+          : index === lastUserIndex
+            ? fallbackInputImages
+            : []
+        : [];
+    const includeImages = images.length > 0;
+    const normalizedText = message.content.trim();
+    if (!includeImages && normalizedText.length === 0) {
+      continue;
+    }
+
+    if (includeImages) {
+      const contentParts: Array<Record<string, unknown>> = [];
+      if (normalizedText.length > 0) {
+        contentParts.push({
+          type: "input_text",
+          text: message.content
+        });
+      }
+      for (const image of images) {
+        contentParts.push({
+          type: "input_image",
+          detail: "auto",
+          image_url: imageDataUrl(image)
+        });
+      }
+      input.push({
+        type: "message",
+        role: resolveResponsesRole(message.role),
+        content: contentParts
+      });
+      continue;
+    }
+
+    input.push({
+      type: "message",
+      role: resolveResponsesRole(message.role),
+      content: message.content
+    });
+  }
+
+  return input;
 }
 
 function extractResponseText(payload: unknown): string {
@@ -283,7 +382,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
       },
       body: {
         model: request.profile.model,
-        input: joinMessages(request.messages),
+        input: buildResponsesInput(request),
         stream: true
       },
       timeoutMs: 60_000,

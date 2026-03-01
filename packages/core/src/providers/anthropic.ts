@@ -1,5 +1,5 @@
 import type { NormalizedStreamEvent } from "../events.js";
-import type { ChatMessage, UsageSnapshot } from "../types.js";
+import type { ChatInputImage, ChatMessage, UsageSnapshot } from "../types.js";
 import { postJsonStreamWithTimeout, postJsonWithTimeout, type SseEvent } from "./http.js";
 import type {
   ProviderAdapter,
@@ -27,7 +27,18 @@ const ANTHROPIC_OAUTH_BETAS = [
 ] as const;
 
 function isAnthropicOAuthToken(token: string): boolean {
-  return token.includes("sk-ant-oat");
+  const normalized = token.trim();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.includes("sk-ant-oat")) {
+    return true;
+  }
+  if (normalized.toLowerCase().includes("oat")) {
+    return true;
+  }
+  const setupToken = process.env.ANTHROPIC_SETUP_TOKEN?.trim();
+  return Boolean(setupToken && setupToken === normalized);
 }
 
 function buildAnthropicHeaders(token: string): Record<string, string> {
@@ -60,13 +71,98 @@ function providerErrorEvent(params: {
   };
 }
 
-function mapMessages(messages: ChatMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
-  return messages
-    .filter((message) => message.content.trim().length > 0)
-    .map((message) => ({
-      role: message.role === "assistant" ? "assistant" : "user",
-      content: message.content
-    }));
+function findLastUserMessageIndex(messages: ChatMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function resolveMessageImageRefs(
+  request: ProviderTurnRequest,
+  message: ProviderTurnRequest["messages"][number]
+): ChatInputImage[] {
+  if (typeof request.resolveInputImageRef !== "function") {
+    return [];
+  }
+  const refs = message?.imageRefs ?? [];
+  if (!Array.isArray(refs) || refs.length === 0) {
+    return [];
+  }
+  const resolved: ChatInputImage[] = [];
+  for (const ref of refs) {
+    const image = request.resolveInputImageRef(ref);
+    if (image) {
+      resolved.push(image);
+    }
+  }
+  return resolved;
+}
+
+function mapMessages(
+  request: ProviderTurnRequest
+): Array<{ role: "user" | "assistant"; content: string | Array<Record<string, unknown>> }> {
+  const messages = request.messages;
+  const fallbackInputImages = request.inputImages ?? [];
+  const lastUserMessageIndex = findLastUserMessageIndex(messages);
+  const mapped: Array<{ role: "user" | "assistant"; content: string | Array<Record<string, unknown>> }> = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) {
+      continue;
+    }
+    const role = message.role === "assistant" ? "assistant" : "user";
+    const persistedImages = resolveMessageImageRefs(request, message);
+    const images =
+      message.role === "user"
+        ? persistedImages.length > 0
+          ? persistedImages
+          : index === lastUserMessageIndex
+            ? fallbackInputImages
+            : []
+        : [];
+    const includeImages = images.length > 0;
+    const normalizedText = message.content.trim();
+
+    if (!includeImages && normalizedText.length === 0) {
+      continue;
+    }
+
+    if (!includeImages) {
+      mapped.push({
+        role,
+        content: message.content
+      });
+      continue;
+    }
+
+    const contentBlocks: Array<Record<string, unknown>> = [];
+    if (normalizedText.length > 0) {
+      contentBlocks.push({
+        type: "text",
+        text: message.content
+      });
+    }
+    for (const image of images) {
+      contentBlocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: image.mimeType,
+          data: image.dataBase64
+        }
+      });
+    }
+    mapped.push({
+      role: "user",
+      content: contentBlocks
+    });
+  }
+
+  return mapped;
 }
 
 function extractText(payload: unknown): string {
@@ -314,7 +410,7 @@ export class AnthropicMessagesAdapter implements ProviderAdapter {
       headers: buildAnthropicHeaders(bearerToken),
       body: {
         model: request.profile.model,
-        messages: mapMessages(request.messages),
+        messages: mapMessages(request),
         max_tokens: 1024,
         stream: true
       },

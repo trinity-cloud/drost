@@ -23,7 +23,7 @@ function resolveRuntimeUiMode(uiMode: StartUiMode): "plain" | "tui" {
   if (uiMode === "tui") {
     return process.stdin.isTTY && process.stdout.isTTY ? "tui" : "plain";
   }
-  return process.stdin.isTTY && process.stdout.isTTY ? "tui" : "plain";
+  return "plain";
 }
 
 export async function runStartLoop(params: {
@@ -37,7 +37,7 @@ export async function runStartLoop(params: {
   let runtimeConfig = params.config;
 
   while (true) {
-    const requestedUiMode = params.uiMode ?? "auto";
+    const requestedUiMode = params.uiMode ?? "plain";
     const runtimeUiMode = resolveRuntimeUiMode(requestedUiMode);
     if (requestedUiMode === "tui" && runtimeUiMode !== "tui" && !warnedTuiFallback) {
       warnedTuiFallback = true;

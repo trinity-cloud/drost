@@ -160,9 +160,19 @@ export class TelegramChannelAdapter implements ChannelAdapter {
           continue;
         }
 
-        const input = toText(message.text).trim();
         const chatId = message.chat?.id;
-        if (!input || chatId === undefined) {
+        if (chatId === undefined) {
+          continue;
+        }
+
+        const inboundTurn = await this.apiClient.buildInboundTurnInput({
+          text: toText(message.text),
+          caption: toText(message.caption),
+          photo: message.photo
+        });
+        const input = inboundTurn.input;
+        const hasImages = inboundTurn.inputImages.length > 0;
+        if (input.length === 0 && !hasImages) {
           continue;
         }
 
@@ -206,6 +216,7 @@ export class TelegramChannelAdapter implements ChannelAdapter {
           identity,
           title: message.chat?.title,
           input,
+          inputImages: inboundTurn.inputImages,
           mapping
         };
         await this.handleTurn(chatId, request);

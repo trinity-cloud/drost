@@ -1,19 +1,13 @@
-import readline from "node:readline";
 import {
   RESTART_EXIT_CODE,
   createGateway,
   type GatewayConfig
 } from "@drost/core";
-import { renderCommandHints, renderGatewayBoot, renderSessionSummary, renderStreamEvent } from "@drost/tui";
+import { renderGatewayBoot } from "@drost/tui";
 import {
-  buildSessionSummaries,
-  loadSessions,
-  parseToolCommand,
   print,
   removePidFile,
-  summarizeToolValue,
-  writePidFile,
-  type SessionSummary
+  writePidFile
 } from "./runtime-common.js";
 
 export async function runGatewayCyclePlain(params: {
@@ -22,10 +16,7 @@ export async function runGatewayCyclePlain(params: {
   restartCount: number;
 }): Promise<number> {
   let settled = false;
-  let turnInFlight = false;
-  let rl: readline.Interface | null = null;
   let keepAliveTimer: NodeJS.Timeout | null = null;
-  let activeSessionId = "local";
 
   let resolveExit!: (code: number) => void;
   const exitPromise = new Promise<number>((resolve) => {
@@ -37,7 +28,6 @@ export async function runGatewayCyclePlain(params: {
       return;
     }
     settled = true;
-    rl?.close();
     if (keepAliveTimer) {
       clearInterval(keepAliveTimer);
       keepAliveTimer = null;
@@ -88,12 +78,7 @@ export async function runGatewayCyclePlain(params: {
 
   const hasProviders = Boolean(params.config.providers && params.config.providers.profiles.length > 0);
   if (hasProviders) {
-    loadSessions(gateway, activeSessionId);
-    print("[drost] local session ready.");
-    print(renderCommandHints());
-    for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10) as SessionSummary[])) {
-      print(line);
-    }
+    print("[drost] server mode active. Use channels/control API/health endpoint.");
   } else {
     print("[drost] no providers configured. Waiting for signals.");
   }
@@ -119,282 +104,8 @@ export async function runGatewayCyclePlain(params: {
   process.on("SIGTERM", onSigTerm);
   process.on("SIGUSR2", onSigUsr2);
 
-  const forceInteractive = process.env.DROST_FORCE_INTERACTIVE === "1";
-  if (process.stdin.isTTY || forceInteractive) {
-    rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      prompt: "> "
-    });
-
-    rl.on("line", async (line) => {
-      const text = line.trim();
-      if (!text) {
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/help") {
-        print(renderCommandHints());
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/restart") {
-        const result = await gateway.requestRestart({
-          intent: "manual",
-          reason: "/restart command"
-        });
-        if (result && typeof result === "object" && "ok" in result && result.ok === false) {
-          print(`[drost] restart blocked: ${result.message}`);
-          rl?.prompt();
-        }
-        return;
-      }
-
-      if (text.startsWith("/provider ")) {
-        const providerId = text.slice("/provider ".length).trim();
-        if (!providerId) {
-          print("[drost] provider id required");
-          rl?.prompt();
-          return;
-        }
-        if (!hasProviders) {
-          print("[drost] no providers configured in drost.config.*");
-          rl?.prompt();
-          return;
-        }
-        try {
-          gateway.queueSessionProviderSwitch(activeSessionId, providerId);
-          const session = gateway.getSessionState(activeSessionId);
-          print(
-            `[drost] provider queued for next turn in session ${activeSessionId}: ${providerId} (active: ${session?.activeProviderId ?? "n/a"})`
-          );
-        } catch (error) {
-          print(`[drost] ${error instanceof Error ? error.message : String(error)}`);
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/session") {
-        if (!hasProviders) {
-          print("[drost] no providers configured in drost.config.*");
-          rl?.prompt();
-          return;
-        }
-        const session = gateway.getSessionState(activeSessionId);
-        print(
-          `[drost] active session=${activeSessionId} provider=${session?.activeProviderId ?? "n/a"} pending=${session?.pendingProviderId ?? "(none)"}`
-        );
-        rl?.prompt();
-        return;
-      }
-
-      if (text.startsWith("/session ")) {
-        if (!hasProviders) {
-          print("[drost] no providers configured in drost.config.*");
-          rl?.prompt();
-          return;
-        }
-        const nextSessionId = text.slice("/session ".length).trim();
-        if (!nextSessionId) {
-          print("[drost] session id required");
-          rl?.prompt();
-          return;
-        }
-        if (!gateway.sessionExists(nextSessionId)) {
-          print(`[drost] unknown session: ${nextSessionId}`);
-          rl?.prompt();
-          return;
-        }
-        try {
-          gateway.ensureSession(nextSessionId);
-          activeSessionId = nextSessionId;
-          const session = gateway.getSessionState(activeSessionId);
-          print(
-            `[drost] active session switched to ${activeSessionId} (provider=${session?.activeProviderId ?? "n/a"})`
-          );
-        } catch (error) {
-          print(`[drost] ${error instanceof Error ? error.message : String(error)}`);
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/sessions") {
-        if (!hasProviders) {
-          print("[drost] no providers configured in drost.config.*");
-          rl?.prompt();
-          return;
-        }
-        for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10))) {
-          print(line);
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/new") {
-        if (!hasProviders) {
-          print("[drost] no providers configured in drost.config.*");
-          rl?.prompt();
-          return;
-        }
-        try {
-          const nextSessionId = gateway.createSession({
-            channel: "local",
-            fromSessionId: activeSessionId
-          });
-          activeSessionId = nextSessionId;
-          const session = gateway.getSessionState(activeSessionId);
-          print(
-            `[drost] active session switched to ${activeSessionId} (provider=${session?.activeProviderId ?? "n/a"})`
-          );
-        } catch (error) {
-          print(`[drost] ${error instanceof Error ? error.message : String(error)}`);
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/status") {
-        const currentStatus = gateway.getStatus();
-        for (const line of renderGatewayBoot({
-          state: currentStatus.state,
-          startedAt: currentStatus.startedAt,
-          degradedReasons: currentStatus.degradedReasons,
-          restartCount: params.restartCount,
-          healthUrl: currentStatus.healthUrl
-        })) {
-          print(line);
-        }
-        if (hasProviders) {
-          for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10))) {
-            print(line);
-          }
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/providers") {
-        const profiles = gateway.listProviderProfiles();
-        if (profiles.length === 0) {
-          print("[drost] no provider profiles configured");
-        } else {
-          for (const profile of profiles) {
-            print(
-              `[drost] provider=${profile.id} kind=${profile.kind} model=${profile.model} auth=${profile.authProfileId}`
-            );
-          }
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text === "/tools") {
-        const toolNames = gateway.listLoadedToolNames();
-        if (toolNames.length === 0) {
-          print("[drost] no tools loaded");
-        } else {
-          print(`[drost] loaded tools: ${toolNames.join(", ")}`);
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (text.startsWith("/tool ")) {
-        const parsed = parseToolCommand(text.slice("/tool ".length));
-        if ("error" in parsed) {
-          print(`[drost] ${parsed.error}`);
-          rl?.prompt();
-          return;
-        }
-
-        const result = await gateway.runTool({
-          sessionId: activeSessionId,
-          toolName: parsed.toolName,
-          input: parsed.input,
-          onEvent: (event) => {
-            print(
-              renderStreamEvent({
-                type: event.type,
-                sessionId: event.sessionId,
-                providerId: event.providerId,
-                payload: {
-                  text: event.payload.text,
-                  error: event.payload.error,
-                  toolName: event.payload.toolName,
-                  metadata: event.payload.metadata,
-                  usage: event.payload.usage
-                }
-              })
-            );
-          }
-        });
-
-        if (result.ok) {
-          print(`[drost] tool ${result.toolName} output: ${summarizeToolValue(result.output)}`);
-        } else {
-          print(`[drost] tool ${result.toolName} ${result.error?.code ?? "error"}: ${result.error?.message ?? "unknown error"}`);
-          if (result.error?.issues && result.error.issues.length > 0) {
-            for (const issue of result.error.issues) {
-              print(`[drost]   issue ${issue.path}: ${issue.message}`);
-            }
-          }
-        }
-        rl?.prompt();
-        return;
-      }
-
-      if (!hasProviders) {
-        print("[drost] no providers configured in drost.config.*");
-        rl?.prompt();
-        return;
-      }
-
-      if (turnInFlight) {
-        print("[drost] turn already in progress");
-        rl?.prompt();
-        return;
-      }
-
-      turnInFlight = true;
-      try {
-        await gateway.runSessionTurn({
-          sessionId: activeSessionId,
-          input: text,
-          onEvent: (event) => {
-            print(
-              renderStreamEvent({
-                type: event.type,
-                sessionId: event.sessionId,
-                providerId: event.providerId,
-                payload: {
-                  text: event.payload.text,
-                  error: event.payload.error,
-                  toolName: event.payload.toolName,
-                  metadata: event.payload.metadata,
-                  usage: event.payload.usage
-                }
-              })
-            );
-          }
-        });
-      } catch (error) {
-        print(`[drost] ${error instanceof Error ? error.message : String(error)}`);
-      } finally {
-        turnInFlight = false;
-        rl?.prompt();
-      }
-    });
-
-    rl.prompt();
-  } else {
-    // Keep the process alive in non-interactive mode so signals can control lifecycle.
-    keepAliveTimer = setInterval(() => {}, 60_000);
-  }
+  // Keep the process alive in server mode so signals can control lifecycle.
+  keepAliveTimer = setInterval(() => {}, 60_000);
 
   const exitCode = await exitPromise;
   if (exitCode !== RESTART_EXIT_CODE) {

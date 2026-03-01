@@ -97,9 +97,18 @@ Send chat turn:
 curl -s -X POST \
   -H "Authorization: Bearer $DROST_CONTROL_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"sessionId":"local-20260301-010203-000","input":"hello"}' \
+  -d '{"sessionId":"local-20260301-010203-000","input":"hello","images":[{"mimeType":"image/png","dataBase64":"<BASE64_IMAGE_BYTES>"}]}' \
   http://127.0.0.1:8788/control/v1/chat/send
 ```
+
+`POST /control/v1/chat/send` accepts:
+
+- `sessionId` (required)
+- `input` (optional when `images` is provided)
+- `images` (optional): array of image objects
+  - `dataBase64` (or `data`) + optional `mimeType`
+  - `dataUrl` (`data:image/...;base64,...`)
+  - `path` (resolved relative to gateway workspace)
 
 Dry-run prune:
 

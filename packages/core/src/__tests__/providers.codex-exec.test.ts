@@ -242,4 +242,159 @@ describe("codex exec adapter", () => {
 
     expect(eventTypes).toContain("provider.error");
   });
+
+  it("passes images to codex exec in the same turn call", async () => {
+    const imgB64 = Buffer.from("fake-image").toString("base64");
+    const runner = vi.fn(async (params: any) => {
+      const args: string[] = Array.isArray(params.args) ? params.args : [];
+      const imageFlagIndex = args.indexOf("--image");
+      expect(imageFlagIndex).toBeGreaterThanOrEqual(0);
+      const imagePath = args[imageFlagIndex + 1];
+      expect(typeof imagePath).toBe("string");
+      if (typeof imagePath !== "string") {
+        throw new Error("Missing image path argument");
+      }
+      expect(imagePath.endsWith(".png")).toBe(true);
+      return {
+        stdout: [
+          "{\"type\":\"item.completed\",\"item\":{\"id\":\"i-1\",\"type\":\"agent_message\",\"text\":\"ok\"}}",
+          "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
+        ].join("\n"),
+        stderr: ""
+      };
+    });
+    const adapter = new CodexExecAdapter(runner);
+
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Describe this image",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      inputImages: [
+        {
+          mimeType: "image/png",
+          dataBase64: imgB64
+        }
+      ],
+      resolveBearerToken: () => null,
+      emit: () => undefined
+    });
+
+    expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it("uses resolved persisted image refs when inputImages are not provided", async () => {
+    const imgB64 = Buffer.from("persisted-image").toString("base64");
+    const runner = vi.fn(async (params: any) => {
+      const args: string[] = Array.isArray(params.args) ? params.args : [];
+      const imageFlagIndex = args.indexOf("--image");
+      expect(imageFlagIndex).toBeGreaterThanOrEqual(0);
+      const imagePath = args[imageFlagIndex + 1];
+      expect(typeof imagePath).toBe("string");
+      if (typeof imagePath !== "string") {
+        throw new Error("Missing image path argument");
+      }
+      expect(imagePath.endsWith(".png")).toBe(true);
+      return {
+        stdout: [
+          "{\"type\":\"item.completed\",\"item\":{\"id\":\"i-1\",\"type\":\"agent_message\",\"text\":\"ok\"}}",
+          "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
+        ].join("\n"),
+        stderr: ""
+      };
+    });
+    const adapter = new CodexExecAdapter(runner);
+    const resolveInputImageRef = vi.fn(() => ({
+      mimeType: "image/png",
+      dataBase64: imgB64
+    }));
+
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "Describe this image",
+          createdAt: new Date().toISOString(),
+          imageRefs: [
+            {
+              id: "img_1",
+              mimeType: "image/png",
+              sha256: "a".repeat(64),
+              bytes: 12,
+              path: ".drost/media/test/a.png"
+            }
+          ]
+        }
+      ],
+      resolveInputImageRef,
+      resolveBearerToken: () => null,
+      emit: () => undefined
+    });
+
+    expect(resolveInputImageRef).toHaveBeenCalledTimes(1);
+    expect(runner).toHaveBeenCalledOnce();
+  });
+
+  it("adds an explicit image-analysis user line for image-only turns", async () => {
+    const imgB64 = Buffer.from("fake-image").toString("base64");
+    const runner = vi.fn(async (params: any) => {
+      const args: string[] = Array.isArray(params.args) ? params.args : [];
+      const promptArg = args[args.length - 1];
+      expect(typeof promptArg).toBe("string");
+      if (typeof promptArg !== "string") {
+        throw new Error("Missing prompt arg");
+      }
+      expect(promptArg).toContain("USER: Analyze the attached image(s).");
+      return {
+        stdout: [
+          "{\"type\":\"item.completed\",\"item\":{\"id\":\"i-1\",\"type\":\"agent_message\",\"text\":\"ok\"}}",
+          "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}"
+        ].join("\n"),
+        stderr: ""
+      };
+    });
+    const adapter = new CodexExecAdapter(runner);
+
+    await adapter.runTurn({
+      sessionId: "s-1",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "old context",
+          createdAt: new Date().toISOString()
+        },
+        {
+          role: "assistant",
+          content: "old answer",
+          createdAt: new Date().toISOString()
+        },
+        {
+          role: "user",
+          content: "",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      inputImages: [
+        {
+          mimeType: "image/png",
+          dataBase64: imgB64
+        }
+      ],
+      resolveBearerToken: () => null,
+      emit: () => undefined
+    });
+
+    expect(runner).toHaveBeenCalledOnce();
+  });
 });

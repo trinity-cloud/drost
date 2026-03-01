@@ -18,7 +18,7 @@ function printHelp(): void {
       "drost commands:",
       "  drost init <name>",
       "  drost migrate runtime [path]",
-      "  drost start [--ui <auto|tui|plain>]",
+      "  drost start [--ui <plain|tui>]",
       "  drost restart",
       "  drost auth doctor",
       "  drost auth codex-import [profileId] [--path /path/to/auth.json]",
@@ -35,7 +35,7 @@ function printHelp(): void {
 }
 
 function parseStartUiMode(args: string[]): { uiMode: StartUiMode; ok: boolean } {
-  let uiMode: StartUiMode = "auto";
+  let uiMode: StartUiMode = "plain";
 
   for (let i = 0; i < args.length; i += 1) {
     const token = args[i];
@@ -53,12 +53,17 @@ function parseStartUiMode(args: string[]): { uiMode: StartUiMode; ok: boolean } 
       return { uiMode, ok: false };
     }
 
-    if (candidate === "auto" || candidate === "plain" || candidate === "tui") {
+    if (candidate === "auto") {
+      uiMode = "plain";
+      continue;
+    }
+
+    if (candidate === "plain" || candidate === "tui") {
       uiMode = candidate;
       continue;
     }
 
-    process.stderr.write(`Invalid --ui value: ${candidate ?? ""}. Expected auto|tui|plain.\n`);
+    process.stderr.write(`Invalid --ui value: ${candidate ?? ""}. Expected plain|tui.\n`);
     return { uiMode, ok: false };
   }
 

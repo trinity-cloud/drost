@@ -1,5 +1,5 @@
 import type { SessionMetadata } from "../../sessions.js";
-import type { ChatMessage } from "../../types.js";
+import type { ChatImageRef, ChatMessage } from "../../types.js";
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -26,11 +26,12 @@ export function createSessionMetadata(seed?: Partial<SessionMetadata>): SessionM
   return metadata;
 }
 
-export function createUserMessage(content: string): ChatMessage {
+export function createUserMessage(content: string, imageRefs?: ChatImageRef[]): ChatMessage {
   return {
     role: "user",
     content,
-    createdAt: nowIso()
+    createdAt: nowIso(),
+    imageRefs: Array.isArray(imageRefs) && imageRefs.length > 0 ? imageRefs : undefined
   };
 }
 

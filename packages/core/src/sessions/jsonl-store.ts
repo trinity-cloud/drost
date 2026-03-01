@@ -125,6 +125,31 @@ export function readSerializedEventLines(filePath: string): string[] {
 }
 
 export function isHistoryPrefix(previous: ChatMessage[], next: ChatMessage[]): boolean {
+  const sameImageRefs = (left: ChatMessage, right: ChatMessage): boolean => {
+    const leftRefs = left.imageRefs ?? [];
+    const rightRefs = right.imageRefs ?? [];
+    if (leftRefs.length !== rightRefs.length) {
+      return false;
+    }
+    for (let index = 0; index < leftRefs.length; index += 1) {
+      const leftRef = leftRefs[index];
+      const rightRef = rightRefs[index];
+      if (!leftRef || !rightRef) {
+        return false;
+      }
+      if (
+        leftRef.id !== rightRef.id ||
+        leftRef.mimeType !== rightRef.mimeType ||
+        leftRef.sha256 !== rightRef.sha256 ||
+        leftRef.bytes !== rightRef.bytes ||
+        leftRef.path !== rightRef.path
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+
   if (previous.length > next.length) {
     return false;
   }
@@ -134,7 +159,12 @@ export function isHistoryPrefix(previous: ChatMessage[], next: ChatMessage[]): b
     if (!left || !right) {
       return false;
     }
-    if (left.role !== right.role || left.content !== right.content || left.createdAt !== right.createdAt) {
+    if (
+      left.role !== right.role ||
+      left.content !== right.content ||
+      left.createdAt !== right.createdAt ||
+      !sameImageRefs(left, right)
+    ) {
       return false;
     }
   }
