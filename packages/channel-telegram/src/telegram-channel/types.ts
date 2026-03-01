@@ -32,6 +32,12 @@ export interface TelegramUpdate {
 export interface TelegramApiResponse<T> {
   ok: boolean;
   description?: string;
+  error_code?: number;
+  parameters?: {
+    retry_after?: number;
+    migrate_to_chat_id?: number;
+    [key: string]: unknown;
+  };
   result: T;
 }
 

@@ -146,7 +146,8 @@ export function handleTuiCommand(params: {
       startedAt: status.startedAt,
       degradedReasons: status.degradedReasons,
       restartCount: params.restartCount,
-      healthUrl: status.healthUrl
+      healthUrl: status.healthUrl,
+      controlUrl: status.controlUrl
     }).map((line) => normalizeEventLine(line));
 
     if (params.hasProviders) {

@@ -2,6 +2,14 @@ import type { StreamEventHandler } from "../../events.js";
 import { persistSessionInputImages, resolveInputImageFromRef } from "../../media-store.js";
 import type { ChatImageRef, ChatInputImage } from "../../types.js";
 
+function sanitizePreview(text: string, maxChars = 160): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
 export async function runSessionTurn(
   runtime: any,
   params: {
@@ -59,6 +67,16 @@ export async function runSessionTurn(
     });
   }
 
+  runtime.emitRuntimeEvent("session.turn.started", {
+    sessionId: params.sessionId,
+    providerId: routeSelection?.primaryProviderId ?? activeProviderId ?? "unknown",
+    routeId: routeSelection?.routeId,
+    inputChars: input.length,
+    inputPreview: sanitizePreview(input),
+    inputImageCount: params.inputImages?.length ?? 0,
+    historyBeforeCount
+  });
+
   const onEvent: StreamEventHandler = (event) => {
     if (event.type !== "tool.call.started" && event.type !== "tool.call.completed") {
       runtime.appendSessionEvent(params.sessionId, event.type, {
@@ -66,6 +84,39 @@ export async function runSessionTurn(
         payload: event.payload
       });
     }
+
+    if (event.type === "provider.error") {
+      runtime.emitRuntimeEvent("provider.error", {
+        sessionId: event.sessionId,
+        providerId: event.providerId,
+        error: event.payload.error
+      });
+    } else if (event.type === "response.completed") {
+      runtime.emitRuntimeEvent("provider.response.completed", {
+        sessionId: event.sessionId,
+        providerId: event.providerId,
+        outputChars: typeof event.payload.text === "string" ? event.payload.text.length : 0,
+        usage: event.payload.usage
+      });
+    } else if (event.type === "tool.call.started") {
+      runtime.emitRuntimeEvent("tool.call.started", {
+        sessionId: event.sessionId,
+        providerId: event.providerId,
+        toolName: event.payload.toolName,
+        input: event.payload.metadata?.input
+      });
+    } else if (event.type === "tool.call.completed") {
+      runtime.emitRuntimeEvent("tool.call.completed", {
+        sessionId: event.sessionId,
+        providerId: event.providerId,
+        toolName: event.payload.toolName,
+        ok: event.payload.metadata?.ok,
+        code: event.payload.metadata?.code,
+        durationMs: event.payload.metadata?.durationMs,
+        error: event.payload.error
+      });
+    }
+
     params.onEvent(event);
   };
 
@@ -126,6 +177,14 @@ export async function runSessionTurn(
         })
     });
     runSucceeded = true;
+  } catch (error) {
+    runtime.emitRuntimeEvent("session.turn.failed", {
+      sessionId: params.sessionId,
+      providerId: runtime.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId ?? "unknown",
+      durationMs: Date.now() - turnStartedAtMs,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    throw error;
   } finally {
     if (runSucceeded) {
       const history = manager.getSessionHistory(params.sessionId);
@@ -149,6 +208,16 @@ export async function runSessionTurn(
         },
         runtime.config.observability?.usageEventsEnabled
       );
+      runtime.emitRuntimeEvent("session.turn.completed", {
+        sessionId: params.sessionId,
+        providerId: runtime.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId ?? "unknown",
+        durationMs: Date.now() - turnStartedAtMs,
+        inputChars: input.length,
+        outputChars: assistantText ? assistantText.length : 0,
+        historyBeforeCount,
+        historyAfterCount: history.length,
+        inputImageCount: params.inputImages?.length ?? 0
+      });
     }
     if (runSucceeded && runtime.agentDefinition?.hooks?.afterTurn) {
       try {

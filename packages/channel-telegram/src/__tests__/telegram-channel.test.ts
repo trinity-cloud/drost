@@ -1018,4 +1018,70 @@ describe("telegram channel adapter", () => {
     expect(editedMessages.some((entry) => (entry.text ?? "").includes("<b>Final Answer</b>"))).toBe(true);
   });
 
+  it("reports Telegram API method and description when command registration fails", async () => {
+    const errors: string[] = [];
+    const updateBatches: unknown[][] = [[]];
+
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.includes("/deleteMyCommands")) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: 400,
+            description: "Bad Request: not enough rights to manage commands"
+          }),
+          {
+            status: 400,
+            headers: {
+              "content-type": "application/json"
+            }
+          }
+        );
+      }
+      if (url.includes("/getUpdates")) {
+        const next = updateBatches.shift() ?? [];
+        return jsonResponse({
+          ok: true,
+          result: next
+        });
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      if (url.includes("/sendMessage")) {
+        return jsonResponse({
+          ok: true,
+          result: {
+            message_id: 1,
+            ...body
+          }
+        });
+      }
+      return jsonResponse({ ok: true, result: true });
+    };
+
+    const adapter = new TelegramChannelAdapter({
+      token: "test-token",
+      pollIntervalMs: 20,
+      persistState: false,
+      fetchImpl,
+      onError: (error) => {
+        errors.push(error.message);
+      }
+    });
+    activeAdapters.push(adapter);
+
+    adapter.connect({
+      runTurn: async () => ({
+        sessionId: "session:telegram:global:noop",
+        providerId: "provider-a",
+        response: "ok"
+      })
+    });
+
+    await waitFor(() => errors.length > 0);
+    expect(errors[0]).toContain("deleteMyCommands");
+    expect(errors[0]).toContain("status=400");
+    expect(errors[0]).toContain("not enough rights");
+  });
+
 });

@@ -43,6 +43,14 @@ function createSmokeConfig(workspace) {
     "export default {",
     "  workspaceDir: \".\",",
     "  health: { enabled: false },",
+    "  controlApi: {",
+    "    enabled: true,",
+    "    host: \"127.0.0.1\",",
+    "    port: 0,",
+    "    token: \"smoke-admin\",",
+    "    readToken: \"smoke-read\",",
+    "    allowLoopbackWithoutAuth: false",
+    "  },",
     "  sessionStore: { enabled: true, continuity: { enabled: true, autoOnNew: true } },",
     "  providers: {",
     "    defaultSessionProvider: \"echo\",",
@@ -69,10 +77,9 @@ function startCli(workspace) {
     cwd: workspace,
     env: {
       ...process.env,
-      NO_COLOR: "1",
-      DROST_FORCE_INTERACTIVE: "1"
+      NO_COLOR: "1"
     },
-    stdio: ["pipe", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"]
   });
 
   let output = "";
@@ -101,8 +108,25 @@ async function waitForOutput(readOutput, pattern, timeoutMs, label) {
   fail(`timeout waiting for ${label}. output:\n${readOutput()}`);
 }
 
-function sendLine(child, line) {
-  child.stdin.write(`${line}\n`);
+function parseControlUrl(output) {
+  const match = output.match(/control=(http:\/\/[^\s|]+)/);
+  return match?.[1] ?? null;
+}
+
+async function controlFetch(controlUrl, method, route, body) {
+  const response = await fetch(`${controlUrl}${route}`, {
+    method,
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer smoke-admin"
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    fail(`control ${method} ${route} failed status=${response.status} payload=${JSON.stringify(payload)}`);
+  }
+  return payload;
 }
 
 async function stopCli(child, readOutput) {
@@ -135,39 +159,60 @@ async function run() {
   createSmokeConfig(workspace);
 
   const first = startCli(workspace);
-  await waitForOutput(first.readOutput, /\[drost\] local session ready\./, 15_000, "initial boot");
-
-  sendLine(first.child, "/new");
-  const afterNew = await waitForOutput(
-    first.readOutput,
-    /\[drost\] active session switched to ([^\s]+) \(provider=/,
-    15_000,
-    "/new response"
-  );
-  const createdMatch = afterNew.match(/\[drost\] active session switched to ([^\s]+) \(provider=/);
-  if (!createdMatch?.[1]) {
-    fail(`could not parse new session id from output:\n${afterNew}`);
+  const bootOutput = await waitForOutput(first.readOutput, /\[drost\] gateway: (running|degraded)/, 15_000, "initial boot");
+  const controlUrl = parseControlUrl(bootOutput);
+  if (!controlUrl) {
+    fail(`could not parse control url from output:\n${bootOutput}`);
   }
-  const newSessionId = createdMatch[1];
 
-  sendLine(first.child, "message-new-1");
-  await waitForOutput(first.readOutput, /echo:message-new-1/, 15_000, "new session assistant output");
+  const createdLocal = await controlFetch(controlUrl, "POST", "/sessions", {
+    channel: "local",
+    title: "Local Session"
+  });
+  const localSessionId = createdLocal.sessionId;
+  if (!localSessionId) {
+    fail(`missing local session id in create response: ${JSON.stringify(createdLocal)}`);
+  }
+  const localTurn = await controlFetch(controlUrl, "POST", "/chat/send", {
+    sessionId: localSessionId,
+    input: "message-local-1"
+  });
+  if (typeof localTurn.response !== "string" || !localTurn.response.includes("echo:message-local-1")) {
+    fail(`unexpected local turn response: ${JSON.stringify(localTurn)}`);
+  }
 
-  sendLine(first.child, "/session local");
-  await waitForOutput(first.readOutput, /\[drost\] active session switched to local/, 15_000, "switch to local");
+  const createdNew = await controlFetch(controlUrl, "POST", "/sessions", {
+    channel: "local",
+    title: "New Session",
+    fromSessionId: localSessionId
+  });
+  const newSessionId = createdNew.sessionId;
+  if (!newSessionId) {
+    fail(`missing new session id in create response: ${JSON.stringify(createdNew)}`);
+  }
+  const newTurn = await controlFetch(controlUrl, "POST", "/chat/send", {
+    sessionId: newSessionId,
+    input: "message-new-1"
+  });
+  if (typeof newTurn.response !== "string" || !newTurn.response.includes("echo:message-new-1")) {
+    fail(`unexpected new session turn response: ${JSON.stringify(newTurn)}`);
+  }
 
-  sendLine(first.child, "message-local-1");
-  await waitForOutput(first.readOutput, /echo:message-local-1/, 15_000, "local session assistant output");
-
-  sendLine(first.child, "/sessions");
-  await waitForOutput(first.readOutput, new RegExp(`\\*?\\s*${newSessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), 15_000, "/sessions listing new session");
+  const sessionsList = await controlFetch(controlUrl, "GET", "/sessions");
+  const listed = Array.isArray(sessionsList.sessions) ? sessionsList.sessions : [];
+  if (!listed.some((entry) => entry.sessionId === localSessionId)) {
+    fail(`local session missing from /sessions: ${JSON.stringify(sessionsList)}`);
+  }
+  if (!listed.some((entry) => entry.sessionId === newSessionId)) {
+    fail(`new session missing from /sessions: ${JSON.stringify(sessionsList)}`);
+  }
 
   await stopCli(first.child, first.readOutput);
 
   const sessionDir = path.join(workspace, "sessions");
-  const localTranscript = path.join(sessionDir, `${encodeURIComponent("local")}.jsonl`);
+  const localTranscript = path.join(sessionDir, `${encodeURIComponent(localSessionId)}.jsonl`);
   const newTranscript = path.join(sessionDir, `${encodeURIComponent(newSessionId)}.jsonl`);
-  const localFull = path.join(sessionDir, `${encodeURIComponent("local")}.full.jsonl`);
+  const localFull = path.join(sessionDir, `${encodeURIComponent(localSessionId)}.full.jsonl`);
   const newFull = path.join(sessionDir, `${encodeURIComponent(newSessionId)}.full.jsonl`);
   if (!fs.existsSync(localTranscript) || !fs.existsSync(localFull)) {
     fail("missing local transcript/full session files after first run");
@@ -183,27 +228,28 @@ async function run() {
   }
 
   const second = startCli(workspace);
-  await waitForOutput(second.readOutput, /\[drost\] local session ready\./, 15_000, "second boot");
+  const secondBootOutput = await waitForOutput(second.readOutput, /\[drost\] gateway: (running|degraded)/, 15_000, "second boot");
+  const secondControlUrl = parseControlUrl(secondBootOutput);
+  if (!secondControlUrl) {
+    fail(`could not parse second control url from output:\n${secondBootOutput}`);
+  }
 
-  sendLine(second.child, "/sessions");
-  await waitForOutput(second.readOutput, /local/, 15_000, "persisted local session list");
-  await waitForOutput(
-    second.readOutput,
-    new RegExp(newSessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-    15_000,
-    "persisted new session list"
-  );
+  const persistedList = await controlFetch(secondControlUrl, "GET", "/sessions");
+  const persistedSessions = Array.isArray(persistedList.sessions) ? persistedList.sessions : [];
+  if (!persistedSessions.some((entry) => entry.sessionId === localSessionId)) {
+    fail(`persisted local session missing after restart: ${JSON.stringify(persistedList)}`);
+  }
+  if (!persistedSessions.some((entry) => entry.sessionId === newSessionId)) {
+    fail(`persisted new session missing after restart: ${JSON.stringify(persistedList)}`);
+  }
 
-  sendLine(second.child, `/session ${newSessionId}`);
-  await waitForOutput(
-    second.readOutput,
-    new RegExp(`\\[drost\\] active session switched to ${newSessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(provider=`),
-    15_000,
-    "switch to persisted new session"
-  );
-
-  sendLine(second.child, "message-new-2");
-  await waitForOutput(second.readOutput, /echo:message-new-2/, 15_000, "persisted new session assistant output");
+  const followupTurn = await controlFetch(secondControlUrl, "POST", "/chat/send", {
+    sessionId: newSessionId,
+    input: "message-new-2"
+  });
+  if (typeof followupTurn.response !== "string" || !followupTurn.response.includes("echo:message-new-2")) {
+    fail(`unexpected follow-up turn response: ${JSON.stringify(followupTurn)}`);
+  }
   await stopCli(second.child, second.readOutput);
 
   const newTranscriptAfterRestart = fs.readFileSync(newTranscript, "utf8");

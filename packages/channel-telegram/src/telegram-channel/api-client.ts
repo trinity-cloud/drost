@@ -9,13 +9,77 @@ import {
   type TelegramUpdate
 } from "./types.js";
 
-async function parseApiResponse<T>(response: Response): Promise<TelegramApiResponse<T>> {
-  const body = (await response.json()) as TelegramApiResponse<T>;
+function truncateForLog(value: string, max = 240): string {
+  const normalized = value.trim();
+  if (normalized.length <= max) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function parseJsonBody(rawBody: string): Record<string, unknown> | null {
+  if (!rawBody.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function toTelegramApiResponse<T>(record: Record<string, unknown>): TelegramApiResponse<T> | undefined {
+  if (typeof record.ok !== "boolean") {
+    return undefined;
+  }
+  return record as unknown as TelegramApiResponse<T>;
+}
+
+async function parseApiResponse<T>(response: Response, methodName: string): Promise<TelegramApiResponse<T>> {
+  const rawBody = await response.text();
+  const parsedBody = parseJsonBody(rawBody);
+  const body = parsedBody ? toTelegramApiResponse<T>(parsedBody) : undefined;
+
+  const description =
+    body?.description?.trim() ||
+    (parsedBody?.description && typeof parsedBody.description === "string"
+      ? parsedBody.description.trim()
+      : "") ||
+    truncateForLog(rawBody);
+  const errorCode =
+    typeof body?.error_code === "number"
+      ? body.error_code
+      : typeof parsedBody?.error_code === "number"
+        ? parsedBody.error_code
+        : undefined;
+
   if (!response.ok) {
-    throw new Error(`Telegram request failed with status ${response.status}`);
+    const details = [
+      `Telegram API ${methodName} failed`,
+      `status=${response.status}`,
+      errorCode !== undefined ? `error_code=${errorCode}` : null,
+      description ? `description=${description}` : null
+    ]
+      .filter((part) => typeof part === "string" && part.length > 0)
+      .join(" ");
+    throw new Error(details);
+  }
+  if (!body) {
+    throw new Error(`Telegram API ${methodName} returned an invalid response body`);
   }
   if (!body.ok) {
-    throw new Error(body.description || "Telegram API returned ok=false");
+    const details = [
+      `Telegram API ${methodName} returned ok=false`,
+      errorCode !== undefined ? `error_code=${errorCode}` : null,
+      description ? `description=${description}` : null
+    ]
+      .filter((part) => typeof part === "string" && part.length > 0)
+      .join(" ");
+    throw new Error(details);
   }
   return body;
 }
@@ -64,7 +128,7 @@ export class TelegramApiClient {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ scope })
       });
-      await parseApiResponse<boolean>(deleteResponse);
+      await parseApiResponse<boolean>(deleteResponse, "deleteMyCommands");
     }
 
     const setResponse = await this.fetchImpl(buildApiUrl(this.apiBaseUrl, this.token, "setMyCommands"), {
@@ -74,7 +138,7 @@ export class TelegramApiClient {
         commands: TELEGRAM_BOT_COMMANDS
       })
     });
-    await parseApiResponse<boolean>(setResponse);
+    await parseApiResponse<boolean>(setResponse, "setMyCommands");
   }
 
   async fetchUpdates(offset: number): Promise<TelegramUpdate[]> {
@@ -88,7 +152,7 @@ export class TelegramApiClient {
     const response = await this.fetchImpl(url.toString(), {
       method: "GET"
     });
-    const payload = await parseApiResponse<TelegramUpdate[]>(response);
+    const payload = await parseApiResponse<TelegramUpdate[]>(response, "getUpdates");
     return Array.isArray(payload.result) ? payload.result : [];
   }
 
@@ -130,7 +194,7 @@ export class TelegramApiClient {
         file_id: largestPhoto.file_id
       })
     });
-    const filePayload = await parseApiResponse<TelegramGetFileResult>(fileResponse);
+    const filePayload = await parseApiResponse<TelegramGetFileResult>(fileResponse, "getFile");
     const filePath = filePayload.result?.file_path?.trim();
     if (!filePath) {
       return {
@@ -143,7 +207,15 @@ export class TelegramApiClient {
       method: "GET"
     });
     if (!fileBytesResponse.ok) {
-      throw new Error(`Telegram file download failed with status ${fileBytesResponse.status}`);
+      let bodyPreview = "";
+      try {
+        bodyPreview = truncateForLog(await fileBytesResponse.text());
+      } catch {
+        bodyPreview = "";
+      }
+      throw new Error(
+        `Telegram file download failed status=${fileBytesResponse.status}${bodyPreview ? ` description=${bodyPreview}` : ""}`
+      );
     }
     const fileBytes = Buffer.from(await fileBytesResponse.arrayBuffer());
     return {
@@ -182,7 +254,7 @@ export class TelegramApiClient {
         },
         body: JSON.stringify(payload)
       });
-      const apiPayload = await parseApiResponse<TelegramSendMessageResult>(response);
+      const apiPayload = await parseApiResponse<TelegramSendMessageResult>(response, "sendMessage");
       if (typeof apiPayload.result?.message_id !== "number") {
         throw new Error("Telegram sendMessage response missing message_id");
       }
@@ -222,7 +294,7 @@ export class TelegramApiClient {
         },
         body: JSON.stringify(payload)
       });
-      await parseApiResponse<Record<string, unknown>>(response);
+      await parseApiResponse<Record<string, unknown>>(response, "editMessageText");
     } catch (error) {
       if (!parseMode || !allowFallback) {
         throw error;
@@ -242,6 +314,6 @@ export class TelegramApiClient {
         action
       })
     });
-    await parseApiResponse<Record<string, unknown>>(response);
+    await parseApiResponse<Record<string, unknown>>(response, "sendChatAction");
   }
 }

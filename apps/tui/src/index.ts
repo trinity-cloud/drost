@@ -4,6 +4,7 @@ export interface TuiGatewaySnapshot {
   degradedReasons?: string[];
   restartCount?: number;
   healthUrl?: string;
+  controlUrl?: string;
 }
 
 export interface TuiStreamEvent {
@@ -247,7 +248,7 @@ export function renderGatewayBoot(snapshot: TuiGatewaySnapshot): string[] {
   const lines = [line("========================================")];
   lines.push(
     line(
-      `gateway: ${snapshot.state} | restarts=${snapshot.restartCount ?? 0}${snapshot.healthUrl ? ` | health=${snapshot.healthUrl}` : ""}`
+      `gateway: ${snapshot.state} | restarts=${snapshot.restartCount ?? 0}${snapshot.healthUrl ? ` | health=${snapshot.healthUrl}` : ""}${snapshot.controlUrl ? ` | control=${snapshot.controlUrl}` : ""}`
     )
   );
   if (snapshot.startedAt) {
