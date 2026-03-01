@@ -172,6 +172,50 @@ describe("gateway channels", () => {
     }
   });
 
+  it("queues continuity exactly once when channel /new is dispatched", async () => {
+    const workspaceDir = makeTempDir();
+    const channel = new FakeChannelAdapter();
+    const gateway = createGateway({
+      ...makeConfig(workspaceDir, [channel]),
+      sessionStore: {
+        enabled: true,
+        continuity: {
+          enabled: true,
+          autoOnNew: true,
+          maxParallelJobs: 1
+        }
+      }
+    });
+
+    await gateway.start();
+    try {
+      expect(channel.context).not.toBeNull();
+      const result = await channel.context!.dispatchCommand!({
+        identity: {
+          channel: "telegram",
+          workspaceId: "wk-1",
+          chatId: "chat-1"
+        },
+        input: "/new"
+      });
+
+      expect(result.handled).toBe(true);
+      expect(result.ok).toBe(true);
+      expect(result.action).toBe("new_session");
+      expect(typeof result.sessionId).toBe("string");
+
+      const jobs = gateway.listContinuityJobs(20) as Array<{
+        fromSessionId?: string;
+        toSessionId?: string;
+      }>;
+      expect(jobs.length).toBe(1);
+      expect(jobs[0]?.fromSessionId).toBe("session:telegram:wk-1:chat-1");
+      expect(jobs[0]?.toSessionId).toBe(result.sessionId);
+    } finally {
+      await gateway.stop();
+    }
+  });
+
   it("supports dynamic channel registration and duplicate guardrails", async () => {
     const workspaceDir = makeTempDir();
     const gateway = createGateway(makeConfig(workspaceDir));

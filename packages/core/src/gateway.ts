@@ -78,6 +78,28 @@ const DEFAULT_RESTART_BUDGET_INTENTS: ReadonlySet<GatewayRestartIntent> = new Se
 const CONTROL_EVENT_STREAM_PING_MS = 15_000;
 const CONTROL_JSON_BODY_MAX_BYTES = 512_000;
 const OBS_MAX_TEXT_CHARS = 8_000;
+const OBS_REDACTED_TEXT = "[REDACTED]";
+const OBS_MAX_REDACTION_DEPTH = 10;
+const OBS_SENSITIVE_KEY_NAMES = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "api-key",
+  "apikey",
+  "api_key",
+  "password",
+  "passwd",
+  "passphrase",
+  "secret",
+  "client_secret",
+  "private_key",
+  "access_token",
+  "refresh_token",
+  "session_token",
+  "id_token",
+  "token"
+]);
 const ORCHESTRATION_STATE_FILE = path.join(".drost", "orchestration-lanes.json");
 
 export type GatewayState = "stopped" | "running" | "degraded";
@@ -431,17 +453,103 @@ function clipText(value: string, maxChars = OBS_MAX_TEXT_CHARS): string {
   return `${value.slice(0, maxChars)}...[truncated ${dropped} chars]`;
 }
 
-function summarizeForObservability(value: unknown): unknown {
+function isSensitiveObservabilityKey(key: string): boolean {
+  const normalized = key.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (OBS_SENSITIVE_KEY_NAMES.has(normalized)) {
+    return true;
+  }
+  return (
+    normalized.includes("token") ||
+    normalized.includes("secret") ||
+    normalized.includes("password") ||
+    normalized.includes("passphrase") ||
+    normalized.includes("apikey") ||
+    normalized.includes("api_key")
+  );
+}
+
+function redactStringSecrets(value: string): string {
+  let sanitized = value;
+  sanitized = sanitized.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, `Bearer ${OBS_REDACTED_TEXT}`);
+  sanitized = sanitized.replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{12,}\b/g, OBS_REDACTED_TEXT);
+  sanitized = sanitized.replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gi, OBS_REDACTED_TEXT);
+  sanitized = sanitized.replace(/\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b/g, OBS_REDACTED_TEXT);
+  sanitized = sanitized.replace(
+    /\b(token|secret|password|passphrase|api[_-]?key)\s*[:=]\s*([^\s,;]+)/gi,
+    (_, label: string) => `${label}=${OBS_REDACTED_TEXT}`
+  );
+  return sanitized;
+}
+
+function sanitizeObservabilityValue(value: unknown, depth = 0, seen?: WeakSet<object>): unknown {
   if (typeof value === "string") {
-    return clipText(value);
+    return redactStringSecrets(value);
   }
   if (value === null || value === undefined) {
     return value;
   }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (depth >= OBS_MAX_REDACTION_DEPTH) {
+    return "[Truncated depth]";
+  }
+
+  if (Buffer.isBuffer(value)) {
+    return redactStringSecrets(value.toString("utf8"));
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeObservabilityValue(entry, depth + 1, seen));
+  }
+
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: redactStringSecrets(value.message),
+      stack: value.stack ? redactStringSecrets(value.stack) : undefined
+    };
+  }
+
+  if (typeof value === "object") {
+    const references = seen ?? new WeakSet<object>();
+    const record = value as Record<string, unknown>;
+    if (references.has(record)) {
+      return "[Circular]";
+    }
+    references.add(record);
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(record)) {
+      if (isSensitiveObservabilityKey(key)) {
+        sanitized[key] = OBS_REDACTED_TEXT;
+      } else {
+        sanitized[key] = sanitizeObservabilityValue(entry, depth + 1, references);
+      }
+    }
+    return sanitized;
+  }
+
+  return redactStringSecrets(String(value));
+}
+
+function summarizeForObservability(value: unknown): unknown {
+  const sanitized = sanitizeObservabilityValue(value);
+  if (typeof sanitized === "string") {
+    return clipText(sanitized);
+  }
+  if (sanitized === null || sanitized === undefined) {
+    return sanitized;
+  }
   try {
-    return JSON.parse(clipText(JSON.stringify(value)));
+    return JSON.parse(clipText(JSON.stringify(sanitized)));
   } catch {
-    return clipText(String(value));
+    return clipText(String(sanitized));
   }
 }
 
@@ -1700,9 +1808,6 @@ export class GatewayRuntime {
       },
       request.input
     );
-    if (result.handled && result.action === "new_session" && result.sessionId) {
-      this.scheduleSessionContinuity(sessionId, result.sessionId);
-    }
     return result;
   }
 

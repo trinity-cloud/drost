@@ -207,7 +207,8 @@ async function runGatewayCyclePlain(params: {
   process.on("SIGTERM", onSigTerm);
   process.on("SIGUSR2", onSigUsr2);
 
-  if (process.stdin.isTTY) {
+  const forceInteractive = process.env.DROST_FORCE_INTERACTIVE === "1";
+  if (process.stdin.isTTY || forceInteractive) {
     rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
