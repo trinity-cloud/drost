@@ -174,6 +174,63 @@ class SnapshotDeltaAdapter implements ProviderAdapter {
   }
 }
 
+class NativeToolCallAdapter implements ProviderAdapter {
+  readonly id = "native-tool";
+  readonly supportsNativeToolCalls = true;
+  turns = 0;
+  sawAvailableTools = false;
+
+  async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
+    return {
+      providerId: profile.id,
+      ok: true,
+      code: "ok",
+      message: "ok"
+    };
+  }
+
+  async runTurn(request: ProviderTurnRequest): Promise<{ nativeToolCalls?: Array<{ id: string; name: string; input: unknown }> }> {
+    this.turns += 1;
+    this.sawAvailableTools = Array.isArray(request.availableTools) && request.availableTools.length > 0;
+    const hasToolResult = request.messages.some(
+      (message) => message.role === "tool" && message.content.startsWith("TOOL_RESULT")
+    );
+    if (!hasToolResult) {
+      return {
+        nativeToolCalls: [
+          {
+            id: "call_native_1",
+            name: "echo_tool",
+            input: {
+              text: "native"
+            }
+          }
+        ]
+      };
+    }
+
+    request.emit({
+      type: "response.delta",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "Final answer from native tool call."
+      }
+    });
+    request.emit({
+      type: "response.completed",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "Final answer from native tool call."
+      }
+    });
+    return {};
+  }
+}
+
 function authStore(): AuthStore {
   return {
     version: 1,
@@ -376,5 +433,69 @@ describe("provider tool loop", () => {
     expect(history[1]?.role).toBe("assistant");
     expect(history[1]?.content).toBe("When debugging, I usually do four things.");
     expect(history[1]?.content).not.toContain("When debuggWhen debugging");
+  });
+
+  it("runs provider-native tool calls when adapter returns native call descriptors", async () => {
+    const adapter = new NativeToolCallAdapter();
+    const manager = new ProviderManager({
+      profiles: [profile("native-tool")],
+      adapters: [adapter]
+    });
+    manager.ensureSession("s-1", "provider");
+
+    const toolCalls: Array<{ name: string; input: unknown }> = [];
+    await manager.runTurn({
+      sessionId: "s-1",
+      input: "use native tool calling",
+      authStore: authStore(),
+      availableToolNames: ["echo_tool"],
+      availableTools: [
+        {
+          name: "echo_tool",
+          description: "Echo text",
+          inputSchema: {
+            type: "object",
+            properties: {
+              text: {
+                type: "string"
+              }
+            },
+            required: ["text"],
+            additionalProperties: false
+          }
+        }
+      ],
+      onEvent: () => {},
+      runTool: async (request) => {
+        toolCalls.push({ name: request.toolName, input: request.input });
+        return {
+          ok: true,
+          output: {
+            echoed: request.input
+          }
+        };
+      }
+    });
+
+    expect(adapter.turns).toBe(2);
+    expect(adapter.sawAvailableTools).toBe(true);
+    expect(toolCalls).toEqual([
+      {
+        name: "echo_tool",
+        input: {
+          text: "native"
+        }
+      }
+    ]);
+
+    const history = manager.getSessionHistory("s-1");
+    expect(history.length).toBe(4);
+    expect(history[1]?.role).toBe("tool");
+    expect(history[1]?.content).toContain("TOOL_NATIVE_CALLS");
+    expect(history[2]?.role).toBe("tool");
+    expect(history[2]?.content).toContain("TOOL_RESULT");
+    expect(history[2]?.content).toContain("call_native_1");
+    expect(history[3]?.role).toBe("assistant");
+    expect(history[3]?.content).toContain("Final answer from native tool call.");
   });
 });

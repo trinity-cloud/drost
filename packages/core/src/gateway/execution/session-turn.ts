@@ -1,5 +1,7 @@
 import type { StreamEventHandler } from "../../events.js";
 import { persistSessionInputImages, resolveInputImageFromRef } from "../../media-store.js";
+import type { ProviderNativeToolDefinition } from "../../providers/types.js";
+import { toolInputSchemaFromParameters } from "../../tools/json-schema.js";
 import type { ChatImageRef, ChatInputImage } from "../../types.js";
 
 function sanitizePreview(text: string, maxChars = 160): string {
@@ -8,6 +10,25 @@ function sanitizePreview(text: string, maxChars = 160): string {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function resolveProviderNativeTools(runtime: any, toolNames: string[]): ProviderNativeToolDefinition[] {
+  if (toolNames.length === 0) {
+    return [];
+  }
+  const nativeTools: ProviderNativeToolDefinition[] = [];
+  for (const toolName of toolNames) {
+    const tool = runtime.toolRegistry.get(toolName);
+    if (!tool) {
+      continue;
+    }
+    nativeTools.push({
+      name: toolName,
+      description: typeof tool.description === "string" ? tool.description : undefined,
+      inputSchema: toolInputSchemaFromParameters(tool.parameters)
+    });
+  }
+  return nativeTools;
 }
 
 export async function runSessionTurn(
@@ -146,6 +167,8 @@ export async function runSessionTurn(
   }
 
   try {
+    const availableToolNames = runtime.listLoadedToolNames();
+    const availableTools = resolveProviderNativeTools(runtime, availableToolNames);
     await manager.runTurn({
       sessionId: params.sessionId,
       input,
@@ -160,7 +183,8 @@ export async function runSessionTurn(
       route: routeSelection ?? undefined,
       onEvent,
       signal: params.signal,
-      availableToolNames: runtime.listLoadedToolNames(),
+      availableToolNames,
+      availableTools,
       runTool: async (request: {
         sessionId: string;
         toolName: string;

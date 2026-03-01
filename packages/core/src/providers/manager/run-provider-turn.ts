@@ -1,7 +1,13 @@
 import type { AuthStore } from "../../auth/store.js";
 import type { StreamEventHandler } from "../../events.js";
 import type { ChatImageRef, ChatInputImage, ChatMessage } from "../../types.js";
-import type { ProviderAdapter, ProviderProfile } from "../types.js";
+import { normalizeNativeToolCalls } from "../tool-protocol.js";
+import type {
+  ProviderAdapter,
+  ProviderNativeToolCall,
+  ProviderNativeToolDefinition,
+  ProviderProfile
+} from "../types.js";
 import { classifyProviderFailure } from "./failure.js";
 import { ProviderFailoverState } from "./failover.js";
 import { resolveProviderBearerToken } from "./auth-resolution.js";
@@ -16,13 +22,14 @@ export async function runProviderTurnWithFailover(params: {
   authStore: AuthStore;
   messages: ChatMessage[];
   inputImages?: ChatInputImage[];
+  availableTools?: ProviderNativeToolDefinition[];
   resolveInputImageRef?: (ref: ChatImageRef) => ChatInputImage | null;
   onEvent: StreamEventHandler;
   signal?: AbortSignal;
   profiles: Map<string, ProviderProfile>;
   adapters: Map<string, ProviderAdapter>;
   failover: ProviderFailoverState;
-}): Promise<{ providerId: string; assistantBuffer: string }> {
+}): Promise<{ providerId: string; assistantBuffer: string; nativeToolCalls: ProviderNativeToolCall[] }> {
   const candidates = params.failover.resolveCandidates(params.primaryProviderId, params.fallbackProviderIds);
   let lastError: unknown = null;
   let attempt = 0;
@@ -47,12 +54,13 @@ export async function runProviderTurnWithFailover(params: {
     };
 
     try {
-      await adapter.runTurn({
+      const turnResult = await adapter.runTurn({
         sessionId: params.sessionId,
         providerId: profile.id,
         profile,
         messages: params.messages,
         inputImages: params.inputImages,
+        availableTools: params.availableTools,
         resolveInputImageRef: params.resolveInputImageRef,
         resolveBearerToken: (authProfileId) =>
           resolveProviderBearerToken({
@@ -65,7 +73,8 @@ export async function runProviderTurnWithFailover(params: {
       });
       return {
         providerId: profile.id,
-        assistantBuffer
+        assistantBuffer,
+        nativeToolCalls: normalizeNativeToolCalls(turnResult?.nativeToolCalls)
       };
     } catch (error) {
       lastError = error;

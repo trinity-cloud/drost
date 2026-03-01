@@ -1,12 +1,19 @@
 import type { NormalizedStreamEvent } from "../events.js";
 import type { ChatInputImage, ChatMessage, UsageSnapshot } from "../types.js";
 import { postJsonStreamWithTimeout, postJsonWithTimeout, type SseEvent } from "./http.js";
+import {
+  normalizeNativeToolCalls,
+  parseNativeToolCallsMessage,
+  parseToolResultMessage
+} from "./tool-protocol.js";
 import type {
   ProviderAdapter,
+  ProviderNativeToolCall,
   ProviderProbeContext,
   ProviderProbeResult,
   ProviderProfile,
-  ProviderTurnRequest
+  ProviderTurnRequest,
+  ProviderTurnResult
 } from "./types.js";
 
 function nowIso(): string {
@@ -114,6 +121,44 @@ function mapMessages(
     if (!message) {
       continue;
     }
+
+    if (message.role === "tool") {
+      const nativeToolCalls = parseNativeToolCallsMessage(message.content);
+      if (nativeToolCalls && nativeToolCalls.length > 0) {
+        const contentBlocks = nativeToolCalls.map((call, callIndex) => ({
+          type: "tool_use",
+          id: call.id?.trim() || `toolu_drost_${index + 1}_${callIndex + 1}`,
+          name: call.name,
+          input: normalizeToolUseInput(call.input)
+        }));
+        mapped.push({
+          role: "assistant",
+          content: contentBlocks
+        });
+        continue;
+      }
+
+      const toolResult = parseToolResultMessage(message.content);
+      if (toolResult?.callId) {
+        mapped.push({
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: toolResult.callId,
+              content: safeJsonString({
+                name: toolResult.name,
+                ok: toolResult.ok,
+                output: toolResult.output,
+                error: toolResult.error
+              })
+            }
+          ]
+        });
+        continue;
+      }
+    }
+
     const role = message.role === "assistant" ? "assistant" : "user";
     const persistedImages = resolveMessageImageRefs(request, message);
     const images =
@@ -165,6 +210,57 @@ function mapMessages(
   return mapped;
 }
 
+function safeJsonString(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify(String(value));
+  }
+}
+
+function normalizeToolUseInput(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      value
+    };
+  }
+  return value as Record<string, unknown>;
+}
+
+function fallbackToolInputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: true
+  };
+}
+
+function normalizeToolInputSchema(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallbackToolInputSchema();
+  }
+  return value as Record<string, unknown>;
+}
+
+function buildAnthropicTools(request: ProviderTurnRequest): Array<Record<string, unknown>> {
+  const tools = Array.isArray(request.availableTools) ? request.availableTools : [];
+  if (tools.length === 0) {
+    return [];
+  }
+  const resolved: Array<Record<string, unknown>> = [];
+  for (const tool of tools) {
+    const name = tool?.name?.trim();
+    if (!name) {
+      continue;
+    }
+    resolved.push({
+      name,
+      description: tool.description?.trim() || undefined,
+      input_schema: normalizeToolInputSchema(tool.inputSchema)
+    });
+  }
+  return resolved;
+}
+
 function extractText(payload: unknown): string {
   if (!payload || typeof payload !== "object") {
     return "";
@@ -184,6 +280,35 @@ function extractText(payload: unknown): string {
     }
   }
   return chunks.join("");
+}
+
+function extractNativeToolCallsFromPayload(payload: unknown): ProviderNativeToolCall[] {
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  const record = payload as Record<string, unknown>;
+  const content = Array.isArray(record.content) ? record.content : [];
+  const calls: ProviderNativeToolCall[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const block = item as Record<string, unknown>;
+    if (block.type !== "tool_use") {
+      continue;
+    }
+    const name = typeof block.name === "string" ? block.name.trim() : "";
+    if (!name) {
+      continue;
+    }
+    const idCandidate = typeof block.id === "string" ? block.id.trim() : "";
+    calls.push({
+      id: idCandidate.length > 0 ? idCandidate : undefined,
+      name,
+      input: normalizeToolUseInput(block.input)
+    });
+  }
+  return normalizeNativeToolCalls(calls);
 }
 
 function extractUsage(payload: unknown): UsageSnapshot | undefined {
@@ -369,6 +494,7 @@ async function runProbe(params: {
 
 export class AnthropicMessagesAdapter implements ProviderAdapter {
   readonly id = "anthropic-messages";
+  readonly supportsNativeToolCalls = true;
 
   async probe(profile: ProviderProfile, context: ProviderProbeContext): Promise<ProviderProbeResult> {
     const bearerToken = context.resolveBearerToken(profile.authProfileId);
@@ -388,7 +514,7 @@ export class AnthropicMessagesAdapter implements ProviderAdapter {
     });
   }
 
-  async runTurn(request: ProviderTurnRequest): Promise<void> {
+  async runTurn(request: ProviderTurnRequest): Promise<ProviderTurnResult> {
     const bearerToken = request.resolveBearerToken(request.profile.authProfileId);
     if (!bearerToken) {
       const message = `Missing auth profile token: ${request.profile.authProfileId}`;
@@ -404,85 +530,190 @@ export class AnthropicMessagesAdapter implements ProviderAdapter {
     let responseText = "";
     let usage: UsageSnapshot | undefined;
     let streamError: string | null = null;
+    let nativeToolCalls: ProviderNativeToolCall[] = [];
+    const nativeTools = buildAnthropicTools(request);
 
-    const response = await postJsonStreamWithTimeout({
-      url: `${normalizeBaseUrl(baseUrl)}/v1/messages`,
-      headers: buildAnthropicHeaders(bearerToken),
-      body: {
+    const runAttempt = async (withNativeTools: boolean) => {
+      responseText = "";
+      usage = undefined;
+      streamError = null;
+      nativeToolCalls = [];
+      const streamedToolCallState = new Map<
+        number,
+        { id?: string; name: string; inputJson: string; inputValue?: Record<string, unknown> }
+      >();
+
+      const finalizeStreamedToolCall = (index: number): void => {
+        const state = streamedToolCallState.get(index);
+        if (!state) {
+          return;
+        }
+        streamedToolCallState.delete(index);
+        let parsedInput: unknown = state.inputValue;
+        if (!parsedInput && state.inputJson.trim().length > 0) {
+          try {
+            parsedInput = JSON.parse(state.inputJson);
+          } catch {
+            parsedInput = {
+              value: state.inputJson
+            };
+          }
+        }
+        nativeToolCalls = normalizeNativeToolCalls([
+          ...nativeToolCalls,
+          {
+            id: state.id,
+            name: state.name,
+            input: normalizeToolUseInput(parsedInput)
+          }
+        ]);
+      };
+
+      const body: Record<string, unknown> = {
         model: request.profile.model,
         messages: mapMessages(request),
         max_tokens: 1024,
         stream: true
-      },
-      timeoutMs: 60_000,
-      signal: request.signal,
-      onSseEvent: async (event) => {
-        const payload = parseSseJson(event);
-        if (!payload) {
-          return;
-        }
+      };
+      if (withNativeTools && nativeTools.length > 0) {
+        body.tools = nativeTools;
+      }
 
-        const streamType = typeof payload.type === "string" ? payload.type : event.event;
-        if (streamType === "error") {
-          streamError = streamErrorMessage(payload) ?? "Anthropic stream error";
-          return;
-        }
-
-        if (streamType === "content_block_delta") {
-          const delta = payload.delta;
-          if (!delta || typeof delta !== "object") {
+      const response = await postJsonStreamWithTimeout({
+        url: `${normalizeBaseUrl(baseUrl)}/v1/messages`,
+        headers: buildAnthropicHeaders(bearerToken),
+        body,
+        timeoutMs: 60_000,
+        signal: request.signal,
+        onSseEvent: async (event) => {
+          const payload = parseSseJson(event);
+          if (!payload) {
             return;
           }
-          const text = (delta as Record<string, unknown>).text;
-          if (typeof text === "string" && text.length > 0) {
-            responseText += text;
-            request.emit({
-              type: "response.delta",
-              sessionId: request.sessionId,
-              providerId: request.providerId,
-              timestamp: nowIso(),
-              payload: {
-                text
-              }
-            });
-          }
-          return;
-        }
 
-        if (streamType === "message_start") {
-          const nextUsage = usageFromMessageStart(payload) ?? usage;
-          if (!sameUsage(usage, nextUsage) && nextUsage) {
-            usage = nextUsage;
-            request.emit({
-              type: "usage.updated",
-              sessionId: request.sessionId,
-              providerId: request.providerId,
-              timestamp: nowIso(),
-              payload: {
-                usage
-              }
-            });
+          const streamType = typeof payload.type === "string" ? payload.type : event.event;
+          if (streamType === "error") {
+            streamError = streamErrorMessage(payload) ?? "Anthropic stream error";
+            return;
           }
-          return;
-        }
 
-        if (streamType === "message_delta") {
-          const nextUsage = usageFromMessageDelta(payload, usage);
-          if (!sameUsage(usage, nextUsage) && nextUsage) {
-            usage = nextUsage;
-            request.emit({
-              type: "usage.updated",
-              sessionId: request.sessionId,
-              providerId: request.providerId,
-              timestamp: nowIso(),
-              payload: {
-                usage
-              }
+          if (streamType === "content_block_start") {
+            const index = typeof payload.index === "number" ? payload.index : -1;
+            const block = payload.content_block;
+            if (index < 0 || !block || typeof block !== "object") {
+              return;
+            }
+            const blockRecord = block as Record<string, unknown>;
+            if (blockRecord.type !== "tool_use") {
+              return;
+            }
+            const name = typeof blockRecord.name === "string" ? blockRecord.name.trim() : "";
+            if (!name) {
+              return;
+            }
+            const idCandidate = typeof blockRecord.id === "string" ? blockRecord.id.trim() : "";
+            streamedToolCallState.set(index, {
+              id: idCandidate.length > 0 ? idCandidate : undefined,
+              name,
+              inputJson: "",
+              inputValue:
+                blockRecord.input && typeof blockRecord.input === "object" && !Array.isArray(blockRecord.input)
+                  ? (blockRecord.input as Record<string, unknown>)
+                  : undefined
             });
+            return;
+          }
+
+          if (streamType === "content_block_delta") {
+            const delta = payload.delta;
+            if (!delta || typeof delta !== "object") {
+              return;
+            }
+            const deltaRecord = delta as Record<string, unknown>;
+            const text = deltaRecord.text;
+            if (typeof text === "string" && text.length > 0) {
+              responseText += text;
+              request.emit({
+                type: "response.delta",
+                sessionId: request.sessionId,
+                providerId: request.providerId,
+                timestamp: nowIso(),
+                payload: {
+                  text
+                }
+              });
+            }
+
+            if (deltaRecord.type === "input_json_delta" && typeof deltaRecord.partial_json === "string") {
+              const index = typeof payload.index === "number" ? payload.index : -1;
+              if (index >= 0) {
+                const state = streamedToolCallState.get(index);
+                if (state) {
+                  state.inputJson += deltaRecord.partial_json;
+                  streamedToolCallState.set(index, state);
+                }
+              }
+            }
+            return;
+          }
+
+          if (streamType === "content_block_stop") {
+            const index = typeof payload.index === "number" ? payload.index : -1;
+            if (index >= 0) {
+              finalizeStreamedToolCall(index);
+            }
+            return;
+          }
+
+          if (streamType === "message_start") {
+            const nextUsage = usageFromMessageStart(payload) ?? usage;
+            if (!sameUsage(usage, nextUsage) && nextUsage) {
+              usage = nextUsage;
+              request.emit({
+                type: "usage.updated",
+                sessionId: request.sessionId,
+                providerId: request.providerId,
+                timestamp: nowIso(),
+                payload: {
+                  usage
+                }
+              });
+            }
+            return;
+          }
+
+          if (streamType === "message_delta") {
+            const nextUsage = usageFromMessageDelta(payload, usage);
+            if (!sameUsage(usage, nextUsage) && nextUsage) {
+              usage = nextUsage;
+              request.emit({
+                type: "usage.updated",
+                sessionId: request.sessionId,
+                providerId: request.providerId,
+                timestamp: nowIso(),
+                payload: {
+                  usage
+                }
+              });
+            }
           }
         }
+      });
+
+      for (const index of streamedToolCallState.keys()) {
+        finalizeStreamedToolCall(index);
       }
-    });
+      return response;
+    };
+
+    let response = await runAttempt(true);
+    if (
+      response.status === 400 &&
+      nativeTools.length > 0 &&
+      response.text.toLowerCase().includes("tool")
+    ) {
+      response = await runAttempt(false);
+    }
 
     if (response.status >= 400) {
       const message = `Anthropic messages request failed (status ${response.status})`;
@@ -497,6 +728,10 @@ export class AnthropicMessagesAdapter implements ProviderAdapter {
     if (!response.streamed) {
       responseText = extractText(response.json);
       usage = extractUsage(response.json);
+      const responseCalls = extractNativeToolCallsFromPayload(response.json);
+      if (responseCalls.length > 0) {
+        nativeToolCalls = normalizeNativeToolCalls([...nativeToolCalls, ...responseCalls]);
+      }
 
       if (responseText.length > 0) {
         request.emit({
@@ -542,5 +777,8 @@ export class AnthropicMessagesAdapter implements ProviderAdapter {
         usage
       }
     });
+    return {
+      nativeToolCalls
+    };
   }
 }

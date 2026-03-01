@@ -77,6 +77,13 @@ export default {
       }
     ]
   },
+  subagents: {
+    enabled: true,
+    maxParallelJobs: 2,
+    defaultTimeoutMs: 120000,
+    allowNested: false,
+    lockMode: "none"
+  },
   channels: telegramToken
     ? [
         createTelegramChannel({

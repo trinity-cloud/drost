@@ -2,12 +2,19 @@ import type { NormalizedStreamEvent } from "../events.js";
 import { imageDataUrl } from "../input-images.js";
 import type { ChatInputImage, UsageSnapshot } from "../types.js";
 import { postJsonStreamWithTimeout, postJsonWithTimeout, type SseEvent } from "./http.js";
+import {
+  normalizeNativeToolCalls,
+  parseNativeToolCallsMessage,
+  parseToolResultMessage
+} from "./tool-protocol.js";
 import type {
   ProviderAdapter,
+  ProviderNativeToolCall,
   ProviderProbeContext,
   ProviderProbeResult,
   ProviderProfile,
-  ProviderTurnRequest
+  ProviderTurnRequest,
+  ProviderTurnResult
 } from "./types.js";
 
 function nowIso(): string {
@@ -68,6 +75,43 @@ function buildResponsesInput(request: ProviderTurnRequest): Array<Record<string,
       continue;
     }
 
+    if (message.role === "tool") {
+      const nativeToolCalls = parseNativeToolCallsMessage(message.content);
+      if (nativeToolCalls && nativeToolCalls.length > 0) {
+        for (let callIndex = 0; callIndex < nativeToolCalls.length; callIndex += 1) {
+          const nativeToolCall = nativeToolCalls[callIndex];
+          if (!nativeToolCall) {
+            continue;
+          }
+          const callId =
+            nativeToolCall.id?.trim() ||
+            `drost_call_${index + 1}_${callIndex + 1}`;
+          input.push({
+            type: "function_call",
+            call_id: callId,
+            name: nativeToolCall.name,
+            arguments: safeJsonString(nativeToolCall.input ?? {})
+          });
+        }
+        continue;
+      }
+
+      const toolResult = parseToolResultMessage(message.content);
+      if (toolResult?.callId) {
+        input.push({
+          type: "function_call_output",
+          call_id: toolResult.callId,
+          output: safeJsonString({
+            name: toolResult.name,
+            ok: toolResult.ok,
+            output: toolResult.output,
+            error: toolResult.error
+          })
+        });
+        continue;
+      }
+    }
+
     const persistedImages = resolveMessageImageRefs(request, message);
     const images =
       message.role === "user"
@@ -114,6 +158,125 @@ function buildResponsesInput(request: ProviderTurnRequest): Array<Record<string,
   }
 
   return input;
+}
+
+function safeJsonString(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify(String(value));
+  }
+}
+
+function fallbackToolInputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: true
+  };
+}
+
+function normalizeToolInputSchema(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallbackToolInputSchema();
+  }
+  return value as Record<string, unknown>;
+}
+
+function buildResponsesTools(request: ProviderTurnRequest): Array<Record<string, unknown>> {
+  const tools = Array.isArray(request.availableTools) ? request.availableTools : [];
+  if (tools.length === 0) {
+    return [];
+  }
+  const resolved: Array<Record<string, unknown>> = [];
+  for (const tool of tools) {
+    const name = tool?.name?.trim();
+    if (!name) {
+      continue;
+    }
+    resolved.push({
+      type: "function",
+      name,
+      description: tool.description?.trim() || undefined,
+      parameters: normalizeToolInputSchema(tool.inputSchema)
+    });
+  }
+  return resolved;
+}
+
+function parseLooseJson(value: unknown): unknown {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return {};
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return {
+      value: trimmed
+    };
+  }
+}
+
+function toNativeToolCall(value: unknown): ProviderNativeToolCall | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type : "";
+  if (type !== "function_call") {
+    return null;
+  }
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  if (!name) {
+    return null;
+  }
+  const callIdCandidate = typeof record.call_id === "string"
+    ? record.call_id.trim()
+    : typeof record.id === "string"
+      ? record.id.trim()
+      : "";
+  const argumentsValue = parseLooseJson(record.arguments);
+  return {
+    id: callIdCandidate.length > 0 ? callIdCandidate : undefined,
+    name,
+    input: argumentsValue ?? {}
+  };
+}
+
+function extractNativeToolCallsFromResponsesPayload(payload: unknown): ProviderNativeToolCall[] {
+  const calls: ProviderNativeToolCall[] = [];
+  const collectFromRecord = (value: unknown): void => {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const fromRecord = toNativeToolCall(record);
+    if (fromRecord) {
+      calls.push(fromRecord);
+    }
+    if (Array.isArray(record.output)) {
+      for (const item of record.output) {
+        const fromItem = toNativeToolCall(item);
+        if (fromItem) {
+          calls.push(fromItem);
+        }
+      }
+    }
+    if (record.item && typeof record.item === "object") {
+      const fromItem = toNativeToolCall(record.item);
+      if (fromItem) {
+        calls.push(fromItem);
+      }
+    }
+    if (record.response && typeof record.response === "object") {
+      collectFromRecord(record.response);
+    }
+  };
+  collectFromRecord(payload);
+  return normalizeNativeToolCalls(calls);
 }
 
 function extractResponseText(payload: unknown): string {
@@ -329,6 +492,7 @@ async function runProbe(params: {
 
 export class OpenAIResponsesAdapter implements ProviderAdapter {
   readonly id = "openai-responses";
+  readonly supportsNativeToolCalls = true;
 
   async probe(profile: ProviderProfile, context: ProviderProbeContext): Promise<ProviderProbeResult> {
     const bearerToken = context.resolveBearerToken(profile.authProfileId);
@@ -348,7 +512,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     });
   }
 
-  async runTurn(request: ProviderTurnRequest): Promise<void> {
+  async runTurn(request: ProviderTurnRequest): Promise<ProviderTurnResult> {
     const bearerToken = request.resolveBearerToken(request.profile.authProfileId);
     if (!bearerToken) {
       const message = `Missing auth profile token: ${request.profile.authProfileId}`;
@@ -374,53 +538,82 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     let responseText = "";
     let usage: UsageSnapshot | undefined;
     let streamError: string | null = null;
+    let nativeToolCalls: ProviderNativeToolCall[] = [];
+    const nativeTools = buildResponsesTools(request);
 
-    const response = await postJsonStreamWithTimeout({
-      url: responsesUrl(baseUrl),
-      headers: {
-        authorization: `Bearer ${bearerToken}`
-      },
-      body: {
+    const runAttempt = async (withNativeTools: boolean) => {
+      responseText = "";
+      usage = undefined;
+      streamError = null;
+      nativeToolCalls = [];
+
+      const body: Record<string, unknown> = {
         model: request.profile.model,
         input: buildResponsesInput(request),
         stream: true
-      },
-      timeoutMs: 60_000,
-      signal: request.signal,
-      onSseEvent: async (event) => {
-        const payload = parseSseJson(event);
-        if (!payload) {
-          return;
-        }
-
-        const streamType = typeof payload.type === "string" ? payload.type : "";
-        if (streamType === "response.error" || streamType === "error") {
-          streamError = streamErrorMessage(payload) ?? "Responses stream error";
-          return;
-        }
-
-        if (streamType === "response.output_text.delta") {
-          const delta = typeof payload.delta === "string" ? payload.delta : "";
-          if (delta.length > 0) {
-            responseText += delta;
-            request.emit({
-              type: "response.delta",
-              sessionId: request.sessionId,
-              providerId: request.providerId,
-              timestamp: nowIso(),
-              payload: {
-                text: delta
-              }
-            });
-          }
-          return;
-        }
-
-        if (streamType === "response.completed") {
-          usage = extractUsageFromStreamRecord(payload) ?? usage;
-        }
+      };
+      if (withNativeTools && nativeTools.length > 0) {
+        body.tools = nativeTools;
+        body.tool_choice = "auto";
       }
-    });
+
+      return await postJsonStreamWithTimeout({
+        url: responsesUrl(baseUrl),
+        headers: {
+          authorization: `Bearer ${bearerToken}`
+        },
+        body,
+        timeoutMs: 60_000,
+        signal: request.signal,
+        onSseEvent: async (event) => {
+          const payload = parseSseJson(event);
+          if (!payload) {
+            return;
+          }
+
+          const streamCalls = extractNativeToolCallsFromResponsesPayload(payload);
+          if (streamCalls.length > 0) {
+            nativeToolCalls = normalizeNativeToolCalls([...nativeToolCalls, ...streamCalls]);
+          }
+
+          const streamType = typeof payload.type === "string" ? payload.type : "";
+          if (streamType === "response.error" || streamType === "error") {
+            streamError = streamErrorMessage(payload) ?? "Responses stream error";
+            return;
+          }
+
+          if (streamType === "response.output_text.delta") {
+            const delta = typeof payload.delta === "string" ? payload.delta : "";
+            if (delta.length > 0) {
+              responseText += delta;
+              request.emit({
+                type: "response.delta",
+                sessionId: request.sessionId,
+                providerId: request.providerId,
+                timestamp: nowIso(),
+                payload: {
+                  text: delta
+                }
+              });
+            }
+            return;
+          }
+
+          if (streamType === "response.completed") {
+            usage = extractUsageFromStreamRecord(payload) ?? usage;
+          }
+        }
+      });
+    };
+
+    let response = await runAttempt(true);
+    if (
+      response.status === 400 &&
+      nativeTools.length > 0 &&
+      response.text.toLowerCase().includes("tool")
+    ) {
+      response = await runAttempt(false);
+    }
 
     if (response.status >= 400) {
       const message = `Responses API request failed (status ${response.status})`;
@@ -435,6 +628,10 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     if (!response.streamed) {
       responseText = extractResponseText(response.json);
       usage = extractUsage(response.json);
+      const responseCalls = extractNativeToolCallsFromResponsesPayload(response.json);
+      if (responseCalls.length > 0) {
+        nativeToolCalls = normalizeNativeToolCalls([...nativeToolCalls, ...responseCalls]);
+      }
       if (responseText.length > 0) {
         request.emit({
           type: "response.delta",
@@ -479,5 +676,8 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         usage
       }
     });
+    return {
+      nativeToolCalls
+    };
   }
 }

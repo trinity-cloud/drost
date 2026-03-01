@@ -23,7 +23,7 @@ function createToolInstructionMessage(toolNames: string[]): ChatMessage | null {
     content: [
       "Tool calling is available for this session.",
       `Available tools: ${toolNames.join(", ")}`,
-      "If you need a tool, respond with exactly one line in this format and no additional text:",
+      "If native tool calling is unavailable, respond with exactly one line in this format and no additional text:",
       "TOOL_CALL {\"name\":\"<tool_name>\",\"input\":{...}}",
       "After you receive TOOL_RESULT as a tool message, continue with the user response."
     ].join("\n"),

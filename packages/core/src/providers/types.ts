@@ -37,16 +37,34 @@ export interface ProviderTurnRequest {
   profile: ProviderProfile;
   messages: ChatMessage[];
   inputImages?: ChatInputImage[];
+  availableTools?: ProviderNativeToolDefinition[];
   resolveInputImageRef?: (ref: ChatImageRef) => ChatInputImage | null;
   resolveBearerToken: (authProfileId: string) => string | null;
   emit: StreamEventHandler;
   signal?: AbortSignal;
 }
 
+export interface ProviderNativeToolDefinition {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
+export interface ProviderNativeToolCall {
+  id?: string;
+  name: string;
+  input: unknown;
+}
+
+export interface ProviderTurnResult {
+  nativeToolCalls?: ProviderNativeToolCall[];
+}
+
 export interface ProviderAdapter {
   id: string;
+  supportsNativeToolCalls?: boolean;
   probe(profile: ProviderProfile, context: ProviderProbeContext): Promise<ProviderProbeResult>;
-  runTurn(request: ProviderTurnRequest): Promise<void>;
+  runTurn(request: ProviderTurnRequest): Promise<ProviderTurnResult | void>;
 }
 
 export interface ProviderSessionState {

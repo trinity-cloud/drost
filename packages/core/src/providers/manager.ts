@@ -4,6 +4,7 @@ import type { AuthStore } from "../auth/store.js";
 import type { SessionMetadata } from "../sessions.js";
 import type {
   ProviderAdapter,
+  ProviderNativeToolDefinition,
   ProviderProbeResult,
   ProviderProfile,
   ProviderSessionState
@@ -14,7 +15,12 @@ import { resolveProviderBearerToken } from "./manager/auth-resolution.js";
 import { createAssistantMessage, createToolMessage, createUserMessage, nowIso } from "./manager/metadata.js";
 import { runProviderTurnWithFailover } from "./manager/run-provider-turn.js";
 import { ProviderSessionRegistry } from "./manager/session-registry.js";
-import { buildTurnMessages, normalizeToolNames, parseToolCall, safeJson } from "./manager/tool-calls.js";
+import { buildTurnMessages, normalizeToolNames, parseToolCall } from "./manager/tool-calls.js";
+import {
+  encodeNativeToolCallsMessage,
+  encodeToolResultMessage,
+  normalizeNativeToolCalls
+} from "./tool-protocol.js";
 
 export type { ProviderFailureClass, ProviderFailoverConfig, ProviderFailoverStatus };
 
@@ -32,6 +38,35 @@ interface ToolRunResult {
     message: string;
     issues?: Array<{ path: string; message: string; code?: string }>;
   };
+}
+
+function normalizeNativeToolDefinitions(
+  availableTools: ProviderNativeToolDefinition[] | undefined,
+  availableToolNames: string[]
+): ProviderNativeToolDefinition[] {
+  if (!availableTools || availableTools.length === 0 || availableToolNames.length === 0) {
+    return [];
+  }
+  const allowNames = new Set(availableToolNames);
+  const normalized: ProviderNativeToolDefinition[] = [];
+  const seen = new Set<string>();
+
+  for (const tool of availableTools) {
+    const name = tool?.name?.trim();
+    if (!name || !allowNames.has(name) || seen.has(name)) {
+      continue;
+    }
+    seen.add(name);
+    normalized.push({
+      name,
+      description: typeof tool.description === "string" ? tool.description : undefined,
+      inputSchema:
+        tool.inputSchema && typeof tool.inputSchema === "object" && !Array.isArray(tool.inputSchema)
+          ? tool.inputSchema
+          : undefined
+    });
+  }
+  return normalized;
 }
 
 export class ProviderManager {
@@ -151,6 +186,7 @@ export class ProviderManager {
     signal?: AbortSignal;
     route?: ProviderRouteSelection;
     availableToolNames?: string[];
+    availableTools?: ProviderNativeToolDefinition[];
     maxToolCalls?: number;
     runTool?: (request: {
       sessionId: string;
@@ -199,19 +235,31 @@ export class ProviderManager {
 
     const availableToolNames = normalizeToolNames(params.availableToolNames);
     const canRunTools = availableToolNames.length > 0 && typeof params.runTool === "function";
+    const nativeToolDefinitions = canRunTools
+      ? normalizeNativeToolDefinitions(params.availableTools, availableToolNames)
+      : [];
     const maxToolCalls = Math.max(1, params.maxToolCalls ?? 50);
     let remainingToolCalls = maxToolCalls;
 
     try {
       while (true) {
+        const activeProfile = this.profileById.get(activeProviderId);
+        const activeAdapter = activeProfile ? this.adapterById.get(activeProfile.adapterId) : undefined;
+        const preferNativeToolCalling = Boolean(
+          canRunTools && nativeToolDefinitions.length > 0 && activeAdapter?.supportsNativeToolCalls
+        );
+
         const turnResult = await runProviderTurnWithFailover({
           sessionId: session.sessionId,
           primaryProviderId: activeProviderId,
           routeId: params.route?.routeId,
           fallbackProviderIds: params.route?.fallbackProviderIds,
           authStore: params.authStore,
-          messages: buildTurnMessages(session.history, canRunTools ? availableToolNames : []),
+          messages: preferNativeToolCalling
+            ? [...session.history]
+            : buildTurnMessages(session.history, canRunTools ? availableToolNames : []),
           inputImages: params.inputImages,
+          availableTools: nativeToolDefinitions,
           resolveInputImageRef: params.resolveInputImageRef,
           onEvent: params.onEvent,
           signal: params.signal,
@@ -224,6 +272,57 @@ export class ProviderManager {
         activeProviderId = turnResult.providerId;
         if (session.activeProviderId !== activeProviderId) {
           session.activeProviderId = activeProviderId;
+        }
+
+        const nativeToolCalls = canRunTools ? normalizeNativeToolCalls(turnResult.nativeToolCalls) : [];
+        if (nativeToolCalls.length > 0 && params.runTool) {
+          session.history.push(createToolMessage(encodeNativeToolCallsMessage(nativeToolCalls)));
+          session.metadata.lastActivityAt = nowIso();
+
+          let budgetExceeded = false;
+          for (const nativeToolCall of nativeToolCalls) {
+            if (remainingToolCalls <= 0) {
+              budgetExceeded = true;
+              break;
+            }
+            remainingToolCalls -= 1;
+            const toolResult = await params.runTool({
+              sessionId: session.sessionId,
+              providerId: activeProviderId,
+              toolName: nativeToolCall.name,
+              input: nativeToolCall.input,
+              onEvent: params.onEvent
+            });
+            session.history.push(
+              createToolMessage(
+                encodeToolResultMessage({
+                  name: nativeToolCall.name,
+                  callId: nativeToolCall.id,
+                  ok: toolResult.ok,
+                  output: toolResult.output,
+                  error: toolResult.error
+                })
+              )
+            );
+            session.metadata.lastActivityAt = nowIso();
+          }
+
+          if (budgetExceeded) {
+            const message = `Tool call budget exceeded (${maxToolCalls})`;
+            params.onEvent({
+              type: "provider.error",
+              sessionId: session.sessionId,
+              providerId: activeProviderId,
+              timestamp: nowIso(),
+              payload: {
+                error: message
+              }
+            });
+            session.history.push(createAssistantMessage(message));
+            session.metadata.lastActivityAt = nowIso();
+            break;
+          }
+          continue;
         }
 
         if (assistantBuffer.trim().length === 0) {
@@ -264,12 +363,12 @@ export class ProviderManager {
 
         session.history.push(
           createToolMessage(
-            `TOOL_RESULT ${safeJson({
+            encodeToolResultMessage({
               name: toolCall.toolName,
               ok: toolResult.ok,
               output: toolResult.output,
               error: toolResult.error
-            })}`
+            })
           )
         );
         session.metadata.lastActivityAt = nowIso();
