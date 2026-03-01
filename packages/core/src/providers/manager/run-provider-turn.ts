@@ -13,6 +13,9 @@ import { ProviderFailoverState } from "./failover.js";
 import { resolveProviderBearerToken } from "./auth-resolution.js";
 import { nowIso } from "./metadata.js";
 import { mergeStreamText } from "./streaming.js";
+import { ProviderRuntimeKernel } from "../runtime/kernel.js";
+
+const runtimeKernel = new ProviderRuntimeKernel();
 
 export async function runProviderTurnWithFailover(params: {
   sessionId: string;
@@ -54,23 +57,27 @@ export async function runProviderTurnWithFailover(params: {
     };
 
     try {
-      const turnResult = await adapter.runTurn({
-        sessionId: params.sessionId,
-        providerId: profile.id,
-        profile,
-        messages: params.messages,
-        inputImages: params.inputImages,
-        availableTools: params.availableTools,
-        resolveInputImageRef: params.resolveInputImageRef,
-        resolveBearerToken: (authProfileId) =>
-          resolveProviderBearerToken({
-            authStore: params.authStore,
-            profile,
-            authProfileId
-          }),
-        emit: onEvent,
-        signal: params.signal
+      const runtimeTurn = await runtimeKernel.runTurn({
+        adapter,
+        request: {
+          sessionId: params.sessionId,
+          providerId: profile.id,
+          profile,
+          messages: params.messages,
+          inputImages: params.inputImages,
+          availableTools: params.availableTools,
+          resolveInputImageRef: params.resolveInputImageRef,
+          resolveBearerToken: (authProfileId) =>
+            resolveProviderBearerToken({
+              authStore: params.authStore,
+              profile,
+              authProfileId
+            }),
+          emit: onEvent,
+          signal: params.signal
+        }
       });
+      const turnResult = runtimeTurn.turnResult;
       return {
         providerId: profile.id,
         assistantBuffer,

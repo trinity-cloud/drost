@@ -220,16 +220,36 @@ function parseLooseJson(value: unknown): unknown {
   }
 }
 
+function isFunctionCallType(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "function_call" ||
+    normalized === "tool_call" ||
+    normalized.endsWith(":function_call") ||
+    normalized.endsWith(":tool_call")
+  );
+}
+
 function toNativeToolCall(value: unknown): ProviderNativeToolCall | null {
   if (!value || typeof value !== "object") {
     return null;
   }
   const record = value as Record<string, unknown>;
-  const type = typeof record.type === "string" ? record.type : "";
-  if (type !== "function_call") {
+  if (!isFunctionCallType(record.type)) {
     return null;
   }
-  const name = typeof record.name === "string" ? record.name.trim() : "";
+  const functionRecord =
+    record.function && typeof record.function === "object"
+      ? (record.function as Record<string, unknown>)
+      : null;
+  const name = typeof record.name === "string"
+    ? record.name.trim()
+    : typeof functionRecord?.name === "string"
+      ? functionRecord.name.trim()
+      : "";
   if (!name) {
     return null;
   }
@@ -238,7 +258,9 @@ function toNativeToolCall(value: unknown): ProviderNativeToolCall | null {
     : typeof record.id === "string"
       ? record.id.trim()
       : "";
-  const argumentsValue = parseLooseJson(record.arguments);
+  const argumentsValue = parseLooseJson(
+    record.arguments ?? functionRecord?.arguments ?? functionRecord?.input ?? record.input
+  );
   return {
     id: callIdCandidate.length > 0 ? callIdCandidate : undefined,
     name,

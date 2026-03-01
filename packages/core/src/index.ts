@@ -108,12 +108,16 @@ export type {
   ProviderProbeContext,
   ProviderTurnRequest,
   ProviderKind,
+  ProviderFamily,
+  ProviderCapabilities,
+  ProviderAuthMode,
   ProviderSessionState
 } from "./providers/types.js";
 export { ProviderManager } from "./providers/manager.js";
 export { OpenAIResponsesAdapter } from "./providers/openai-responses.js";
 export { AnthropicMessagesAdapter } from "./providers/anthropic.js";
 export { CodexExecAdapter } from "./providers/codex-exec.js";
+export { ProviderRuntimeKernel } from "./providers/runtime/kernel.js";
 
 export type { AuthStore, AuthProfile, AuthCredential } from "./auth/store.js";
 export {

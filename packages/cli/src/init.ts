@@ -54,6 +54,7 @@ function templateConfig(): string {
         id: "openai-codex",
         adapterId: "codex-exec",
         kind: "openai-codex",
+        family: "codex",
         baseUrl: "https://api.openai.com",
         model: "auto",
         authProfileId: "openai-codex:default"
@@ -62,6 +63,7 @@ function templateConfig(): string {
         id: "openai",
         adapterId: "openai-responses",
         kind: "openai",
+        family: "openai-responses",
         baseUrl: "https://api.openai.com",
         model: "gpt-4.1-mini",
         authProfileId: "openai:default"
@@ -70,6 +72,7 @@ function templateConfig(): string {
         id: "anthropic",
         adapterId: "anthropic-messages",
         kind: "anthropic",
+        family: "anthropic-messages",
         baseUrl: "https://api.anthropic.com",
         model: "claude-sonnet-4-5",
         authProfileId: "anthropic:default"
@@ -78,6 +81,7 @@ function templateConfig(): string {
         id: "local-openai-compatible",
         adapterId: "openai-responses",
         kind: "openai-compatible",
+        family: "openai-responses",
         baseUrl: "http://localhost:8000",
         model: "your-model-id",
         authProfileId: "openai-compatible:local"

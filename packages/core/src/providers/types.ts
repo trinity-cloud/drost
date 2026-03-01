@@ -3,14 +3,36 @@ import type { ChatImageRef, ChatInputImage, ChatMessage } from "../types.js";
 import type { SessionMetadata } from "../sessions.js";
 
 export type ProviderKind = "openai" | "openai-compatible" | "anthropic" | "openai-codex";
+export type ProviderFamily = "openai-responses" | "anthropic-messages" | "codex" | "legacy";
+
+export interface ProviderCapabilities {
+  nativeToolCalls: boolean;
+  imageInput: boolean;
+  streaming: boolean;
+  toolResultReplay: boolean;
+  strictJsonSchema?: boolean;
+  maxImagesPerTurn?: number;
+  maxToolsPerTurn?: number;
+}
+
+export type ProviderAuthMode = "api_key" | "setup_token" | "oauth" | "cli" | "token" | "unknown";
+
+export interface ProviderProfileWireQuirks {
+  xaiXmlToolFallback?: boolean;
+  disableStrictJsonSchema?: boolean;
+  anthropicSetupTokenMode?: boolean;
+}
 
 export interface ProviderProfile {
   id: string;
   adapterId: string;
   kind: ProviderKind;
+  family?: ProviderFamily;
   baseUrl?: string;
   model: string;
   authProfileId: string;
+  capabilityHints?: Partial<ProviderCapabilities>;
+  wireQuirks?: ProviderProfileWireQuirks;
 }
 
 export interface ProviderProbeResult {
@@ -24,6 +46,13 @@ export interface ProviderProbeResult {
     | "unreachable"
     | "provider_error";
   message: string;
+  runtime?: {
+    family?: ProviderFamily;
+    dialectId?: string;
+    authMode?: ProviderAuthMode;
+    capabilities?: ProviderCapabilities;
+    warnings?: string[];
+  };
 }
 
 export interface ProviderProbeContext {

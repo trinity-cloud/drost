@@ -16,6 +16,8 @@ import { createAssistantMessage, createToolMessage, createUserMessage, nowIso } 
 import { runProviderTurnWithFailover } from "./manager/run-provider-turn.js";
 import { ProviderSessionRegistry } from "./manager/session-registry.js";
 import { buildTurnMessages, normalizeToolNames, parseToolCall } from "./manager/tool-calls.js";
+import { ProviderRuntimeKernel } from "./runtime/kernel.js";
+import { resolveProviderCapabilities } from "./runtime/capabilities.js";
 import {
   encodeNativeToolCallsMessage,
   encodeToolResultMessage,
@@ -74,6 +76,7 @@ export class ProviderManager {
   private readonly adapterById = new Map<string, ProviderAdapter>();
   private readonly sessions: ProviderSessionRegistry;
   private readonly failover: ProviderFailoverState;
+  private readonly runtimeKernel = new ProviderRuntimeKernel();
 
   constructor(params: { profiles: ProviderProfile[]; adapters: ProviderAdapter[]; failover?: ProviderFailoverConfig }) {
     for (const profile of params.profiles) {
@@ -160,16 +163,20 @@ export class ProviderManager {
         continue;
       }
 
-      const result = await adapter.probe(profile, {
-        resolveBearerToken: (authProfileId) =>
-          resolveProviderBearerToken({
-            authStore: params.authStore,
-            profile,
-            authProfileId
-          }),
-        timeoutMs: params.timeoutMs
+      const result = await this.runtimeKernel.probe({
+        profile,
+        adapter,
+        context: {
+          resolveBearerToken: (authProfileId) =>
+            resolveProviderBearerToken({
+              authStore: params.authStore,
+              profile,
+              authProfileId
+            }),
+          timeoutMs: params.timeoutMs
+        }
       });
-      probes.push(result);
+      probes.push(result.probeResult);
     }
 
     return probes;
@@ -245,8 +252,12 @@ export class ProviderManager {
       while (true) {
         const activeProfile = this.profileById.get(activeProviderId);
         const activeAdapter = activeProfile ? this.adapterById.get(activeProfile.adapterId) : undefined;
+        const activeCapabilities =
+          activeProfile && activeAdapter
+            ? resolveProviderCapabilities(activeProfile, activeAdapter)
+            : null;
         const preferNativeToolCalling = Boolean(
-          canRunTools && nativeToolDefinitions.length > 0 && activeAdapter?.supportsNativeToolCalls
+          canRunTools && nativeToolDefinitions.length > 0 && activeCapabilities?.nativeToolCalls
         );
 
         const turnResult = await runProviderTurnWithFailover({
@@ -329,7 +340,9 @@ export class ProviderManager {
           break;
         }
 
-        const toolCall = canRunTools ? parseToolCall(assistantBuffer) : null;
+        const toolCall = canRunTools
+          ? parseToolCall(assistantBuffer, availableToolNames)
+          : null;
         if (!toolCall || !params.runTool) {
           session.history.push(createAssistantMessage(assistantBuffer));
           session.metadata.lastActivityAt = nowIso();

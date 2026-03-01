@@ -278,4 +278,55 @@ describe("openai responses adapter", () => {
     expect(firstMessage?.content?.[1]?.type).toBe("input_image");
     expect(firstMessage?.content?.[1]?.image_url).toBe(`data:image/png;base64,${imgB64}`);
   });
+
+  it("extracts native tool calls from tool_call response items", async () => {
+    const adapter = new OpenAIResponsesAdapter();
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"tool_call\",\"id\":\"call_a\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Iran\\\"}\"}}]}}\n\n"
+          )
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      }
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" }
+        })
+      )
+    );
+
+    const result = await adapter.runTurn({
+      sessionId: "s-tool-call",
+      providerId: profile.id,
+      profile,
+      messages: [
+        {
+          role: "user",
+          content: "search for Iran",
+          createdAt: new Date().toISOString()
+        }
+      ],
+      resolveBearerToken: () => "sk-test",
+      emit: () => undefined
+    });
+
+    expect(result.nativeToolCalls).toEqual([
+      {
+        id: "call_a",
+        name: "web_search",
+        input: {
+          query: "Iran"
+        }
+      }
+    ]);
+  });
 });

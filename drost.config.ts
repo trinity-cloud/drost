@@ -39,41 +39,69 @@ export default {
         id: "openai-codex",
         adapterId: "codex-exec",
         kind: "openai-codex",
+        family: "codex",
         baseUrl: "https://api.openai.com",
         model: "gpt-5.3-codex",
-        authProfileId: "openai-codex:default"
+        authProfileId: "openai-codex:default",
+        capabilityHints: {
+          imageInput: true
+        }
       },
       {
         id: "openai",
         adapterId: "openai-responses",
         kind: "openai",
+        family: "openai-responses",
         baseUrl: "https://api.openai.com",
         model: "gpt-5.3-codex",
-        authProfileId: "openai:default"
+        authProfileId: "openai:default",
+        capabilityHints: {
+          nativeToolCalls: true,
+          imageInput: true
+        }
       },
       {
         id: "anthropic",
         adapterId: "anthropic-messages",
         kind: "anthropic",
+        family: "anthropic-messages",
         baseUrl: "https://api.anthropic.com",
         model: "claude-sonnet-4-6",
-        authProfileId: "anthropic:default"
+        authProfileId: "anthropic:default",
+        capabilityHints: {
+          nativeToolCalls: true,
+          imageInput: true
+        }
       },
       {
         id: "xai",
         adapterId: "openai-responses",
         kind: "openai-compatible",
+        family: "openai-responses",
         baseUrl: "https://api.x.ai/v1",
         model: "grok-4-1-fast-reasoning",
-        authProfileId: "openai-compatible:xai"
+        authProfileId: "openai-compatible:xai",
+        wireQuirks: {
+          xaiXmlToolFallback: true,
+          disableStrictJsonSchema: true
+        },
+        capabilityHints: {
+          nativeToolCalls: true,
+          imageInput: true
+        }
       },
       {
         id: "local-openai-compatible",
         adapterId: "openai-responses",
         kind: "openai-compatible",
+        family: "openai-responses",
         baseUrl: "http://localhost:8000",
         model: "your-model-id",
-        authProfileId: "openai-compatible:local"
+        authProfileId: "openai-compatible:local",
+        capabilityHints: {
+          nativeToolCalls: false,
+          imageInput: true
+        }
       }
     ]
   },
