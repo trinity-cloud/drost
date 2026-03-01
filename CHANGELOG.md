@@ -2,6 +2,26 @@
 
 All notable changes to Drost are documented in this file.
 
+## 0.1.0-rc.2 - 2026-03-01
+
+### Added
+
+- Optional plugin runtime + skill runtime integration with gateway wiring and tests.
+- Optional subagent runtime manager/store/types with gated enablement and tests.
+- New `AGENTS.md` engineering guidance file for repository contributors.
+
+### Changed
+
+- Large runtime refactor to split monolithic modules across gateway, sessions, providers, tools, CLI, and Telegram channel implementations.
+- Gateway internals decomposed into focused modules (`execution`, `lifecycle`, `session-admin`, `provider-routing`, `control-api`) without intended behavior regressions.
+- Provider manager and session/tool runtimes reorganized into smaller files and clearer interfaces.
+- Documentation updates for configuration and control API behavior.
+
+### Quality
+
+- Release gate verification passed on this cut: `pnpm build`, `pnpm test`, and full `pnpm smoke`.
+- Test suite currently passes 46 files / 148 tests.
+
 ## 0.1.0-rc.1 - 2026-03-01
 
 ### Added

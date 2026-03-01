@@ -20,6 +20,7 @@ This folder contains operator and developer documentation for Drost.
 
 ## Releases and Migrations
 
+- [v0.1.0-rc.2](releases/v0.1.0-rc.2.md)
 - [v0.1.0-rc.1](releases/v0.1.0-rc.1.md)
 - [P0 RC1 Migration](migrations/2026-03-01-p0-rc1.md)
 
