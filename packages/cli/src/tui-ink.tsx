@@ -178,7 +178,6 @@ function hydrateTranscriptFromSessions(gateway: GatewayRuntime, buffers: TuiConv
 function buildSessionSummaries(gateway: GatewayRuntime, activeSessionId: string): SessionSummary[] {
   return gateway
     .listSessionSnapshots()
-    .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
     .map((session) => ({
       ...session,
       active: session.sessionId === activeSessionId
@@ -709,6 +708,10 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
           pushEvents(["session id required"]);
           return;
         }
+        if (!props.gateway.sessionExists(nextSessionId)) {
+          pushEvents([`unknown session: ${nextSessionId}`]);
+          return;
+        }
         try {
           props.gateway.ensureSession(nextSessionId);
           setActiveSessionId(nextSessionId);
@@ -730,7 +733,7 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
           return;
         }
         pushEvents(
-          renderSessionSummary(buildSessionSummaries(props.gateway, activeSessionRef.current)).map((line) =>
+          renderSessionSummary(buildSessionSummaries(props.gateway, activeSessionRef.current).slice(0, 10)).map((line) =>
             normalizeEventLine(line)
           )
         );
@@ -742,9 +745,11 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
           pushEvents(["no providers configured in drost.config.*"]);
           return;
         }
-        const nextSessionId = `local-${Date.now().toString(36)}`;
         try {
-          props.gateway.ensureSession(nextSessionId);
+          const nextSessionId = props.gateway.createSession({
+            channel: "local",
+            fromSessionId: activeSessionRef.current
+          });
           setActiveSessionId(nextSessionId);
           activeSessionRef.current = nextSessionId;
           const session = props.gateway.getSessionState(nextSessionId);
@@ -770,7 +775,7 @@ function GatewayInkApp(props: GatewayInkAppProps): React.JSX.Element {
 
         if (props.hasProviders) {
           lines.push(
-            ...renderSessionSummary(buildSessionSummaries(props.gateway, activeSessionRef.current)).map((line) =>
+            ...renderSessionSummary(buildSessionSummaries(props.gateway, activeSessionRef.current).slice(0, 10)).map((line) =>
               normalizeEventLine(line)
             )
           );

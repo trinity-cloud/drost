@@ -6,7 +6,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { z } from "zod";
-import { canonicalizePath, isWithinRoot, resolveWorkspacePath } from "./path-policy.js";
+import {
+  assertPathInMutableRoots,
+  canonicalizePath,
+  isWithinRoot,
+  resolveWorkspacePath
+} from "./path-policy.js";
 import { importTypeScriptModule, unwrapModuleDefault } from "./module-loader.js";
 
 const execFileAsync = promisify(execFile);
@@ -482,10 +487,28 @@ function resolveWorkspaceRelativeOrAbsolutePath(workspaceDir: string, requestedP
 
 function resolveMutableFilePath(context: ToolContext, requestedPath: string): { absolute: string; path: string } {
   const absolute = resolveWorkspaceRelativeOrAbsolutePath(context.workspaceDir, requestedPath);
+  assertPathInMutableRoots({
+    targetPath: absolute,
+    mutableRoots: context.mutableRoots,
+    requestedPath
+  });
   return {
     absolute,
     path: workspaceRelativePath(context.workspaceDir, absolute)
   };
+}
+
+function resolveMutableWorkspacePath(context: ToolContext, requestedPath: string): {
+  absolute: string;
+  relative: string;
+} {
+  const resolved = resolveWorkspacePath(context.workspaceDir, requestedPath);
+  assertPathInMutableRoots({
+    targetPath: resolved.absolute,
+    mutableRoots: context.mutableRoots,
+    requestedPath
+  });
+  return resolved;
 }
 
 function parseRipgrepLine(line: string): {
@@ -623,13 +646,43 @@ function resolveScopedGitPaths(params: {
     const resolved = new Set<string>();
     for (const requested of params.inputPaths) {
       const absolute = resolveWorkspaceRelativeOrAbsolutePath(params.workspaceDir, requested);
+      assertPathInMutableRoots({
+        targetPath: absolute,
+        mutableRoots: params.mutableRoots,
+        requestedPath: requested
+      });
       resolved.add(toRepoRelativePath(params.repoRoot, absolute));
     }
     return Array.from(resolved).sort((left, right) => left.localeCompare(right));
   }
 
-  // No mutable-root scoping: default to whole repository.
-  return ["."];
+  const resolved = new Set<string>();
+  for (const mutableRoot of params.mutableRoots) {
+    try {
+      const absolute = path.isAbsolute(mutableRoot)
+        ? path.resolve(mutableRoot)
+        : path.resolve(params.workspaceDir, mutableRoot);
+      if (!isWithinRoot(absolute, params.repoRoot)) {
+        continue;
+      }
+      resolved.add(toRepoRelativePath(params.repoRoot, absolute));
+    } catch {
+      // ignore invalid mutable roots
+    }
+  }
+
+  if (resolved.size === 0) {
+    const workspacePath = path.resolve(params.workspaceDir);
+    if (isWithinRoot(workspacePath, params.repoRoot)) {
+      resolved.add(toRepoRelativePath(params.repoRoot, workspacePath));
+    }
+  }
+
+  return Array.from(resolved).sort((left, right) => left.localeCompare(right));
+}
+
+function isPathInMutableRoots(targetPath: string, mutableRoots: string[]): boolean {
+  return mutableRoots.some((root) => isWithinRoot(targetPath, root));
 }
 
 function parseNumstat(output: string): { added: number; removed: number } {
@@ -749,6 +802,41 @@ function extractExaResults(payload: unknown, limit: number): Array<{ title: stri
     });
   }
   return results;
+}
+
+function normalizePrefix(prefix: string): string {
+  return prefix.trim();
+}
+
+function commandMatchesPrefix(command: string, prefix: string): boolean {
+  const normalizedPrefix = normalizePrefix(prefix);
+  if (!normalizedPrefix) {
+    return false;
+  }
+  return command === normalizedPrefix || command.startsWith(`${normalizedPrefix} `);
+}
+
+function enforceShellPolicy(command: string, policy: ShellToolPolicy | undefined): void {
+  const normalizedCommand = command.trim();
+  if (!normalizedCommand) {
+    throw new Error("Shell command is required");
+  }
+
+  const denyPrefixes = (policy?.denyCommandPrefixes ?? []).map(normalizePrefix).filter((prefix) => prefix.length > 0);
+  for (const prefix of denyPrefixes) {
+    if (commandMatchesPrefix(normalizedCommand, prefix)) {
+      throw new Error(`Shell command denied by policy: ${prefix}`);
+    }
+  }
+
+  const allowPrefixes = (policy?.allowCommandPrefixes ?? []).map(normalizePrefix).filter((prefix) => prefix.length > 0);
+  if (allowPrefixes.length === 0) {
+    return;
+  }
+  const matched = allowPrefixes.some((prefix) => commandMatchesPrefix(normalizedCommand, prefix));
+  if (!matched) {
+    throw new Error("Shell command denied by allow-list policy");
+  }
 }
 
 async function collectToolFiles(dirPath: string): Promise<string[]> {
@@ -881,7 +969,7 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
     execute: async (rawInput, context) => {
       const input = fileToolSchema.parse(rawInput);
       if (input.action === "read") {
-        const resolved = resolveWorkspacePath(context.workspaceDir, input.path);
+        const resolved = resolveMutableWorkspacePath(context, input.path);
         const content = await fs.readFile(resolved.absolute, input.encoding);
         return {
           action: input.action,
@@ -891,7 +979,7 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
       }
 
       if (input.action === "write") {
-        const resolved = resolveWorkspacePath(context.workspaceDir, input.path);
+        const resolved = resolveMutableWorkspacePath(context, input.path);
         if (input.createDirs) {
           await fs.mkdir(path.dirname(resolved.absolute), { recursive: true });
         }
@@ -911,7 +999,7 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
       }
 
       if (input.action === "list") {
-        const resolved = resolveWorkspacePath(context.workspaceDir, input.path);
+        const resolved = resolveMutableWorkspacePath(context, input.path);
         const stats = await fs.stat(resolved.absolute);
         if (!stats.isDirectory()) {
           throw new Error(`Not a directory: ${input.path}`);
@@ -933,7 +1021,7 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
         };
       }
 
-      const resolved = resolveWorkspacePath(context.workspaceDir, input.path);
+      const resolved = resolveMutableWorkspacePath(context, input.path);
       const original = await fs.readFile(resolved.absolute, "utf8");
       const replacedCount = input.all ? countOccurrences(original, input.search) : original.includes(input.search) ? 1 : 0;
       if (replacedCount === 0) {
@@ -969,11 +1057,16 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
         // best effort: non-git workspace falls back to configured workspace dir
       }
       const searchRoots: string[] = [];
-      for (const root of [searchRoot]) {
+      const candidateRoots = context.mutableRoots.length > 0 ? context.mutableRoots : [context.workspaceDir];
+      for (const root of candidateRoots) {
+        const absoluteRoot = path.isAbsolute(root) ? root : path.resolve(context.workspaceDir, root);
+        if (!isWithinRoot(absoluteRoot, searchRoot)) {
+          continue;
+        }
         try {
-          const stat = await fs.stat(root);
+          const stat = await fs.stat(absoluteRoot);
           if (stat.isDirectory() || stat.isFile()) {
-            searchRoots.push(root);
+            searchRoots.push(absoluteRoot);
           }
         } catch {
           // ignore missing roots
@@ -1212,6 +1305,9 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
         }
 
         const absolute = path.resolve(gitRoot, normalizedPath);
+        if (!isPathInMutableRoots(absolute, context.mutableRoots)) {
+          continue;
+        }
         entries.push({
           path: workspaceRelativePath(context.workspaceDir, absolute),
           status,
@@ -1330,6 +1426,11 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
       const normalizedPaths: string[] = [];
       for (const patchPath of patchPaths) {
         const absolute = path.resolve(gitRoot, patchPath);
+        assertPathInMutableRoots({
+          targetPath: absolute,
+          mutableRoots: context.mutableRoots,
+          requestedPath: patchPath
+        });
         normalizedPaths.push(workspaceRelativePath(context.workspaceDir, absolute));
       }
 
@@ -1381,11 +1482,17 @@ export function createDefaultBuiltInTools(params: BuiltInToolFactoryParams = {})
     parameters: shellToolSchema,
     execute: async (rawInput, context) => {
       const input = shellToolSchema.parse(rawInput);
+      enforceShellPolicy(input.command, params.shellPolicy);
       const timeoutMs = input.timeoutMs ?? params.shellPolicy?.timeoutMs;
       const maxBuffer = params.shellPolicy?.maxBufferBytes ?? 512 * 1024;
       const cwd = input.cwd
-        ? resolveWorkspacePath(context.workspaceDir, input.cwd).absolute
+        ? resolveMutableWorkspacePath(context, input.cwd).absolute
         : context.workspaceDir;
+      assertPathInMutableRoots({
+        targetPath: cwd,
+        mutableRoots: context.mutableRoots,
+        requestedPath: input.cwd ?? "."
+      });
 
       try {
         const result = await execFileAsync("sh", ["-lc", input.command], {

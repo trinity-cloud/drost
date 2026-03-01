@@ -1,6 +1,8 @@
 import type { GatewayStatus, SessionSnapshot, ToolRunResult } from "./gateway.js";
 import type { ProviderProfile } from "./providers/types.js";
 import type { StreamEventHandler } from "./events.js";
+import type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
+import type { SessionOriginIdentity } from "./sessions.js";
 
 /**
  * Narrow interface of gateway methods the command dispatcher needs.
@@ -10,6 +12,23 @@ export interface ChannelCommandGateway {
   getStatus(): GatewayStatus;
   listProviderProfiles(): ProviderProfile[];
   listSessionSnapshots(): SessionSnapshot[];
+  sessionExists(sessionId: string): boolean;
+  createSession(params?: {
+    channel?: string;
+    title?: string;
+    origin?: SessionOriginIdentity;
+  }): string;
+  createChannelSession(params: {
+    identity: ChannelSessionIdentity;
+    mapping?: ChannelSessionMappingOptions;
+    title?: string;
+  }): string;
+  switchChannelSession(params: {
+    identity: ChannelSessionIdentity;
+    mapping?: ChannelSessionMappingOptions;
+    sessionId: string;
+    title?: string;
+  }): { ok: boolean; message: string; sessionId?: string };
   getSessionState(
     sessionId: string
   ): { activeProviderId: string; pendingProviderId?: string } | null;
@@ -29,13 +48,17 @@ export interface ChannelCommandGateway {
 
 export interface ChannelCommandSessionContext {
   sessionId: string;
+  identity?: ChannelSessionIdentity;
+  mapping?: ChannelSessionMappingOptions;
+  title?: string;
 }
 
 export interface ChannelCommandResult {
   handled: boolean;
   text: string;
   ok?: boolean;
-  action?: "new_session";
+  action?: "new_session" | "switch_session";
+  sessionId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,20 +124,60 @@ export async function dispatchChannelCommand(
     };
   }
 
+  if (text.startsWith("/session ")) {
+    const nextSessionId = text.slice("/session ".length).trim();
+    if (!nextSessionId) {
+      return { handled: true, text: "Usage: /session <id>", ok: false };
+    }
+    if (!session.identity) {
+      return { handled: true, text: "Session switching unavailable in this channel context.", ok: false };
+    }
+    const switched = gateway.switchChannelSession({
+      identity: session.identity,
+      mapping: session.mapping,
+      sessionId: nextSessionId,
+      title: session.title
+    });
+    if (!switched.ok) {
+      return { handled: true, text: switched.message, ok: false };
+    }
+    const state = gateway.getSessionState(nextSessionId);
+    return {
+      handled: true,
+      text: `Active session switched to ${nextSessionId} (provider=${state?.activeProviderId ?? "n/a"})`,
+      ok: true,
+      action: "switch_session",
+      sessionId: nextSessionId
+    };
+  }
+
   if (text === "/sessions") {
     return {
       handled: true,
-      text: formatSessions(gateway.listSessionSnapshots(), session.sessionId),
+      text: formatSessions(gateway.listSessionSnapshots().slice(0, 10), session.sessionId),
       ok: true
     };
   }
 
   if (text === "/new") {
+    let nextSessionId = "";
+    if (session.identity) {
+      nextSessionId = gateway.createChannelSession({
+        identity: session.identity,
+        mapping: session.mapping,
+        title: session.title
+      });
+    } else {
+      nextSessionId = gateway.createSession({
+        channel: "local"
+      });
+    }
     return {
       handled: true,
-      text: `Started new session.`,
+      text: `Started new session: ${nextSessionId}`,
       ok: true,
-      action: "new_session"
+      action: "new_session",
+      sessionId: nextSessionId
     };
   }
 
@@ -176,7 +239,8 @@ function formatHelp(): string {
     "  /providers       - List provider profiles",
     "  /provider <id>   - Switch provider for next turn",
     "  /session         - Current session info",
-    "  /sessions        - List all sessions",
+    "  /session <id>    - Switch active session",
+    "  /sessions        - List the 10 most recent sessions",
     "  /new             - Start a new session (clear current)",
     "  /tools           - List loaded tools",
     "  /tool <name> [json] - Run a tool",

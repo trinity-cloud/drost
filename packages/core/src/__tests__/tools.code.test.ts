@@ -190,7 +190,7 @@ describe("code evolution tools", () => {
     await gateway.stop();
   });
 
-  it("allows code.patch when patch targets path outside mutable roots", async () => {
+  it("rejects code.patch when patch targets path outside mutable roots", async () => {
     const repo = setupRepo();
     const gateway = createGateway({
       workspaceDir: repo.workspaceDir,
@@ -208,7 +208,8 @@ describe("code evolution tools", () => {
         patch: makePatch("agent-v1", "agent-v2")
       }
     });
-    expect(patch.ok).toBe(true);
+    expect(patch.ok).toBe(false);
+    expect(patch.error?.message).toContain("outside mutable roots");
 
     const read = await gateway.runTool({
       sessionId: "local",
@@ -220,8 +221,8 @@ describe("code evolution tools", () => {
         after: 0
       }
     });
-    expect(read.ok).toBe(true);
-    expect((read.output as { lines?: Array<{ text: string }> }).lines?.[0]?.text).toContain("agent-v2");
+    expect(read.ok).toBe(false);
+    expect(read.error?.message).toContain("outside mutable roots");
 
     await gateway.stop();
   });

@@ -36,9 +36,26 @@ export function unwrapModuleDefault(value: unknown): unknown {
 }
 
 export async function importTypeScriptModule(filePath: string): Promise<unknown> {
-  const { tsImport } = await import("tsx/esm/api");
   const moduleUrl = pathToFileURL(filePath).href;
-  return await tsImport(moduleUrl, {
-    parentURL: moduleUrl
+  const { tsImport } = await import("tsx/esm/api");
+  try {
+    return await tsImport(moduleUrl, {
+      parentURL: moduleUrl
+    });
+  } catch (error) {
+    const errorCode = (error as { code?: string } | null)?.code;
+    if (errorCode !== "ERR_MODULE_NOT_FOUND") {
+      throw error;
+    }
+  }
+
+  const { register } = await import("tsx/cjs/api");
+  const scoped = register({
+    namespace: `drost-tsx-${Date.now()}-${Math.random().toString(36).slice(2)}`
   });
+  try {
+    return scoped.require(filePath, filePath);
+  } finally {
+    scoped.unregister();
+  }
 }

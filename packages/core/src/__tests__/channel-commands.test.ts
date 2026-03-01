@@ -42,6 +42,14 @@ function makeGateway(overrides: Partial<ChannelCommandGateway> = {}): ChannelCom
         }
       }
     ],
+    sessionExists: () => true,
+    createSession: () => "local-20260228-120000-000",
+    createChannelSession: () => "telegram-20260228-120000-000",
+    switchChannelSession: ({ sessionId }) => ({
+      ok: true,
+      message: `Active session switched to ${sessionId}`,
+      sessionId
+    }),
     getSessionState: () => ({
       activeProviderId: "provider-a",
       pendingProviderId: undefined
@@ -66,6 +74,15 @@ function makeGateway(overrides: Partial<ChannelCommandGateway> = {}): ChannelCom
 
 const session: ChannelCommandSessionContext = {
   sessionId: "session:telegram:wk:chat-1"
+};
+
+const channelSession: ChannelCommandSessionContext = {
+  sessionId: "session:telegram:wk:chat-1",
+  identity: {
+    channel: "telegram",
+    workspaceId: "wk",
+    chatId: "chat-1"
+  }
 };
 
 describe("isChannelCommand", () => {
@@ -206,18 +223,72 @@ describe("dispatchChannelCommand", () => {
     expect(result.text).toContain("* session:telegram:wk:chat-1");
   });
 
+  it("/sessions limits output to 10 sessions", async () => {
+    const snapshots = Array.from({ length: 12 }, (_, index) => ({
+      sessionId: `session-${index + 1}`,
+      activeProviderId: "provider-a",
+      turnInProgress: false,
+      historyCount: index + 1,
+      metadata: {
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lastActivityAt: "2026-01-01T00:00:00.000Z"
+      }
+    }));
+    const gateway = makeGateway({
+      listSessionSnapshots: () => snapshots
+    });
+    const result = await dispatchChannelCommand(gateway, session, "/sessions");
+    const lines = result.text.split("\n");
+    expect(lines).toHaveLength(10);
+    expect(result.text).toContain("session-1");
+    expect(result.text).toContain("session-10");
+    expect(result.text).not.toContain("session-11");
+    expect(result.text).not.toContain("session-12");
+  });
+
   it("/sessions with empty list", async () => {
     const gateway = makeGateway({ listSessionSnapshots: () => [] });
     const result = await dispatchChannelCommand(gateway, session, "/sessions");
     expect(result.text).toContain("No active sessions");
   });
 
+  it("/session <id> switches active channel session", async () => {
+    const switchFn = vi.fn().mockReturnValue({
+      ok: true,
+      message: "ok",
+      sessionId: "telegram-20260228-120001-000"
+    });
+    const gateway = makeGateway({
+      switchChannelSession: switchFn
+    });
+    const result = await dispatchChannelCommand(
+      gateway,
+      channelSession,
+      "/session telegram-20260228-120001-000"
+    );
+    expect(result.handled).toBe(true);
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe("switch_session");
+    expect(result.sessionId).toBe("telegram-20260228-120001-000");
+    expect(switchFn).toHaveBeenCalledWith({
+      identity: {
+        channel: "telegram",
+        workspaceId: "wk",
+        chatId: "chat-1"
+      },
+      mapping: undefined,
+      sessionId: "telegram-20260228-120001-000",
+      title: undefined
+    });
+  });
+
   it("/new returns new_session action", async () => {
-    const result = await dispatchChannelCommand(makeGateway(), session, "/new");
+    const result = await dispatchChannelCommand(makeGateway(), channelSession, "/new");
     expect(result.handled).toBe(true);
     expect(result.ok).toBe(true);
     expect(result.action).toBe("new_session");
     expect(result.text).toContain("Started new session");
+    expect(result.sessionId).toContain("telegram-");
   });
 
   it("/tools lists loaded tools", async () => {

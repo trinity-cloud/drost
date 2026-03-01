@@ -98,7 +98,6 @@ function buildSessionSummaries(gateway: GatewayRuntime, activeSessionId: string)
 }> {
   return gateway
     .listSessionSnapshots()
-    .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
     .map((session) => ({
       ...session,
       active: session.sessionId === activeSessionId
@@ -180,7 +179,7 @@ async function runGatewayCyclePlain(params: {
     loadSessions(gateway, activeSessionId);
     print("[drost] local session ready.");
     print(renderCommandHints());
-    for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId))) {
+    for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10))) {
       print(line);
     }
   } else {
@@ -291,6 +290,11 @@ async function runGatewayCyclePlain(params: {
           rl?.prompt();
           return;
         }
+        if (!gateway.sessionExists(nextSessionId)) {
+          print(`[drost] unknown session: ${nextSessionId}`);
+          rl?.prompt();
+          return;
+        }
         try {
           gateway.ensureSession(nextSessionId);
           activeSessionId = nextSessionId;
@@ -311,7 +315,7 @@ async function runGatewayCyclePlain(params: {
           rl?.prompt();
           return;
         }
-        for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId))) {
+        for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10))) {
           print(line);
         }
         rl?.prompt();
@@ -324,9 +328,11 @@ async function runGatewayCyclePlain(params: {
           rl?.prompt();
           return;
         }
-        const nextSessionId = `local-${Date.now().toString(36)}`;
         try {
-          gateway.ensureSession(nextSessionId);
+          const nextSessionId = gateway.createSession({
+            channel: "local",
+            fromSessionId: activeSessionId
+          });
           activeSessionId = nextSessionId;
           const session = gateway.getSessionState(activeSessionId);
           print(
@@ -351,7 +357,7 @@ async function runGatewayCyclePlain(params: {
           print(line);
         }
         if (hasProviders) {
-          for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId))) {
+          for (const line of renderSessionSummary(buildSessionSummaries(gateway, activeSessionId).slice(0, 10))) {
             print(line);
           }
         }

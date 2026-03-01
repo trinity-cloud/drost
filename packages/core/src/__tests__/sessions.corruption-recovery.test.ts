@@ -21,7 +21,7 @@ afterEach(() => {
 describe("sessions corruption recovery", () => {
   it("quarantines corrupt json and emits diagnostics", () => {
     const sessionDirectory = makeTempDir();
-    const sessionPath = path.join(sessionDirectory, `${encodeURIComponent("alpha")}.json`);
+    const sessionPath = path.join(sessionDirectory, `${encodeURIComponent("alpha")}.full.jsonl`);
     fs.writeFileSync(sessionPath, "{not-json");
 
     const result = loadSessionRecordWithDiagnostics(sessionDirectory, "alpha");
@@ -37,8 +37,8 @@ describe("sessions corruption recovery", () => {
 
   it("quarantines invalid-shape payloads", () => {
     const sessionDirectory = makeTempDir();
-    const sessionPath = path.join(sessionDirectory, `${encodeURIComponent("beta")}.json`);
-    fs.writeFileSync(sessionPath, JSON.stringify({ foo: "bar" }, null, 2));
+    const sessionPath = path.join(sessionDirectory, `${encodeURIComponent("beta")}.full.jsonl`);
+    fs.writeFileSync(sessionPath, `${JSON.stringify({ foo: "bar" })}\n`);
 
     const result = loadSessionRecordWithDiagnostics(sessionDirectory, "beta");
     expect(result.record).toBeNull();

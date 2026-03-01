@@ -94,11 +94,82 @@ export interface SessionStoreConfig {
     summarize?: (params: { sessionId?: string; history: ChatMessage[] }) => ChatMessage[];
   };
   retention?: {
+    enabled?: boolean;
+    maxSessions?: number;
+    maxTotalBytes?: number;
+    maxAgeDays?: number;
+    archiveFirst?: boolean;
     archiveAfterIdleMs?: number;
+  };
+  continuity?: {
+    enabled?: boolean;
+    autoOnNew?: boolean;
+    sourceMaxMessages?: number;
+    sourceMaxChars?: number;
+    summaryMaxChars?: number;
+    notifyOnComplete?: boolean;
+    maxParallelJobs?: number;
   };
 }
 
 export interface GatewayShellConfig extends ShellToolPolicy {}
+
+export interface GatewayOrchestrationConfig {
+  enabled?: boolean;
+  defaultMode?: "queue" | "interrupt" | "collect" | "steer" | "steer_backlog";
+  defaultCap?: number;
+  dropPolicy?: "old" | "new" | "summarize";
+  collectDebounceMs?: number;
+  persistState?: boolean;
+}
+
+export interface ProviderRouteConfig {
+  id: string;
+  primaryProviderId: string;
+  fallbackProviderIds?: string[];
+}
+
+export interface ProviderRouterConfig {
+  enabled?: boolean;
+  defaultRoute?: string;
+  routes?: ProviderRouteConfig[];
+}
+
+export interface GatewayFailoverConfig {
+  enabled?: boolean;
+  chain?: string[];
+  maxRetries?: number;
+  retryDelayMs?: number;
+  backoffMultiplier?: number;
+  authCooldownSeconds?: number;
+  rateLimitCooldownSeconds?: number;
+  serverErrorCooldownSeconds?: number;
+}
+
+export interface GatewayToolPolicyConfig {
+  profile?: "strict" | "balanced" | "permissive";
+  writableRoots?: string[];
+  allowedTools?: string[];
+  deniedTools?: string[];
+}
+
+export interface GatewayControlApiConfig {
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  token?: string;
+  readToken?: string;
+  allowLoopbackWithoutAuth?: boolean;
+  mutationRateLimitPerMinute?: number;
+}
+
+export interface GatewayObservabilityConfig {
+  enabled?: boolean;
+  directory?: string;
+  toolTracesEnabled?: boolean;
+  usageEventsEnabled?: boolean;
+  runtimeEventsEnabled?: boolean;
+}
 
 export interface GatewayConfig {
   workspaceDir: string;
@@ -112,6 +183,12 @@ export interface GatewayConfig {
   sessionStore?: SessionStoreConfig;
   health?: GatewayHealthConfig;
   shell?: GatewayShellConfig;
+  toolPolicy?: GatewayToolPolicyConfig;
+  orchestration?: GatewayOrchestrationConfig;
+  providerRouter?: ProviderRouterConfig;
+  failover?: GatewayFailoverConfig;
+  controlApi?: GatewayControlApiConfig;
+  observability?: GatewayObservabilityConfig;
   providers?: ProviderRuntimeConfig;
   restartPolicy?: GatewayRestartPolicyConfig;
   hooks?: GatewayHooks;

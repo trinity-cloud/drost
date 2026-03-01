@@ -666,7 +666,8 @@ export class TelegramChannelAdapter implements ChannelAdapter {
     { command: "providers", description: "List provider profiles" },
     { command: "provider", description: "Switch provider for next turn" },
     { command: "session", description: "Current session info" },
-    { command: "sessions", description: "List all sessions" },
+    { command: "sessions", description: "List recent sessions" },
+    { command: "new", description: "Start a new session" },
     { command: "tools", description: "List loaded tools" },
     { command: "tool", description: "Run a tool" },
     { command: "restart", description: "Restart the gateway" }
@@ -765,10 +766,6 @@ export class TelegramChannelAdapter implements ChannelAdapter {
             }
           }
           if (commandResult.handled) {
-            if (commandResult.action === "new_session") {
-              this.sessionPrefixByChat.set(String(chatId), `s${Date.now().toString(36)}`);
-              stateChanged = true;
-            }
             if (typeof message.message_id === "number" && Number.isFinite(message.message_id) && message.message_id >= 0) {
               this.markMessageProcessed(chatId, Math.floor(message.message_id));
               stateChanged = true;

@@ -48,11 +48,13 @@ describe("sessions atomic write", () => {
       ]
     });
 
-    const filePath = path.join(sessionDirectory, `${encodeURIComponent("alpha")}.json`);
-    expect(fs.existsSync(filePath)).toBe(true);
+    const transcriptPath = path.join(sessionDirectory, `${encodeURIComponent("alpha")}.jsonl`);
+    const fullPath = path.join(sessionDirectory, `${encodeURIComponent("alpha")}.full.jsonl`);
+    expect(fs.existsSync(transcriptPath)).toBe(true);
+    expect(fs.existsSync(fullPath)).toBe(true);
     expect(first.revision).toBe(1);
     expect(second.revision).toBe(2);
-    expect(fs.readFileSync(filePath, "utf8")).toContain('"version": 2');
+    expect(fs.readFileSync(fullPath, "utf8")).toContain("\"type\":\"message\"");
 
     const leftovers = fs.readdirSync(sessionDirectory).filter((entry) => entry.includes(".tmp-"));
     expect(leftovers).toEqual([]);

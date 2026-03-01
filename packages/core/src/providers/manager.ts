@@ -10,6 +10,41 @@ import type {
   ProviderSessionState
 } from "./types.js";
 
+export type ProviderFailureClass =
+  | "auth"
+  | "permission"
+  | "rate_limit"
+  | "server_error"
+  | "network"
+  | "timeout"
+  | "fatal_request"
+  | "unknown";
+
+export interface ProviderFailoverConfig {
+  enabled?: boolean;
+  chain?: string[];
+  maxRetries?: number;
+  retryDelayMs?: number;
+  backoffMultiplier?: number;
+  authCooldownSeconds?: number;
+  rateLimitCooldownSeconds?: number;
+  serverErrorCooldownSeconds?: number;
+}
+
+export interface ProviderFailoverStatus {
+  enabled: boolean;
+  maxRetries: number;
+  chain: string[];
+  providers: Array<{
+    providerId: string;
+    inCooldown: boolean;
+    remainingCooldownSeconds: number;
+    lastFailureClass?: ProviderFailureClass;
+    lastFailureMessage?: string;
+    lastFailureAt?: string;
+  }>;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -242,22 +277,185 @@ interface ToolRunResult {
   };
 }
 
+function statusFromError(error: unknown): number | null {
+  const value = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown; statusCode?: unknown };
+  };
+  const direct = typeof value.status === "number" ? value.status : typeof value.statusCode === "number" ? value.statusCode : null;
+  if (direct !== null && Number.isFinite(direct)) {
+    return Math.floor(direct);
+  }
+  const responseStatus =
+    typeof value.response?.status === "number"
+      ? value.response.status
+      : typeof value.response?.statusCode === "number"
+        ? value.response.statusCode
+        : null;
+  if (responseStatus !== null && Number.isFinite(responseStatus)) {
+    return Math.floor(responseStatus);
+  }
+  return null;
+}
+
+function classifyProviderFailure(error: unknown): ProviderFailureClass {
+  const status = statusFromError(error);
+  if (status === 401) {
+    return "auth";
+  }
+  if (status === 403) {
+    return "permission";
+  }
+  if (status === 429) {
+    return "rate_limit";
+  }
+  if (status !== null && status >= 500) {
+    return "server_error";
+  }
+  if (status !== null && [400, 404, 409, 422].includes(status)) {
+    return "fatal_request";
+  }
+
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes("timeout") || message.includes("timed out") || message.includes("abort")) {
+    return "timeout";
+  }
+  if (
+    message.includes("econn") ||
+    message.includes("network") ||
+    message.includes("enotfound") ||
+    message.includes("ehostunreach")
+  ) {
+    return "network";
+  }
+  if (
+    message.includes("validation") ||
+    message.includes("invalid request") ||
+    message.includes("malformed") ||
+    message.includes("bad request")
+  ) {
+    return "fatal_request";
+  }
+  return "unknown";
+}
+
 export class ProviderManager {
   private readonly profileById = new Map<string, ProviderProfile>();
   private readonly adapterById = new Map<string, ProviderAdapter>();
   private readonly sessions = new Map<string, ProviderSessionState>();
+  private readonly failover: Required<ProviderFailoverConfig>;
+  private readonly providerCooldownUntil = new Map<string, number>();
+  private readonly providerFailures = new Map<string, {
+    failureClass: ProviderFailureClass;
+    message: string;
+    timestamp: string;
+  }>();
 
-  constructor(params: { profiles: ProviderProfile[]; adapters: ProviderAdapter[] }) {
+  constructor(params: { profiles: ProviderProfile[]; adapters: ProviderAdapter[]; failover?: ProviderFailoverConfig }) {
     for (const profile of params.profiles) {
       this.profileById.set(profile.id, profile);
     }
     for (const adapter of params.adapters) {
       this.adapterById.set(adapter.id, adapter);
     }
+    this.failover = {
+      enabled: params.failover?.enabled ?? false,
+      chain: [...(params.failover?.chain ?? [])],
+      maxRetries: Math.max(1, params.failover?.maxRetries ?? 3),
+      retryDelayMs: Math.max(0, params.failover?.retryDelayMs ?? 250),
+      backoffMultiplier: Math.max(1, params.failover?.backoffMultiplier ?? 1.5),
+      authCooldownSeconds: Math.max(0, params.failover?.authCooldownSeconds ?? 900),
+      rateLimitCooldownSeconds: Math.max(0, params.failover?.rateLimitCooldownSeconds ?? 60),
+      serverErrorCooldownSeconds: Math.max(0, params.failover?.serverErrorCooldownSeconds ?? 15)
+    };
   }
 
   listProfiles(): ProviderProfile[] {
     return Array.from(this.profileById.values());
+  }
+
+  private nowMs(): number {
+    return Date.now();
+  }
+
+  private remainingCooldownSeconds(providerId: string): number {
+    const until = this.providerCooldownUntil.get(providerId);
+    if (!until) {
+      return 0;
+    }
+    return Math.max(0, Math.ceil((until - this.nowMs()) / 1000));
+  }
+
+  private inCooldown(providerId: string): boolean {
+    return this.remainingCooldownSeconds(providerId) > 0;
+  }
+
+  private cooldownSecondsForClass(failureClass: ProviderFailureClass): number {
+    if (failureClass === "auth" || failureClass === "permission") {
+      return this.failover.authCooldownSeconds;
+    }
+    if (failureClass === "rate_limit") {
+      return this.failover.rateLimitCooldownSeconds;
+    }
+    if (failureClass === "server_error") {
+      return this.failover.serverErrorCooldownSeconds;
+    }
+    return 0;
+  }
+
+  private recordProviderFailure(params: {
+    providerId: string;
+    failureClass: ProviderFailureClass;
+    message: string;
+  }): void {
+    const cooldownSeconds = this.cooldownSecondsForClass(params.failureClass);
+    if (cooldownSeconds > 0) {
+      this.providerCooldownUntil.set(params.providerId, this.nowMs() + cooldownSeconds * 1000);
+    }
+    this.providerFailures.set(params.providerId, {
+      failureClass: params.failureClass,
+      message: params.message,
+      timestamp: nowIso()
+    });
+  }
+
+  private resolveFailoverCandidates(primaryProviderId: string): string[] {
+    const chain = [primaryProviderId];
+    if (this.failover.enabled) {
+      for (const providerId of this.failover.chain) {
+        const normalized = providerId.trim();
+        if (!normalized || normalized === primaryProviderId) {
+          continue;
+        }
+        chain.push(normalized);
+      }
+    }
+
+    const unique = Array.from(new Set(chain));
+    const preferred = unique.filter((providerId) => !this.inCooldown(providerId));
+    const cooled = unique.filter((providerId) => this.inCooldown(providerId));
+    const ordered = [...preferred, ...cooled];
+    return ordered.slice(0, Math.max(1, this.failover.maxRetries));
+  }
+
+  getFailoverStatus(): ProviderFailoverStatus {
+    return {
+      enabled: this.failover.enabled,
+      maxRetries: this.failover.maxRetries,
+      chain: [...this.failover.chain],
+      providers: this.listProfiles().map((profile) => {
+        const failure = this.providerFailures.get(profile.id);
+        return {
+          providerId: profile.id,
+          inCooldown: this.inCooldown(profile.id),
+          remainingCooldownSeconds: this.remainingCooldownSeconds(profile.id),
+          lastFailureClass: failure?.failureClass,
+          lastFailureMessage: failure?.message,
+          lastFailureAt: failure?.timestamp
+        };
+      })
+    };
   }
 
   listSessions(): ProviderSessionState[] {
@@ -468,15 +666,10 @@ export class ProviderManager {
       session.pendingProviderId = undefined;
     }
 
-    const profile = this.profileById.get(session.activeProviderId);
-    if (!profile) {
+    if (!this.profileById.get(session.activeProviderId)) {
       throw new Error(`Unknown active provider profile: ${session.activeProviderId}`);
     }
-
-    const adapter = this.adapterById.get(profile.adapterId);
-    if (!adapter) {
-      throw new Error(`No adapter registered for ${profile.adapterId}`);
-    }
+    let activeProviderId = session.activeProviderId;
 
     session.history.push(createUserMessage(params.input));
     session.metadata.lastActivityAt = nowIso();
@@ -492,23 +685,19 @@ export class ProviderManager {
 
     try {
       while (true) {
-        let assistantBuffer = "";
-        const onEvent: StreamEventHandler = (event) => {
-          if (event.type === "response.delta" && typeof event.payload.text === "string") {
-            assistantBuffer = mergeStreamText(assistantBuffer, event.payload.text);
-          }
-          params.onEvent(event);
-        };
-
-        await adapter.runTurn({
+        const turnResult = await this.runProviderTurnWithFailover({
           sessionId: session.sessionId,
-          providerId: profile.id,
-          profile,
+          primaryProviderId: activeProviderId,
+          authStore: params.authStore,
           messages: buildTurnMessages(session.history, canRunTools ? availableToolNames : []),
-          resolveBearerToken: (authProfileId) => resolveBearerToken(params.authStore, authProfileId),
-          emit: onEvent,
+          onEvent: params.onEvent,
           signal: params.signal
         });
+        let assistantBuffer = turnResult.assistantBuffer;
+        activeProviderId = turnResult.providerId;
+        if (session.activeProviderId !== activeProviderId) {
+          session.activeProviderId = activeProviderId;
+        }
 
         if (assistantBuffer.trim().length === 0) {
           break;
@@ -526,7 +715,7 @@ export class ProviderManager {
           params.onEvent({
             type: "provider.error",
             sessionId: session.sessionId,
-            providerId: profile.id,
+            providerId: activeProviderId,
             timestamp: nowIso(),
             payload: {
               error: message
@@ -540,7 +729,7 @@ export class ProviderManager {
         remainingToolCalls -= 1;
         const toolResult = await params.runTool({
           sessionId: session.sessionId,
-          providerId: profile.id,
+          providerId: activeProviderId,
           toolName: toolCall.toolName,
           input: toolCall.input,
           onEvent: params.onEvent
@@ -561,5 +750,94 @@ export class ProviderManager {
     } finally {
       session.turnInProgress = false;
     }
+  }
+
+  private async runProviderTurnWithFailover(params: {
+    sessionId: string;
+    primaryProviderId: string;
+    authStore: AuthStore;
+    messages: ChatMessage[];
+    onEvent: StreamEventHandler;
+    signal?: AbortSignal;
+  }): Promise<{ providerId: string; assistantBuffer: string }> {
+    const candidates = this.resolveFailoverCandidates(params.primaryProviderId);
+    let lastError: unknown = null;
+    let attempt = 0;
+
+    for (const providerId of candidates) {
+      attempt += 1;
+      const profile = this.profileById.get(providerId);
+      if (!profile) {
+        continue;
+      }
+      const adapter = this.adapterById.get(profile.adapterId);
+      if (!adapter) {
+        continue;
+      }
+
+      let assistantBuffer = "";
+      const onEvent: StreamEventHandler = (event) => {
+        if (event.type === "response.delta" && typeof event.payload.text === "string") {
+          assistantBuffer = mergeStreamText(assistantBuffer, event.payload.text);
+        }
+        params.onEvent(event);
+      };
+
+      try {
+        await adapter.runTurn({
+          sessionId: params.sessionId,
+          providerId: profile.id,
+          profile,
+          messages: params.messages,
+          resolveBearerToken: (authProfileId) => resolveBearerToken(params.authStore, authProfileId),
+          emit: onEvent,
+          signal: params.signal
+        });
+        return {
+          providerId: profile.id,
+          assistantBuffer
+        };
+      } catch (error) {
+        lastError = error;
+        const failureClass = classifyProviderFailure(error);
+        const message = error instanceof Error ? error.message : String(error);
+        this.recordProviderFailure({
+          providerId: profile.id,
+          failureClass,
+          message
+        });
+
+        params.onEvent({
+          type: "provider.error",
+          sessionId: params.sessionId,
+          providerId: profile.id,
+          timestamp: nowIso(),
+          payload: {
+            error: `Provider ${profile.id} failed (${failureClass}): ${message}`,
+            metadata: {
+              attempt,
+              failureClass,
+              failoverEnabled: this.failover.enabled
+            }
+          }
+        });
+
+        if (!this.failover.enabled || failureClass === "fatal_request") {
+          throw error;
+        }
+
+        if (attempt < candidates.length && this.failover.retryDelayMs > 0) {
+          const delayMs = Math.floor(
+            this.failover.retryDelayMs * Math.pow(this.failover.backoffMultiplier, Math.max(0, attempt - 1))
+          );
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+    throw new Error(`No provider available for session ${params.sessionId}`);
   }
 }

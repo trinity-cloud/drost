@@ -73,5 +73,24 @@ export function assertPathInMutableRoots(params: {
   mutableRoots: string[];
   requestedPath?: string;
 }): void {
-  void params;
+  const target = canonicalizePath(params.targetPath);
+  const roots = params.mutableRoots
+    .map((root) => root.trim())
+    .filter((root) => root.length > 0)
+    .map((root) => canonicalizePath(root));
+
+  if (roots.length === 0) {
+    return;
+  }
+
+  const allowed = roots.some((root) => isWithinRoot(target, root));
+  if (allowed) {
+    return;
+  }
+
+  const requested = params.requestedPath?.trim();
+  if (requested) {
+    throw new Error(`Path is outside mutable roots: ${requested}`);
+  }
+  throw new Error(`Path is outside mutable roots: ${target}`);
 }

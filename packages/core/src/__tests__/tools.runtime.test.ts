@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 describe("gateway tool runtime", () => {
-  it("runs built-in file and agent tools without workspace boundary restrictions", async () => {
+  it("runs built-in file and agent tools with mutable-root enforcement", async () => {
     const workspaceDir = makeTempDir();
     const outsidePath = path.join(path.dirname(workspaceDir), "outside.txt");
     fs.writeFileSync(outsidePath, "outside-ok", "utf8");
@@ -89,8 +89,8 @@ describe("gateway tool runtime", () => {
         path: "../outside.txt"
       }
     });
-    expect(escaped.ok).toBe(true);
-    expect((escaped.output as { content?: string }).content).toBe("outside-ok");
+    expect(escaped.ok).toBe(false);
+    expect(escaped.error?.message).toContain("outside mutable roots");
 
     const status = await gateway.runTool({
       sessionId: "local",
@@ -113,7 +113,7 @@ describe("gateway tool runtime", () => {
     await gateway.stop();
   });
 
-  it("allows file mutations outside configured mutableRoots", async () => {
+  it("blocks file mutations outside configured mutableRoots", async () => {
     const workspaceDir = makeTempDir();
     fs.mkdirSync(path.join(workspaceDir, "allowed"), { recursive: true });
     fs.mkdirSync(path.join(workspaceDir, "blocked"), { recursive: true });
@@ -148,7 +148,8 @@ describe("gateway tool runtime", () => {
         content: "nope"
       }
     });
-    expect(blockedWrite.ok).toBe(true);
+    expect(blockedWrite.ok).toBe(false);
+    expect(blockedWrite.error?.message).toContain("outside mutable roots");
 
     const blockedEdit = await gateway.runTool({
       sessionId: "local",
@@ -160,7 +161,8 @@ describe("gateway tool runtime", () => {
         replace: "changed"
       }
     });
-    expect(blockedEdit.ok).toBe(true);
+    expect(blockedEdit.ok).toBe(false);
+    expect(blockedEdit.error?.message).toContain("outside mutable roots");
 
     const readBlocked = await gateway.runTool({
       sessionId: "local",
@@ -170,8 +172,8 @@ describe("gateway tool runtime", () => {
         path: "blocked/notes.txt"
       }
     });
-    expect(readBlocked.ok).toBe(true);
-    expect((readBlocked.output as { content?: string }).content).toBe("changed");
+    expect(readBlocked.ok).toBe(false);
+    expect(readBlocked.error?.message).toContain("outside mutable roots");
 
     await gateway.stop();
   });
@@ -231,6 +233,39 @@ describe("gateway tool runtime", () => {
     expect(completed[1]?.payload.toolName).toBe("web");
 
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.stop();
+  });
+
+  it("enforces shell allow/deny command prefix policy", async () => {
+    const workspaceDir = makeTempDir();
+    const gateway = createGateway({
+      workspaceDir,
+      shell: {
+        allowCommandPrefixes: ["printf", "echo"],
+        denyCommandPrefixes: ["rm -rf", "curl"]
+      }
+    });
+    await gateway.start();
+
+    const allowed = await gateway.runTool({
+      sessionId: "local",
+      toolName: "shell",
+      input: {
+        command: "printf hi"
+      }
+    });
+    expect(allowed.ok).toBe(true);
+
+    const denied = await gateway.runTool({
+      sessionId: "local",
+      toolName: "shell",
+      input: {
+        command: "curl https://example.com"
+      }
+    });
+    expect(denied.ok).toBe(false);
+    expect(denied.error?.message).toContain("denied");
+
     await gateway.stop();
   });
 

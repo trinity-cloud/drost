@@ -658,6 +658,93 @@ describe("telegram channel adapter", () => {
     expect(sentMessages[0]?.text).toContain("Gateway: running");
   });
 
+  it("keeps mapping unchanged after /new so the next turn reuses the same chat mapping key", async () => {
+    const sentMessages: Array<{ chat_id?: number; text?: string }> = [];
+    let runTurnMapping: { prefix?: string } | undefined;
+    let dispatchCount = 0;
+    const updateBatches: unknown[][] = [
+      [
+        {
+          update_id: 50,
+          message: {
+            message_id: 501,
+            text: "/new",
+            chat: { id: 77 },
+            from: { id: 8 }
+          }
+        }
+      ],
+      [
+        {
+          update_id: 51,
+          message: {
+            message_id: 502,
+            text: "hello",
+            chat: { id: 77 },
+            from: { id: 8 }
+          }
+        }
+      ],
+      []
+    ];
+
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (url.includes("/getUpdates")) {
+        const next = updateBatches.shift() ?? [];
+        return jsonResponse({ ok: true, result: next });
+      }
+      if (url.includes("/sendChatAction")) {
+        return jsonResponse({ ok: true, result: true });
+      }
+      if (url.includes("/sendMessage")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        sentMessages.push(body);
+        return jsonResponse({ ok: true, result: { message_id: 601 } });
+      }
+      return jsonResponse({ ok: true, result: [] });
+    };
+
+    const adapter = new TelegramChannelAdapter({
+      token: "test-token",
+      pollIntervalMs: 20,
+      persistState: false,
+      fetchImpl,
+      onError: (error) => {
+        throw error;
+      }
+    });
+    activeAdapters.push(adapter);
+
+    adapter.connect({
+      runTurn: async (request) => {
+        runTurnMapping = request.mapping;
+        return {
+          sessionId: "telegram-20260228-120000-000",
+          providerId: "provider-a",
+          response: "ok"
+        };
+      },
+      dispatchCommand: async () => {
+        dispatchCount += 1;
+        return {
+          handled: true,
+          text: "Started new session: telegram-20260228-120000-000",
+          ok: true,
+          action: "new_session",
+          sessionId: "telegram-20260228-120000-000"
+        };
+      }
+    });
+
+    await waitFor(() => sentMessages.length >= 2);
+
+    expect(dispatchCount).toBe(1);
+    expect(runTurnMapping).toBeUndefined();
+    expect(sentMessages[0]?.text).toContain("Started new session");
+    expect(sentMessages[1]?.text).toBe("ok");
+  });
+
   it("falls through to runTurn when dispatchCommand returns handled=false", async () => {
     const sentMessages: Array<{ chat_id?: number; text?: string }> = [];
     let runTurnCalled = false;

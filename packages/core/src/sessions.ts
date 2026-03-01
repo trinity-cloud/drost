@@ -2,10 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ChatMessage } from "./types.js";
 
-const SESSION_INDEX_FILE = ".drost-sessions-index.json";
+const SESSION_INDEX_FILE = ".drost-sessions-index.jsonl";
 const SESSION_INDEX_LOCK_FILE = ".drost-sessions-index.lock";
 const SESSION_CORRUPT_DIR = ".drost-sessions-corrupt";
 const SESSION_ARCHIVE_DIR = ".drost-sessions-archive";
+
+const SESSION_TRANSCRIPT_SUFFIX = ".jsonl";
+const SESSION_FULL_SUFFIX = ".full.jsonl";
 
 const DEFAULT_LOCK_TIMEOUT_MS = 600;
 const DEFAULT_LOCK_STALE_MS = 30_000;
@@ -36,26 +39,6 @@ export interface LoadedSessionRecord {
   updatedAt: string;
 }
 
-type SessionRecordV2 = {
-  version: 2;
-  sessionId: string;
-  activeProviderId?: string;
-  pendingProviderId?: string;
-  history: ChatMessage[];
-  metadata: SessionMetadata;
-  revision: number;
-  updatedAt: string;
-};
-
-type SessionRecordV1 = {
-  version?: 1;
-  sessionId?: string;
-  activeProviderId?: string;
-  pendingProviderId?: string;
-  history?: unknown;
-  updatedAt?: string;
-};
-
 export interface SessionIndexEntry {
   sessionId: string;
   activeProviderId?: string;
@@ -69,10 +52,27 @@ export interface SessionIndexEntry {
   origin?: SessionOriginIdentity;
 }
 
-interface SessionIndexFile {
+interface SessionIndexLine extends SessionIndexEntry {
   version: 1;
-  updatedAt: string;
-  sessions: SessionIndexEntry[];
+  type: "session_index";
+  transcriptFile: string;
+  fullFile: string;
+}
+
+interface SessionMessageLine {
+  version: 1;
+  type: "message";
+  role: ChatMessage["role"];
+  content: string;
+  createdAt: string;
+}
+
+interface SessionEventLine {
+  version: 1;
+  type: "event";
+  eventType: string;
+  timestamp: string;
+  payload: unknown;
 }
 
 export type SessionLoadDiagnosticCode = "corrupt_json" | "invalid_shape";
@@ -153,14 +153,6 @@ function ensureDirectory(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function sessionFilePath(sessionDirectory: string, sessionId: string): string {
-  return path.join(sessionDirectory, `${sanitizeSessionId(sessionId)}.json`);
-}
-
-function sessionLockPath(sessionDirectory: string, sessionId: string): string {
-  return path.join(sessionDirectory, `${sanitizeSessionId(sessionId)}.lock`);
-}
-
 function sessionIndexPath(sessionDirectory: string): string {
   return path.join(sessionDirectory, SESSION_INDEX_FILE);
 }
@@ -175,6 +167,18 @@ function sessionCorruptDirectoryPath(sessionDirectory: string): string {
 
 function sessionArchiveDirectoryPath(sessionDirectory: string): string {
   return path.join(sessionDirectory, SESSION_ARCHIVE_DIR);
+}
+
+function sessionTranscriptPath(sessionDirectory: string, sessionId: string): string {
+  return path.join(sessionDirectory, `${sanitizeSessionId(sessionId)}${SESSION_TRANSCRIPT_SUFFIX}`);
+}
+
+function sessionFullPath(sessionDirectory: string, sessionId: string): string {
+  return path.join(sessionDirectory, `${sanitizeSessionId(sessionId)}${SESSION_FULL_SUFFIX}`);
+}
+
+function sessionLockPath(sessionDirectory: string, sessionId: string): string {
+  return path.join(sessionDirectory, `${sanitizeSessionId(sessionId)}.lock`);
 }
 
 function safeDate(value: unknown): string | null {
@@ -238,30 +242,6 @@ function normalizeOrigin(value: unknown): SessionOriginIdentity | undefined {
 
 function isChatRole(value: unknown): value is ChatMessage["role"] {
   return value === "system" || value === "user" || value === "assistant" || value === "tool";
-}
-
-function parseHistory(value: unknown): ChatMessage[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  const messages: ChatMessage[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const record = item as Record<string, unknown>;
-    if (!isChatRole(record.role) || typeof record.content !== "string") {
-      continue;
-    }
-    const createdAt = safeDate(record.createdAt) ?? nowIso();
-    messages.push({
-      role: record.role,
-      content: record.content,
-      createdAt
-    });
-  }
-  return messages;
 }
 
 function normalizeMetadata(params: {
@@ -332,72 +312,6 @@ function toLoadedSessionRecord(params: {
   };
 }
 
-function parseSessionRecord(params: {
-  raw: unknown;
-  requestedSessionId: string;
-}): LoadedSessionRecord | null {
-  if (!params.raw || typeof params.raw !== "object") {
-    return null;
-  }
-  const record = params.raw as Record<string, unknown>;
-  const history = parseHistory(record.history);
-  const fallbackNow = nowIso();
-
-  if (record.version === 2) {
-    const sessionId =
-      typeof record.sessionId === "string" && record.sessionId.trim().length > 0
-        ? record.sessionId.trim()
-        : params.requestedSessionId;
-    const revision =
-      typeof record.revision === "number" && Number.isFinite(record.revision) && record.revision >= 0
-        ? Math.floor(record.revision)
-        : 0;
-    const metadata = normalizeMetadata({
-      raw: record.metadata,
-      history,
-      fallbackNow
-    });
-    const updatedAt = safeDate(record.updatedAt) ?? metadata.lastActivityAt;
-    return toLoadedSessionRecord({
-      sessionId,
-      activeProviderId: typeof record.activeProviderId === "string" ? record.activeProviderId : undefined,
-      pendingProviderId: typeof record.pendingProviderId === "string" ? record.pendingProviderId : undefined,
-      history,
-      metadata,
-      revision,
-      updatedAt
-    });
-  }
-
-  const hasLegacyFields =
-    typeof record.activeProviderId === "string" ||
-    typeof record.pendingProviderId === "string" ||
-    Array.isArray(record.history) ||
-    typeof record.updatedAt === "string" ||
-    typeof record.sessionId === "string";
-  const isLegacyVersion = record.version === undefined || record.version === 1;
-  if (!isLegacyVersion || !hasLegacyFields) {
-    return null;
-  }
-
-  const legacy = record as SessionRecordV1;
-  const metadata = normalizeMetadata({
-    raw: {},
-    history,
-    fallbackNow
-  });
-  const updatedAt = safeDate(legacy.updatedAt) ?? metadata.lastActivityAt;
-  return toLoadedSessionRecord({
-    sessionId: params.requestedSessionId,
-    activeProviderId: typeof legacy.activeProviderId === "string" ? legacy.activeProviderId : undefined,
-    pendingProviderId: typeof legacy.pendingProviderId === "string" ? legacy.pendingProviderId : undefined,
-    history,
-    metadata,
-    revision: 0,
-    updatedAt
-  });
-}
-
 function toIndexEntry(record: LoadedSessionRecord): SessionIndexEntry {
   return {
     sessionId: record.sessionId,
@@ -413,52 +327,97 @@ function toIndexEntry(record: LoadedSessionRecord): SessionIndexEntry {
   };
 }
 
-function parseIndexFile(raw: unknown): SessionIndexEntry[] {
-  if (!raw || typeof raw !== "object") {
-    return [];
+function toIndexLine(entry: SessionIndexEntry, sessionDirectory: string): SessionIndexLine {
+  return {
+    version: 1,
+    type: "session_index",
+    ...entry,
+    transcriptFile: path.basename(sessionTranscriptPath(sessionDirectory, entry.sessionId)),
+    fullFile: path.basename(sessionFullPath(sessionDirectory, entry.sessionId))
+  };
+}
+
+function parseIndexLine(value: unknown): SessionIndexEntry | null {
+  if (!value || typeof value !== "object") {
+    return null;
   }
-  const record = raw as { version?: unknown; sessions?: unknown };
-  if (record.version !== 1 || !Array.isArray(record.sessions)) {
-    return [];
+  const record = value as Record<string, unknown>;
+  if (record.type !== "session_index") {
+    return null;
   }
-  const parsed: SessionIndexEntry[] = [];
-  for (const item of record.sessions) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-    const entry = item as Record<string, unknown>;
-    if (typeof entry.sessionId !== "string" || entry.sessionId.trim().length === 0) {
-      continue;
-    }
-    const createdAt = safeDate(entry.createdAt) ?? nowIso();
-    const lastActivityAt = safeDate(entry.lastActivityAt) ?? createdAt;
-    const updatedAt = safeDate(entry.updatedAt) ?? lastActivityAt;
-    const normalized: SessionIndexEntry = {
-      sessionId: entry.sessionId.trim(),
-      activeProviderId: typeof entry.activeProviderId === "string" ? entry.activeProviderId : undefined,
-      pendingProviderId: typeof entry.pendingProviderId === "string" ? entry.pendingProviderId : undefined,
-      historyCount:
-        typeof entry.historyCount === "number" && Number.isFinite(entry.historyCount) && entry.historyCount >= 0
-          ? Math.floor(entry.historyCount)
-          : 0,
-      revision:
-        typeof entry.revision === "number" && Number.isFinite(entry.revision) && entry.revision >= 0
-          ? Math.floor(entry.revision)
-          : 0,
-      updatedAt,
-      createdAt,
-      lastActivityAt
-    };
-    if (typeof entry.title === "string" && entry.title.trim().length > 0) {
-      normalized.title = entry.title.trim();
-    }
-    const origin = normalizeOrigin(entry.origin);
-    if (origin) {
-      normalized.origin = origin;
-    }
-    parsed.push(normalized);
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId.trim() : "";
+  if (!sessionId) {
+    return null;
   }
-  return parsed;
+  const createdAt = safeDate(record.createdAt) ?? nowIso();
+  const lastActivityAt = safeDate(record.lastActivityAt) ?? createdAt;
+  const updatedAt = safeDate(record.updatedAt) ?? lastActivityAt;
+
+  const entry: SessionIndexEntry = {
+    sessionId,
+    activeProviderId: typeof record.activeProviderId === "string" ? record.activeProviderId : undefined,
+    pendingProviderId: typeof record.pendingProviderId === "string" ? record.pendingProviderId : undefined,
+    historyCount:
+      typeof record.historyCount === "number" && Number.isFinite(record.historyCount) && record.historyCount >= 0
+        ? Math.floor(record.historyCount)
+        : 0,
+    revision:
+      typeof record.revision === "number" && Number.isFinite(record.revision) && record.revision >= 0
+        ? Math.floor(record.revision)
+        : 0,
+    updatedAt,
+    createdAt,
+    lastActivityAt
+  };
+
+  if (typeof record.title === "string" && record.title.trim().length > 0) {
+    entry.title = record.title.trim();
+  }
+  const origin = normalizeOrigin(record.origin);
+  if (origin) {
+    entry.origin = origin;
+  }
+  return entry;
+}
+
+function parseSessionMessageLine(value: unknown): ChatMessage | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type !== "message") {
+    return null;
+  }
+  if (!isChatRole(record.role) || typeof record.content !== "string") {
+    return null;
+  }
+  const createdAt = safeDate(record.createdAt) ?? nowIso();
+  return {
+    role: record.role,
+    content: record.content,
+    createdAt
+  };
+}
+
+function parseSessionEventLine(value: unknown): SessionEventLine | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (record.type !== "event") {
+    return null;
+  }
+  const eventType = typeof record.eventType === "string" ? record.eventType.trim() : "";
+  if (!eventType) {
+    return null;
+  }
+  return {
+    version: 1,
+    type: "event",
+    eventType,
+    timestamp: safeDate(record.timestamp) ?? nowIso(),
+    payload: record.payload
+  };
 }
 
 function withLock<T>(
@@ -517,14 +476,14 @@ function withLock<T>(
   }
 }
 
-function writeJsonAtomic(filePath: string, payload: unknown): void {
+function writeTextAtomic(filePath: string, content: string): void {
   ensureDirectory(path.dirname(filePath));
   const tempPath = path.join(
     path.dirname(filePath),
     `.${path.basename(filePath)}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
   );
   try {
-    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2));
+    fs.writeFileSync(tempPath, content, "utf8");
     fs.renameSync(tempPath, filePath);
   } finally {
     try {
@@ -535,14 +494,39 @@ function writeJsonAtomic(filePath: string, payload: unknown): void {
   }
 }
 
+function appendText(filePath: string, content: string): void {
+  ensureDirectory(path.dirname(filePath));
+  fs.appendFileSync(filePath, content, "utf8");
+}
+
 function readIndexUnlocked(sessionDirectory: string): SessionIndexEntry[] {
   const filePath = sessionIndexPath(sessionDirectory);
+  let raw = "";
   try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    return parseIndexFile(JSON.parse(raw));
+    raw = fs.readFileSync(filePath, "utf8");
   } catch {
     return [];
   }
+
+  const bySession = new Map<string, SessionIndexEntry>();
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      const entry = parseIndexLine(parsed);
+      if (!entry) {
+        continue;
+      }
+      bySession.set(entry.sessionId, entry);
+    } catch {
+      // ignore corrupt lines in index; per-session load will self-heal on save
+    }
+  }
+
+  return Array.from(bySession.values()).sort((left, right) => left.sessionId.localeCompare(right.sessionId));
 }
 
 function writeIndexUnlocked(sessionDirectory: string, entries: SessionIndexEntry[]): void {
@@ -551,12 +535,9 @@ function writeIndexUnlocked(sessionDirectory: string, entries: SessionIndexEntry
     deduped.set(entry.sessionId, entry);
   }
   const normalized = Array.from(deduped.values()).sort((left, right) => left.sessionId.localeCompare(right.sessionId));
-  const payload: SessionIndexFile = {
-    version: 1,
-    updatedAt: nowIso(),
-    sessions: normalized
-  };
-  writeJsonAtomic(sessionIndexPath(sessionDirectory), payload);
+  const lines = normalized.map((entry) => JSON.stringify(toIndexLine(entry, sessionDirectory)));
+  const body = lines.length > 0 ? `${lines.join("\n")}\n` : "";
+  writeTextAtomic(sessionIndexPath(sessionDirectory), body);
 }
 
 function mutateIndex(
@@ -573,18 +554,18 @@ function mutateIndex(
   });
 }
 
-function quarantineSessionFile(params: {
+function quarantineFile(params: {
   sessionDirectory: string;
   sessionId: string;
   sourceFilePath: string;
-  reason: string;
 }): string | undefined {
   try {
     const corruptDir = sessionCorruptDirectoryPath(params.sessionDirectory);
     ensureDirectory(corruptDir);
+    const ext = path.extname(params.sourceFilePath);
     const target = path.join(
       corruptDir,
-      `${sanitizeSessionId(params.sessionId)}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+      `${sanitizeSessionId(params.sessionId)}-${Date.now()}-${Math.random().toString(36).slice(2)}${ext || ".jsonl"}`
     );
     fs.renameSync(params.sourceFilePath, target);
     return target;
@@ -593,75 +574,253 @@ function quarantineSessionFile(params: {
   }
 }
 
+function readSessionMessagesFromJsonl(filePath: string): {
+  ok: true;
+  history: ChatMessage[];
+} | {
+  ok: false;
+  code: SessionLoadDiagnosticCode;
+  message: string;
+} {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      return {
+        ok: true,
+        history: []
+      };
+    }
+    return {
+      ok: false,
+      code: "invalid_shape",
+      message: err.message || String(error)
+    };
+  }
+
+  const history: ChatMessage[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      return {
+        ok: false,
+        code: "corrupt_json",
+        message: error instanceof Error ? error.message : String(error)
+      };
+    }
+    const message = parseSessionMessageLine(parsed);
+    if (message) {
+      history.push(message);
+      continue;
+    }
+
+    const eventLine = parseSessionEventLine(parsed);
+    if (eventLine) {
+      continue;
+    }
+
+    return {
+      ok: false,
+      code: "invalid_shape",
+      message: "Session JSONL line has invalid shape"
+    };
+  }
+
+  return {
+    ok: true,
+    history
+  };
+}
+
+function toSessionMessageLines(history: ChatMessage[]): SessionMessageLine[] {
+  const lines: SessionMessageLine[] = [];
+  for (const message of history) {
+    if (!isChatRole(message.role) || typeof message.content !== "string") {
+      continue;
+    }
+    lines.push({
+      version: 1,
+      type: "message",
+      role: message.role,
+      content: message.content,
+      createdAt: safeDate(message.createdAt) ?? nowIso()
+    });
+  }
+  return lines;
+}
+
+function serializeMessageLines(lines: SessionMessageLine[]): string {
+  if (lines.length === 0) {
+    return "";
+  }
+  return `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`;
+}
+
+function readSerializedEventLines(filePath: string): string[] {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+  const serialized: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      const eventLine = parseSessionEventLine(parsed);
+      if (!eventLine) {
+        continue;
+      }
+      serialized.push(JSON.stringify(eventLine));
+    } catch {
+      // ignore invalid event lines while preserving readable event log
+    }
+  }
+  return serialized;
+}
+
+function isHistoryPrefix(previous: ChatMessage[], next: ChatMessage[]): boolean {
+  if (previous.length > next.length) {
+    return false;
+  }
+  for (let index = 0; index < previous.length; index += 1) {
+    const left = previous[index];
+    const right = next[index];
+    if (!left || !right) {
+      return false;
+    }
+    if (left.role !== right.role || left.content !== right.content || left.createdAt !== right.createdAt) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveIndexEntry(
+  sessionDirectory: string,
+  sessionId: string,
+  entries?: SessionIndexEntry[]
+): SessionIndexEntry | undefined {
+  const source = entries ?? readIndexUnlocked(sessionDirectory);
+  return source.find((entry) => entry.sessionId === sessionId);
+}
+
+function deriveSessionFilesFromEntry(
+  sessionDirectory: string,
+  sessionId: string,
+  entry?: SessionIndexEntry
+): { transcriptPath: string; fullPath: string } {
+  const transcriptPath = sessionTranscriptPath(sessionDirectory, sessionId);
+  const fullPath = sessionFullPath(sessionDirectory, sessionId);
+  if (!entry) {
+    return {
+      transcriptPath,
+      fullPath
+    };
+  }
+  return {
+    transcriptPath,
+    fullPath
+  };
+}
+
+function loadSessionRecordUnlocked(
+  sessionDirectory: string,
+  sessionId: string,
+  entries?: SessionIndexEntry[]
+): SessionLoadResult {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  const entry = resolveIndexEntry(sessionDirectory, normalizedSessionId, entries);
+  const files = deriveSessionFilesFromEntry(sessionDirectory, normalizedSessionId, entry);
+
+  const loaded = readSessionMessagesFromJsonl(files.fullPath);
+  if (!loaded.ok) {
+    if (loaded.code === "corrupt_json" || loaded.code === "invalid_shape") {
+      const quarantinedPath = quarantineFile({
+        sessionDirectory,
+        sessionId: normalizedSessionId,
+        sourceFilePath: files.fullPath
+      });
+      try {
+        fs.rmSync(files.transcriptPath, { force: true });
+      } catch {
+        // best effort
+      }
+      mutateIndex(sessionDirectory, undefined, (all) =>
+        all.filter((candidate) => candidate.sessionId !== normalizedSessionId)
+      );
+      return {
+        record: null,
+        diagnostics: [
+          {
+            code: loaded.code,
+            message: loaded.message,
+            quarantinedPath
+          }
+        ]
+      };
+    }
+  }
+
+  if (!loaded.ok) {
+    return {
+      record: null,
+      diagnostics: [
+        {
+          code: loaded.code,
+          message: loaded.message
+        }
+      ]
+    };
+  }
+
+  if (!entry && loaded.history.length === 0) {
+    return {
+      record: null
+    };
+  }
+
+  const fallbackNow = nowIso();
+  const metadata = normalizeMetadata({
+    raw: entry,
+    history: loaded.history,
+    fallbackNow,
+    previous: undefined
+  });
+
+  const record = toLoadedSessionRecord({
+    sessionId: normalizedSessionId,
+    activeProviderId: entry?.activeProviderId,
+    pendingProviderId: entry?.pendingProviderId,
+    history: loaded.history,
+    metadata,
+    revision: entry?.revision ?? 0,
+    updatedAt: safeDate(entry?.updatedAt) ?? metadata.lastActivityAt
+  });
+
+  return {
+    record
+  };
+}
+
 export function loadSessionRecordWithDiagnostics(
   sessionDirectory: string,
   sessionId: string
 ): SessionLoadResult {
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  const filePath = sessionFilePath(sessionDirectory, normalizedSessionId);
-
   try {
-    const rawText = fs.readFileSync(filePath, "utf8");
-    let raw: unknown;
-    try {
-      raw = JSON.parse(rawText);
-    } catch (error) {
-      const quarantinedPath = quarantineSessionFile({
-        sessionDirectory,
-        sessionId: normalizedSessionId,
-        sourceFilePath: filePath,
-        reason: "corrupt_json"
-      });
-      mutateIndex(sessionDirectory, undefined, (entries) =>
-        entries.filter((entry) => entry.sessionId !== normalizedSessionId)
-      );
-      return {
-        record: null,
-        diagnostics: [
-          {
-            code: "corrupt_json",
-            message: error instanceof Error ? error.message : String(error),
-            quarantinedPath
-          }
-        ]
-      };
-    }
-
-    const parsed = parseSessionRecord({
-      raw,
-      requestedSessionId: normalizedSessionId
-    });
-    if (!parsed) {
-      const quarantinedPath = quarantineSessionFile({
-        sessionDirectory,
-        sessionId: normalizedSessionId,
-        sourceFilePath: filePath,
-        reason: "invalid_shape"
-      });
-      mutateIndex(sessionDirectory, undefined, (entries) =>
-        entries.filter((entry) => entry.sessionId !== normalizedSessionId)
-      );
-      return {
-        record: null,
-        diagnostics: [
-          {
-            code: "invalid_shape",
-            message: "Session file has invalid structure",
-            quarantinedPath
-          }
-        ]
-      };
-    }
-
-    mutateIndex(sessionDirectory, undefined, (entries) => {
-      const next = entries.filter((entry) => entry.sessionId !== parsed.sessionId);
-      next.push(toIndexEntry(parsed));
-      return next;
-    });
-
-    return {
-      record: parsed
-    };
+    return loadSessionRecordUnlocked(sessionDirectory, sessionId);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return {
@@ -702,68 +861,112 @@ export function saveSessionRecord(params: {
 }): LoadedSessionRecord {
   const normalizedSessionId = normalizeSessionId(params.sessionId);
   ensureDirectory(params.sessionDirectory);
-  const filePath = sessionFilePath(params.sessionDirectory, normalizedSessionId);
-  const lockPath = sessionLockPath(params.sessionDirectory, normalizedSessionId);
 
+  const lockPath = sessionLockPath(params.sessionDirectory, normalizedSessionId);
   return withLock(lockPath, params.lock, () => {
-    let previous: LoadedSessionRecord | undefined;
-    if (fs.existsSync(filePath)) {
-      try {
-        const parsed = parseSessionRecord({
-          raw: JSON.parse(fs.readFileSync(filePath, "utf8")),
-          requestedSessionId: normalizedSessionId
-        });
-        previous = parsed ?? undefined;
-      } catch {
-        quarantineSessionFile({
-          sessionDirectory: params.sessionDirectory,
-          sessionId: normalizedSessionId,
-          sourceFilePath: filePath,
-          reason: "corrupt_json"
-        });
-      }
-    }
+    const indexEntries = readIndexUnlocked(params.sessionDirectory);
+    const existingEntry = resolveIndexEntry(params.sessionDirectory, normalizedSessionId, indexEntries);
+    const files = deriveSessionFilesFromEntry(params.sessionDirectory, normalizedSessionId, existingEntry);
+
+    const previousLoaded = loadSessionRecordUnlocked(params.sessionDirectory, normalizedSessionId, indexEntries);
+    const previous = previousLoaded.record ?? undefined;
 
     const fallbackNow = nowIso();
     const metadata = normalizeMetadata({
-      raw: {},
+      raw: existingEntry,
       history: params.history,
       fallbackNow,
       previous: previous?.metadata,
       override: params.metadata
     });
     const updatedAt = metadata.lastActivityAt || fallbackNow;
-    const revision = (previous?.revision ?? 0) + 1;
+    const revision = (existingEntry?.revision ?? 0) + 1;
 
-    const payload: SessionRecordV2 = {
-      version: 2,
+    const nextHistory = params.history.map((message) => ({
+      role: message.role,
+      content: message.content,
+      createdAt: safeDate(message.createdAt) ?? nowIso()
+    }));
+
+    const previousHistory = previous?.history ?? [];
+    const nextFullLines = toSessionMessageLines(nextHistory);
+
+    if (isHistoryPrefix(previousHistory, nextHistory)) {
+      const appended = nextHistory.slice(previousHistory.length);
+      if (appended.length > 0) {
+        appendText(files.fullPath, serializeMessageLines(toSessionMessageLines(appended)));
+      } else if (!fs.existsSync(files.fullPath)) {
+        writeTextAtomic(files.fullPath, serializeMessageLines(nextFullLines));
+      }
+    } else {
+      const preservedEventLines = readSerializedEventLines(files.fullPath);
+      const eventPrefix = preservedEventLines.length > 0 ? `${preservedEventLines.join("\n")}\n` : "";
+      writeTextAtomic(files.fullPath, `${eventPrefix}${serializeMessageLines(nextFullLines)}`);
+    }
+
+    const nextTranscriptHistory = nextHistory.filter(
+      (message) => message.role === "user" || message.role === "assistant"
+    );
+    const previousTranscriptHistory = previousHistory.filter(
+      (message) => message.role === "user" || message.role === "assistant"
+    );
+
+    if (isHistoryPrefix(previousTranscriptHistory, nextTranscriptHistory)) {
+      const appendedTranscript = nextTranscriptHistory.slice(previousTranscriptHistory.length);
+      if (appendedTranscript.length > 0) {
+        appendText(files.transcriptPath, serializeMessageLines(toSessionMessageLines(appendedTranscript)));
+      } else if (!fs.existsSync(files.transcriptPath)) {
+        writeTextAtomic(files.transcriptPath, serializeMessageLines(toSessionMessageLines(nextTranscriptHistory)));
+      }
+    } else {
+      writeTextAtomic(files.transcriptPath, serializeMessageLines(toSessionMessageLines(nextTranscriptHistory)));
+    }
+
+    const saved = toLoadedSessionRecord({
       sessionId: normalizedSessionId,
       activeProviderId: params.activeProviderId,
       pendingProviderId: params.pendingProviderId,
-      history: params.history,
+      history: nextHistory,
       metadata,
       revision,
       updatedAt
-    };
-    writeJsonAtomic(filePath, payload);
-
-    const saved = toLoadedSessionRecord({
-      sessionId: payload.sessionId,
-      activeProviderId: payload.activeProviderId,
-      pendingProviderId: payload.pendingProviderId,
-      history: payload.history,
-      metadata: payload.metadata,
-      revision: payload.revision,
-      updatedAt: payload.updatedAt
     });
 
     mutateIndex(params.sessionDirectory, params.lock, (entries) => {
-      const next = entries.filter((entry) => entry.sessionId !== saved.sessionId);
+      const next = entries.filter((entry) => entry.sessionId !== normalizedSessionId);
       next.push(toIndexEntry(saved));
       return next;
     });
 
     return saved;
+  });
+}
+
+export function appendSessionEventRecord(params: {
+  sessionDirectory: string;
+  sessionId: string;
+  eventType: string;
+  payload?: unknown;
+  timestamp?: string;
+  lock?: SessionStoreLockOptions;
+}): void {
+  const sessionId = normalizeSessionId(params.sessionId);
+  const eventType = params.eventType.trim();
+  if (!eventType) {
+    return;
+  }
+
+  const lockPath = sessionLockPath(params.sessionDirectory, sessionId);
+  withLock(lockPath, params.lock, () => {
+    const fullPath = sessionFullPath(params.sessionDirectory, sessionId);
+    const line: SessionEventLine = {
+      version: 1,
+      type: "event",
+      eventType,
+      timestamp: safeDate(params.timestamp) ?? nowIso(),
+      payload: params.payload
+    };
+    appendText(fullPath, `${JSON.stringify(line)}\n`);
   });
 }
 
@@ -773,20 +976,28 @@ export function deleteSessionRecord(params: {
   lock?: SessionStoreLockOptions;
 }): boolean {
   const normalizedSessionId = normalizeSessionId(params.sessionId);
-  const filePath = sessionFilePath(params.sessionDirectory, normalizedSessionId);
+  const files = {
+    transcriptPath: sessionTranscriptPath(params.sessionDirectory, normalizedSessionId),
+    fullPath: sessionFullPath(params.sessionDirectory, normalizedSessionId)
+  };
   const lockPath = sessionLockPath(params.sessionDirectory, normalizedSessionId);
 
   const removed = withLock(lockPath, params.lock, () => {
-    if (!fs.existsSync(filePath)) {
-      return false;
+    const hadTranscript = fs.existsSync(files.transcriptPath);
+    const hadFull = fs.existsSync(files.fullPath);
+    try {
+      fs.rmSync(files.transcriptPath, { force: true });
+      fs.rmSync(files.fullPath, { force: true });
+    } catch {
+      // best effort
     }
-    fs.rmSync(filePath, { force: true });
-    return true;
+    return hadTranscript || hadFull;
   });
 
   mutateIndex(params.sessionDirectory, params.lock, (entries) =>
     entries.filter((entry) => entry.sessionId !== normalizedSessionId)
   );
+
   return removed;
 }
 
@@ -799,6 +1010,7 @@ export function renameSessionRecord(params: {
 }): LoadedSessionRecord {
   const fromSessionId = normalizeSessionId(params.fromSessionId);
   const toSessionId = normalizeSessionId(params.toSessionId);
+
   if (fromSessionId === toSessionId) {
     const existing = loadSessionRecord(params.sessionDirectory, fromSessionId);
     if (!existing) {
@@ -807,52 +1019,61 @@ export function renameSessionRecord(params: {
     return existing;
   }
 
-  const fromFilePath = sessionFilePath(params.sessionDirectory, fromSessionId);
-  const toFilePath = sessionFilePath(params.sessionDirectory, toSessionId);
   const lockPaths = [
     sessionLockPath(params.sessionDirectory, fromSessionId),
     sessionLockPath(params.sessionDirectory, toSessionId)
   ].sort((left, right) => left.localeCompare(right));
 
   const runRename = (): LoadedSessionRecord => {
-    if (!fs.existsSync(fromFilePath)) {
+    const entries = readIndexUnlocked(params.sessionDirectory);
+    const sourceEntry = resolveIndexEntry(params.sessionDirectory, fromSessionId, entries);
+    if (!sourceEntry) {
       throw new SessionStoreError("not_found", `Unknown session: ${fromSessionId}`);
     }
-    if (!params.overwrite && fs.existsSync(toFilePath)) {
+
+    const targetEntry = resolveIndexEntry(params.sessionDirectory, toSessionId, entries);
+    if (targetEntry && !params.overwrite) {
       throw new SessionStoreError("already_exists", `Session already exists: ${toSessionId}`);
     }
 
-    const source = loadSessionRecord(params.sessionDirectory, fromSessionId);
-    if (!source) {
+    const sourceFiles = deriveSessionFilesFromEntry(params.sessionDirectory, fromSessionId, sourceEntry);
+    const targetFiles = {
+      transcriptPath: sessionTranscriptPath(params.sessionDirectory, toSessionId),
+      fullPath: sessionFullPath(params.sessionDirectory, toSessionId)
+    };
+
+    const loaded = loadSessionRecordUnlocked(params.sessionDirectory, fromSessionId, entries);
+    if (!loaded.record) {
       throw new SessionStoreError("not_found", `Unknown session: ${fromSessionId}`);
     }
 
-    if (params.overwrite && fs.existsSync(toFilePath)) {
-      fs.rmSync(toFilePath, { force: true });
+    if (params.overwrite) {
+      try {
+        fs.rmSync(targetFiles.transcriptPath, { force: true });
+        fs.rmSync(targetFiles.fullPath, { force: true });
+      } catch {
+        // best effort
+      }
+    } else if (fs.existsSync(targetFiles.transcriptPath) || fs.existsSync(targetFiles.fullPath)) {
+      throw new SessionStoreError("already_exists", `Session already exists: ${toSessionId}`);
+    }
+
+    if (fs.existsSync(sourceFiles.transcriptPath)) {
+      fs.renameSync(sourceFiles.transcriptPath, targetFiles.transcriptPath);
+    }
+    if (fs.existsSync(sourceFiles.fullPath)) {
+      fs.renameSync(sourceFiles.fullPath, targetFiles.fullPath);
     }
 
     const renamed: LoadedSessionRecord = {
-      ...source,
+      ...loaded.record,
       sessionId: toSessionId,
-      revision: source.revision + 1,
+      revision: loaded.record.revision + 1,
       updatedAt: nowIso()
     };
 
-    const payload: SessionRecordV2 = {
-      version: 2,
-      sessionId: renamed.sessionId,
-      activeProviderId: renamed.activeProviderId,
-      pendingProviderId: renamed.pendingProviderId,
-      history: renamed.history,
-      metadata: renamed.metadata,
-      revision: renamed.revision,
-      updatedAt: renamed.updatedAt
-    };
-    writeJsonAtomic(toFilePath, payload);
-    fs.rmSync(fromFilePath, { force: true });
-
-    mutateIndex(params.sessionDirectory, params.lock, (entries) => {
-      const next = entries.filter((entry) => entry.sessionId !== fromSessionId && entry.sessionId !== toSessionId);
+    mutateIndex(params.sessionDirectory, params.lock, (allEntries) => {
+      const next = allEntries.filter((entry) => entry.sessionId !== fromSessionId && entry.sessionId !== toSessionId);
       next.push(toIndexEntry(renamed));
       return next;
     });
@@ -879,10 +1100,11 @@ export function importSessionRecord(params: {
   lock?: SessionStoreLockOptions;
 }): LoadedSessionRecord {
   const normalizedSessionId = normalizeSessionId(params.record.sessionId);
-  const filePath = sessionFilePath(params.sessionDirectory, normalizedSessionId);
-  if (!params.overwrite && fs.existsSync(filePath)) {
+  const existing = loadSessionRecord(params.sessionDirectory, normalizedSessionId);
+  if (!params.overwrite && existing) {
     throw new SessionStoreError("already_exists", `Session already exists: ${normalizedSessionId}`);
   }
+
   return saveSessionRecord({
     sessionDirectory: params.sessionDirectory,
     sessionId: normalizedSessionId,
@@ -900,24 +1122,36 @@ export function archiveSessionRecord(params: {
   lock?: SessionStoreLockOptions;
 }): { archivedPath: string } | null {
   const sessionId = normalizeSessionId(params.sessionId);
-  const filePath = sessionFilePath(params.sessionDirectory, sessionId);
   const lockPath = sessionLockPath(params.sessionDirectory, sessionId);
 
   return withLock(lockPath, params.lock, () => {
-    if (!fs.existsSync(filePath)) {
+    const entry = resolveIndexEntry(params.sessionDirectory, sessionId);
+    const files = deriveSessionFilesFromEntry(params.sessionDirectory, sessionId, entry);
+    if (!fs.existsSync(files.transcriptPath) && !fs.existsSync(files.fullPath)) {
       return null;
     }
+
     const archiveDir = sessionArchiveDirectoryPath(params.sessionDirectory);
     ensureDirectory(archiveDir);
-    const archivedPath = path.join(
-      archiveDir,
-      `${sanitizeSessionId(sessionId)}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
-    );
-    fs.renameSync(filePath, archivedPath);
+
+    const archiveToken = `${sanitizeSessionId(sessionId)}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const archivedTranscriptPath = path.join(archiveDir, `${archiveToken}${SESSION_TRANSCRIPT_SUFFIX}`);
+    const archivedFullPath = path.join(archiveDir, `${archiveToken}${SESSION_FULL_SUFFIX}`);
+
+    if (fs.existsSync(files.transcriptPath)) {
+      fs.renameSync(files.transcriptPath, archivedTranscriptPath);
+    }
+    if (fs.existsSync(files.fullPath)) {
+      fs.renameSync(files.fullPath, archivedFullPath);
+    }
+
     mutateIndex(params.sessionDirectory, params.lock, (entries) =>
-      entries.filter((entry) => entry.sessionId !== sessionId)
+      entries.filter((candidate) => candidate.sessionId !== sessionId)
     );
-    return { archivedPath };
+
+    return {
+      archivedPath: fs.existsSync(archivedFullPath) ? archivedFullPath : archivedTranscriptPath
+    };
   });
 }
 
@@ -1067,10 +1301,9 @@ export function listSessionIds(sessionDirectory: string): string[] {
   }
 
   return files
-    .filter((entry) => entry.endsWith(".json"))
-    .filter((entry) => entry !== SESSION_INDEX_FILE)
+    .filter((entry) => entry.endsWith(SESSION_FULL_SUFFIX))
     .map((entry) => {
-      const encoded = entry.replace(/\.json$/i, "");
+      const encoded = entry.slice(0, -SESSION_FULL_SUFFIX.length);
       try {
         return decodeURIComponent(encoded);
       } catch {

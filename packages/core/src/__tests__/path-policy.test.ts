@@ -24,7 +24,7 @@ describe("path policy", () => {
     ]);
   });
 
-  it("allows workspace path escape and ignores mutable-root assertions", () => {
+  it("resolves workspace path escape and enforces mutable-root assertions", () => {
     const workspaceDir = path.resolve("/tmp/workspace-root");
     const escaped = resolveWorkspacePath(workspaceDir, "../outside.txt");
     expect(path.isAbsolute(escaped.absolute)).toBe(true);
@@ -36,6 +36,14 @@ describe("path policy", () => {
         targetPath: path.join(workspaceDir, "blocked", "file.ts"),
         mutableRoots: roots,
         requestedPath: "blocked/file.ts"
+      })
+    ).toThrow("Path is outside mutable roots");
+
+    expect(() =>
+      assertPathInMutableRoots({
+        targetPath: path.join(workspaceDir, "allowed", "file.ts"),
+        mutableRoots: roots,
+        requestedPath: "allowed/file.ts"
       })
     ).not.toThrow();
   });

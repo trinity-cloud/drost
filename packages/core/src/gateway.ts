@@ -45,6 +45,7 @@ import type { ProviderProbeResult, ProviderProfile } from "./providers/types.js"
 import type { ChatMessage } from "./types.js";
 import {
   SessionStoreError,
+  appendSessionEventRecord,
   applySessionHistoryBudget,
   archiveSessionRecord,
   deleteSessionRecord,
@@ -59,6 +60,7 @@ import {
   type SessionMetadata,
   type SessionOriginIdentity
 } from "./sessions.js";
+import { SessionContinuityRuntime } from "./continuity.js";
 import {
   buildChannelSessionId,
   createChannelSessionOrigin,
@@ -72,6 +74,9 @@ const DEFAULT_RESTART_HISTORY_FILE = path.join(".drost", "restart-history.json")
 const DEFAULT_RESTART_BUDGET_MAX = 5;
 const DEFAULT_RESTART_BUDGET_WINDOW_MS = 60 * 60 * 1000;
 const DEFAULT_RESTART_BUDGET_INTENTS: ReadonlySet<GatewayRestartIntent> = new Set(["self_mod", "config_change"]);
+const CONTROL_EVENT_STREAM_PING_MS = 15_000;
+const CONTROL_JSON_BODY_MAX_BYTES = 512_000;
+const OBS_MAX_TEXT_CHARS = 8_000;
 
 export type GatewayState = "stopped" | "running" | "degraded";
 
@@ -94,6 +99,7 @@ export interface GatewayStatus {
     description?: string;
   };
   healthUrl?: string;
+  controlUrl?: string;
 }
 
 export interface SessionSnapshot {
@@ -196,7 +202,11 @@ export type GatewayRuntimeEventType =
   | "evolution.failed"
   | "channel.connected"
   | "channel.disconnected"
-  | "channel.connection_failed";
+  | "channel.connection_failed"
+  | "orchestration.submitted"
+  | "orchestration.started"
+  | "orchestration.completed"
+  | "orchestration.dropped";
 
 export interface GatewayRuntimeEvent {
   type: GatewayRuntimeEventType;
@@ -217,9 +227,48 @@ export interface GatewayConfigReloadResult {
   restartRequired: boolean;
 }
 
+type OrchestrationMode = "queue" | "interrupt" | "collect" | "steer" | "steer_backlog";
+type OrchestrationDropPolicy = "old" | "new" | "summarize";
+
+interface PendingChannelTurn {
+  input: string;
+  onEvent: StreamEventHandler;
+  resolve: (result: ChannelTurnResult) => void;
+  reject: (error: unknown) => void;
+  enqueuedAt: string;
+}
+
+interface ActiveChannelTurn {
+  input: string;
+  onEvent: StreamEventHandler;
+  resolveMany: Array<(result: ChannelTurnResult) => void>;
+  rejectMany: Array<(error: unknown) => void>;
+  controller: AbortController;
+}
+
+interface ChannelLaneState {
+  mode: OrchestrationMode;
+  cap: number;
+  dropPolicy: OrchestrationDropPolicy;
+  collectDebounceMs: number;
+  queue: PendingChannelTurn[];
+  active: ActiveChannelTurn | null;
+  collectTimer: NodeJS.Timeout | null;
+}
+
 interface RestartHistoryEntry {
   timestamp: number;
   intent: GatewayRestartIntent;
+}
+
+type ControlAuthScope = "none" | "read" | "admin";
+
+interface ControlAuthResult {
+  ok: boolean;
+  statusCode?: number;
+  message?: string;
+  scope: ControlAuthScope;
+  mutationKey?: string;
 }
 
 export interface GatewayEvolutionTransactionState {
@@ -237,6 +286,21 @@ function nowIso(): string {
 
 function ensureDirectory(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function sessionStorageBytes(sessionDirectory: string, sessionId: string): number {
+  const encoded = encodeURIComponent(sessionId);
+  const files = [`${encoded}.jsonl`, `${encoded}.full.jsonl`];
+  let total = 0;
+  for (const fileName of files) {
+    const filePath = path.join(sessionDirectory, fileName);
+    try {
+      total += fs.statSync(filePath).size;
+    } catch {
+      // ignore missing files
+    }
+  }
+  return total;
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -268,6 +332,100 @@ function createEvolutionTransactionId(): string {
   return `evo_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function pad2(value: number): string {
+  return value.toString().padStart(2, "0");
+}
+
+function pad3(value: number): string {
+  return value.toString().padStart(3, "0");
+}
+
+function sessionTimestampToken(date = new Date()): string {
+  const year = date.getUTCFullYear();
+  const month = pad2(date.getUTCMonth() + 1);
+  const day = pad2(date.getUTCDate());
+  const hours = pad2(date.getUTCHours());
+  const minutes = pad2(date.getUTCMinutes());
+  const seconds = pad2(date.getUTCSeconds());
+  const millis = pad3(date.getUTCMilliseconds());
+  return `${year}${month}${day}-${hours}${minutes}${seconds}-${millis}`;
+}
+
+function normalizeSessionChannelPart(value: string | undefined): string {
+  const trimmed = (value ?? "").trim().toLowerCase();
+  if (!trimmed) {
+    return "session";
+  }
+  const normalized = trimmed.replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return normalized || "session";
+}
+
+function readControlRequestBody(request: http.IncomingMessage, maxBytes = CONTROL_JSON_BODY_MAX_BYTES): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    request.on("data", (chunk) => {
+      if (!chunk) {
+        return;
+      }
+      const normalized = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += normalized.length;
+      if (totalBytes > maxBytes) {
+        reject(new Error(`Request body exceeds ${maxBytes} bytes`));
+        request.destroy();
+        return;
+      }
+      chunks.push(normalized);
+    });
+    request.on("error", reject);
+    request.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+}
+
+function isLoopbackRemoteAddress(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+  const normalized = value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function parseBearerToken(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed.toLowerCase().startsWith("bearer ")) {
+    return null;
+  }
+  const token = trimmed.slice(7).trim();
+  return token.length > 0 ? token : null;
+}
+
+function clipText(value: string, maxChars = OBS_MAX_TEXT_CHARS): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const dropped = value.length - maxChars;
+  return `${value.slice(0, maxChars)}...[truncated ${dropped} chars]`;
+}
+
+function summarizeForObservability(value: unknown): unknown {
+  if (typeof value === "string") {
+    return clipText(value);
+  }
+  if (value === null || value === undefined) {
+    return value;
+  }
+  try {
+    return JSON.parse(clipText(JSON.stringify(value)));
+  } catch {
+    return clipText(String(value));
+  }
+}
+
 export class GatewayRuntime {
   private readonly config: GatewayConfig;
   private readonly exit: (code: number) => never | void;
@@ -286,12 +444,22 @@ export class GatewayRuntime {
   private agentEntryPath: string | null = null;
   private healthServer: http.Server | null = null;
   private healthUrl: string | undefined;
+  private controlServer: http.Server | null = null;
+  private controlUrl: string | undefined;
+  private controlEventStreams = new Set<http.ServerResponse>();
+  private controlMutationBuckets = new Map<string, number[]>();
+  private controlEventSequence = 0;
   private restartHistoryPath: string;
   private restartHistory: RestartHistoryEntry[] = [];
   private activeEvolutionTransaction: GatewayEvolutionTransactionState | null = null;
   private runtimeEventHandlers = new Set<(event: GatewayRuntimeEvent) => void>();
   private runtimeEvents: GatewayRuntimeEvent[] = [];
   private channelAdapters = new Map<string, ChannelAdapter>();
+  private channelSessionAssignments = new Map<string, string>();
+  private channelLanes = new Map<string, ChannelLaneState>();
+  private continuityRuntime: SessionContinuityRuntime | null = null;
+  private observabilityDirectory: string;
+  private observabilityWriteFailed = false;
 
   readonly workspaceDir: string;
   readonly toolDirectory: string;
@@ -311,10 +479,20 @@ export class GatewayRuntime {
     this.sessionDirectory = path.resolve(
       this.config.sessionStore?.directory ?? path.join(this.workspaceDir, DEFAULT_SESSION_DIRECTORY)
     );
+    this.observabilityDirectory = path.resolve(
+      this.config.observability?.directory ?? path.join(this.workspaceDir, ".drost", "observability")
+    );
     this.agentEntryPath = this.config.agent?.entry ? path.resolve(this.config.agent.entry) : null;
     this.restartHistoryPath = path.resolve(this.workspaceDir, DEFAULT_RESTART_HISTORY_FILE);
     this.sessionStoreEnabled = this.config.sessionStore?.enabled ?? true;
     this.authStore = loadAuthStore(this.authStorePath);
+    if (this.sessionStoreEnabled && this.config.sessionStore?.continuity?.enabled) {
+      this.continuityRuntime = new SessionContinuityRuntime({
+        config: this.config.sessionStore?.continuity,
+        sessionDirectory: this.sessionDirectory,
+        lockOptions: this.sessionLockOptions()
+      });
+    }
     for (const adapter of this.config.channels ?? []) {
       this.registerChannelAdapter(adapter);
     }
@@ -342,7 +520,8 @@ export class GatewayRuntime {
         name: this.agentDefinition?.name,
         description: this.agentDefinition?.description
       },
-      healthUrl: this.healthUrl
+      healthUrl: this.healthUrl,
+      controlUrl: this.controlUrl
     };
   }
 
@@ -384,6 +563,8 @@ export class GatewayRuntime {
     for (const handler of this.runtimeEventHandlers) {
       handler(event);
     }
+    this.broadcastControlRuntimeEvent(event);
+    this.appendObservabilityRecord("runtime-events", event, this.config.observability?.runtimeEventsEnabled);
   }
 
   private loadRestartHistory(): void {
@@ -554,7 +735,8 @@ export class GatewayRuntime {
     ];
     this.providerManager = new ProviderManager({
       profiles: this.config.providers.profiles,
-      adapters
+      adapters,
+      failover: this.config.failover
     });
     return this.providerManager;
   }
@@ -634,6 +816,508 @@ export class GatewayRuntime {
     });
   }
 
+  private ensureObservabilityDirectory(): void {
+    if (!(this.config.observability?.enabled ?? false)) {
+      return;
+    }
+    ensureDirectory(this.observabilityDirectory);
+  }
+
+  private appendObservabilityRecord(
+    stream: "runtime-events" | "tool-traces" | "usage-events",
+    payload: unknown,
+    featureEnabled?: boolean
+  ): void {
+    if (!(this.config.observability?.enabled ?? false)) {
+      return;
+    }
+    if (featureEnabled === false) {
+      return;
+    }
+    try {
+      this.ensureObservabilityDirectory();
+      const entry = {
+        timestamp: nowIso(),
+        stream,
+        payload: summarizeForObservability(payload)
+      };
+      fs.appendFileSync(
+        path.join(this.observabilityDirectory, `${stream}.jsonl`),
+        `${JSON.stringify(entry)}\n`,
+        "utf8"
+      );
+    } catch (error) {
+      if (this.observabilityWriteFailed) {
+        return;
+      }
+      this.observabilityWriteFailed = true;
+      this.degradedReasons.push(
+        `Observability write failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+    }
+  }
+
+  private writeControlJson(
+    response: http.ServerResponse,
+    statusCode: number,
+    payload: Record<string, unknown>
+  ): void {
+    response.statusCode = statusCode;
+    response.setHeader("content-type", "application/json; charset=utf-8");
+    response.end(JSON.stringify(payload));
+  }
+
+  private controlAuthResult(
+    request: http.IncomingMessage,
+    isMutation: boolean
+  ): ControlAuthResult {
+    const allowLoopbackWithoutAuth = this.config.controlApi?.allowLoopbackWithoutAuth ?? true;
+    const remoteAddress = request.socket.remoteAddress;
+    if (allowLoopbackWithoutAuth && isLoopbackRemoteAddress(remoteAddress)) {
+      return {
+        ok: true,
+        scope: "admin",
+        mutationKey: `loopback:${remoteAddress ?? "unknown"}`
+      };
+    }
+
+    const adminToken = this.config.controlApi?.token?.trim();
+    const readToken = this.config.controlApi?.readToken?.trim();
+    const bearer = parseBearerToken(
+      typeof request.headers.authorization === "string"
+        ? request.headers.authorization
+        : Array.isArray(request.headers.authorization)
+          ? request.headers.authorization[0]
+          : undefined
+    );
+    if (!bearer) {
+      return {
+        ok: false,
+        statusCode: 401,
+        message: "Missing bearer token",
+        scope: "none"
+      };
+    }
+
+    let scope: ControlAuthScope = "none";
+    if (adminToken && bearer === adminToken) {
+      scope = "admin";
+    } else if (readToken && bearer === readToken) {
+      scope = "read";
+    }
+
+    if (scope === "none") {
+      return {
+        ok: false,
+        statusCode: 401,
+        message: "Invalid bearer token",
+        scope: "none"
+      };
+    }
+    if (isMutation && scope !== "admin") {
+      return {
+        ok: false,
+        statusCode: 403,
+        message: "Mutation scope requires admin token",
+        scope
+      };
+    }
+    return {
+      ok: true,
+      scope,
+      mutationKey: `${scope}:${remoteAddress ?? "unknown"}:${bearer.slice(0, 12)}`
+    };
+  }
+
+  private consumeControlMutationBudget(key: string): boolean {
+    const limit = this.config.controlApi?.mutationRateLimitPerMinute ?? 60;
+    if (limit <= 0) {
+      return true;
+    }
+    const now = Date.now();
+    const earliest = now - 60_000;
+    const bucket = (this.controlMutationBuckets.get(key) ?? []).filter((timestamp) => timestamp >= earliest);
+    if (bucket.length >= limit) {
+      this.controlMutationBuckets.set(key, bucket);
+      return false;
+    }
+    bucket.push(now);
+    this.controlMutationBuckets.set(key, bucket);
+    return true;
+  }
+
+  private startControlEventStream(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): void {
+    response.statusCode = 200;
+    response.setHeader("content-type", "text/event-stream; charset=utf-8");
+    response.setHeader("cache-control", "no-cache, no-transform");
+    response.setHeader("connection", "keep-alive");
+    response.setHeader("x-accel-buffering", "no");
+    response.flushHeaders?.();
+
+    const snapshot = {
+      status: this.getStatus(),
+      events: this.listRuntimeEvents(100)
+    };
+    response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
+    this.controlEventStreams.add(response);
+
+    const ping = setInterval(() => {
+      if (!this.controlEventStreams.has(response)) {
+        clearInterval(ping);
+        return;
+      }
+      try {
+        response.write(": keepalive\n\n");
+      } catch {
+        this.controlEventStreams.delete(response);
+        clearInterval(ping);
+      }
+    }, CONTROL_EVENT_STREAM_PING_MS);
+
+    const onClose = () => {
+      clearInterval(ping);
+      this.controlEventStreams.delete(response);
+    };
+    request.on("close", onClose);
+    response.on("close", onClose);
+    response.on("error", onClose);
+  }
+
+  private broadcastControlRuntimeEvent(event: GatewayRuntimeEvent): void {
+    if (this.controlEventStreams.size === 0) {
+      return;
+    }
+    const sequence = ++this.controlEventSequence;
+    const frame = `id: ${sequence}\nevent: runtime\ndata: ${JSON.stringify(event)}\n\n`;
+    for (const stream of Array.from(this.controlEventStreams)) {
+      try {
+        stream.write(frame);
+      } catch {
+        this.controlEventStreams.delete(stream);
+      }
+    }
+  }
+
+  private async handleControlRequest(
+    request: http.IncomingMessage,
+    response: http.ServerResponse
+  ): Promise<void> {
+    const basePath = "/control/v1";
+    const method = (request.method ?? "GET").toUpperCase();
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    const pathname = url.pathname;
+    const isMutation = method !== "GET" && method !== "HEAD";
+    const auth = this.controlAuthResult(request, isMutation);
+    if (!auth.ok) {
+      this.writeControlJson(response, auth.statusCode ?? 401, {
+        ok: false,
+        error: auth.message ?? "unauthorized"
+      });
+      return;
+    }
+
+    if (isMutation && auth.mutationKey && !this.consumeControlMutationBudget(auth.mutationKey)) {
+      this.writeControlJson(response, 429, {
+        ok: false,
+        error: "mutation_rate_limited"
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/events`) {
+      this.startControlEventStream(request, response);
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/status`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        status: this.getStatus(),
+        loadedTools: this.listLoadedToolNames(),
+        sessions: this.listSessionSnapshots().length,
+        channels: this.listChannelAdapterIds(),
+        continuity: this.listContinuityJobs(20)
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/sessions`) {
+      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(200, requestedLimit))
+        : 50;
+      this.writeControlJson(response, 200, {
+        ok: true,
+        sessions: this.listSessionSnapshots().slice(0, limit),
+        total: this.listSessionSnapshots().length
+      });
+      return;
+    }
+
+    const sessionDetailMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)$/);
+    if (method === "GET" && sessionDetailMatch) {
+      const sessionId = decodeURIComponent(sessionDetailMatch[1] ?? "");
+      const record = this.exportSession(sessionId);
+      if (!record) {
+        this.writeControlJson(response, 404, {
+          ok: false,
+          error: "session_not_found",
+          sessionId
+        });
+        return;
+      }
+      this.writeControlJson(response, 200, {
+        ok: true,
+        session: record
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/providers/status`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        providerProfiles: this.listProviderProfiles(),
+        providerDiagnostics: this.providerDiagnostics,
+        failover: this.getProviderFailoverStatus()
+      });
+      return;
+    }
+
+    let bodyText = "";
+    let body: Record<string, unknown> = {};
+    if (isMutation) {
+      try {
+        bodyText = await readControlRequestBody(request);
+      } catch (error) {
+        this.writeControlJson(response, 413, {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return;
+      }
+      if (bodyText.trim().length > 0) {
+        try {
+          const parsed = JSON.parse(bodyText);
+          if (parsed && typeof parsed === "object") {
+            body = parsed as Record<string, unknown>;
+          } else {
+            this.writeControlJson(response, 400, {
+              ok: false,
+              error: "JSON body must be an object"
+            });
+            return;
+          }
+        } catch (error) {
+          this.writeControlJson(response, 400, {
+            ok: false,
+            error: error instanceof Error ? error.message : "Invalid JSON"
+          });
+          return;
+        }
+      }
+    }
+
+    if (method === "POST" && pathname === `${basePath}/sessions`) {
+      const channel = typeof body.channel === "string" ? body.channel : undefined;
+      const title = typeof body.title === "string" ? body.title : undefined;
+      const fromSessionId = typeof body.fromSessionId === "string" ? body.fromSessionId : undefined;
+      const sessionId = this.createSession({
+        channel,
+        title,
+        fromSessionId
+      });
+      this.writeControlJson(response, 200, {
+        ok: true,
+        sessionId
+      });
+      return;
+    }
+
+    const switchMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/switch$/);
+    if (method === "POST" && switchMatch) {
+      const targetSessionId = decodeURIComponent(switchMatch[1] ?? "");
+      const identityRaw = body.identity;
+      if (!identityRaw || typeof identityRaw !== "object") {
+        this.writeControlJson(response, 400, {
+          ok: false,
+          error: "identity object is required"
+        });
+        return;
+      }
+      const identityRecord = identityRaw as Record<string, unknown>;
+      if (typeof identityRecord.channel !== "string") {
+        this.writeControlJson(response, 400, {
+          ok: false,
+          error: "identity.channel is required"
+        });
+        return;
+      }
+      const switchResult = this.switchChannelSession({
+        identity: {
+          channel: identityRecord.channel,
+          workspaceId:
+            typeof identityRecord.workspaceId === "string" ? identityRecord.workspaceId : undefined,
+          chatId: typeof identityRecord.chatId === "string" ? identityRecord.chatId : undefined,
+          userId: typeof identityRecord.userId === "string" ? identityRecord.userId : undefined,
+          threadId: typeof identityRecord.threadId === "string" ? identityRecord.threadId : undefined
+        },
+        mapping:
+          body.mapping && typeof body.mapping === "object"
+            ? (body.mapping as ChannelSessionMappingOptions)
+            : undefined,
+        sessionId: targetSessionId,
+        title: typeof body.title === "string" ? body.title : undefined
+      });
+      this.writeControlJson(response, switchResult.ok ? 200 : 400, {
+        ok: switchResult.ok,
+        message: switchResult.message,
+        sessionId: switchResult.sessionId
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/chat/send`) {
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+      const input = typeof body.input === "string" ? body.input : "";
+      if (!sessionId || !input) {
+        this.writeControlJson(response, 400, {
+          ok: false,
+          error: "sessionId and input are required"
+        });
+        return;
+      }
+      const includeEvents = body.includeEvents === true;
+      const events: unknown[] = [];
+      this.ensureSession(sessionId);
+      await this.runSessionTurn({
+        sessionId,
+        input,
+        onEvent: (event) => {
+          if (includeEvents) {
+            events.push(event);
+          }
+        }
+      });
+      const history = this.getSessionHistory(sessionId);
+      const responseText =
+        history
+          .filter((message) => message.role === "assistant")
+          .at(-1)?.content ?? "";
+      const sessionState = this.getSessionState(sessionId);
+      this.writeControlJson(response, 200, {
+        ok: true,
+        sessionId,
+        providerId: sessionState?.activeProviderId,
+        response: responseText,
+        events: includeEvents ? events : undefined
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/runtime/restart`) {
+      const restart = await this.requestRestart({
+        intent:
+          body.intent === "manual" ||
+          body.intent === "self_mod" ||
+          body.intent === "config_change" ||
+          body.intent === "signal"
+            ? body.intent
+            : undefined,
+        reason: typeof body.reason === "string" ? body.reason : undefined,
+        sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
+        providerId: typeof body.providerId === "string" ? body.providerId : undefined,
+        dryRun: body.dryRun === true
+      });
+      if (restart && typeof restart === "object" && "ok" in restart) {
+        this.writeControlJson(response, restart.ok ? 200 : 400, {
+          ok: restart.ok,
+          code: restart.code,
+          message: restart.message,
+          intent: restart.intent,
+          dryRun: restart.dryRun
+        });
+      } else {
+        this.writeControlJson(response, 202, {
+          ok: true,
+          message: "restart_triggered"
+        });
+      }
+      return;
+    }
+
+    this.writeControlJson(response, 404, {
+      ok: false,
+      error: "not_found"
+    });
+  }
+
+  private async startControlServer(): Promise<void> {
+    if (this.controlServer) {
+      return;
+    }
+
+    const enabled = this.config.controlApi?.enabled ?? false;
+    if (!enabled) {
+      this.controlUrl = undefined;
+      return;
+    }
+
+    const host = this.config.controlApi?.host?.trim() || "127.0.0.1";
+    const port = this.config.controlApi?.port ?? 8788;
+    const basePath = "/control/v1";
+
+    const server = http.createServer((request, response) => {
+      void this.handleControlRequest(request, response).catch((error) => {
+        this.writeControlJson(response, 500, {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+
+    const address = server.address();
+    if (address && typeof address === "object") {
+      this.controlUrl = `http://${host}:${address.port}${basePath}`;
+    } else {
+      this.controlUrl = `http://${host}:${port}${basePath}`;
+    }
+    this.controlServer = server;
+  }
+
+  private async stopControlServer(): Promise<void> {
+    for (const stream of this.controlEventStreams) {
+      try {
+        stream.end();
+      } catch {
+        // noop
+      }
+    }
+    this.controlEventStreams.clear();
+    this.controlMutationBuckets.clear();
+
+    const server = this.controlServer;
+    this.controlServer = null;
+    this.controlUrl = undefined;
+    if (!server) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  }
+
   private sessionLockOptions(): { timeoutMs?: number; staleMs?: number } {
     return {
       timeoutMs: this.config.sessionStore?.lock?.timeoutMs,
@@ -663,7 +1347,48 @@ export class GatewayRuntime {
       identity: request.identity,
       mapping: request.mapping
     });
-    return dispatchChannelCommand(this, { sessionId }, request.input);
+    const result = await dispatchChannelCommand(
+      this,
+      {
+        sessionId,
+        identity: request.identity,
+        mapping: request.mapping
+      },
+      request.input
+    );
+    if (result.handled && result.action === "new_session" && result.sessionId) {
+      this.scheduleSessionContinuity(sessionId, result.sessionId);
+    }
+    return result;
+  }
+
+  private scheduleSessionContinuity(fromSessionId: string, toSessionId: string): void {
+    if (!this.sessionStoreEnabled || !this.continuityRuntime) {
+      return;
+    }
+    const from = fromSessionId.trim();
+    const to = toSessionId.trim();
+    if (!from || !to || from === to) {
+      return;
+    }
+    const job = this.continuityRuntime.schedule({
+      fromSessionId: from,
+      toSessionId: to
+    });
+    if (!job) {
+      return;
+    }
+    this.appendSessionEvent(to, "continuity.queued", {
+      jobId: job.jobId,
+      fromSessionId: from,
+      toSessionId: to
+    });
+    this.emitRuntimeEvent("gateway.degraded", {
+      reason: "session_continuity_queued",
+      jobId: job.jobId,
+      fromSessionId: from,
+      toSessionId: to
+    });
   }
 
   private async connectChannels(): Promise<void> {
@@ -861,6 +1586,35 @@ export class GatewayRuntime {
       metadata: session.metadata,
       lock: this.sessionLockOptions()
     });
+    try {
+      this.enforceSessionRetention();
+    } catch (error) {
+      this.degradedReasons.push(
+        `Session retention enforcement failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+    }
+  }
+
+  private appendSessionEvent(sessionId: string, eventType: string, payload: unknown): void {
+    if (!this.sessionStoreEnabled) {
+      return;
+    }
+    try {
+      appendSessionEventRecord({
+        sessionDirectory: this.sessionDirectory,
+        sessionId,
+        eventType,
+        payload,
+        timestamp: nowIso(),
+        lock: this.sessionLockOptions()
+      });
+    } catch (error) {
+      this.degradedReasons.push(
+        `Failed to append session event for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+    }
   }
 
   async start(): Promise<GatewayStatus> {
@@ -880,6 +1634,7 @@ export class GatewayRuntime {
     if (this.sessionStoreEnabled) {
       ensureDirectory(this.sessionDirectory);
     }
+    this.ensureObservabilityDirectory();
     this.loadRestartHistory();
 
     this.degradedReasons = [];
@@ -924,6 +1679,13 @@ export class GatewayRuntime {
         `Health endpoint failed to start: ${error instanceof Error ? error.message : String(error)}`
       );
     }
+    try {
+      await this.startControlServer();
+    } catch (error) {
+      this.degradedReasons.push(
+        `Control API failed to start: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
 
     if (this.agentDefinition?.hooks?.onStart) {
       try {
@@ -944,12 +1706,21 @@ export class GatewayRuntime {
     this.emitRuntimeEvent("gateway.started", {
       state: this.state,
       startedAt: this.startedAt,
-      healthUrl: this.healthUrl
+      healthUrl: this.healthUrl,
+      controlUrl: this.controlUrl
     });
     if (this.degradedReasons.length > 0) {
       this.emitRuntimeEvent("gateway.degraded", {
         reasons: [...this.degradedReasons]
       });
+    }
+    try {
+      this.enforceSessionRetention();
+    } catch (error) {
+      this.degradedReasons.push(
+        `Session retention enforcement failed at startup: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
     }
     return this.getStatus();
   }
@@ -961,7 +1732,20 @@ export class GatewayRuntime {
     this.emitRuntimeEvent("gateway.stopping", {
       state: this.state
     });
+    await this.stopControlServer();
     await this.stopHealthServer();
+    for (const lane of this.channelLanes.values()) {
+      if (lane.collectTimer) {
+        clearTimeout(lane.collectTimer);
+        lane.collectTimer = null;
+      }
+      lane.active?.controller.abort();
+      lane.active = null;
+      for (const queued of lane.queue.splice(0)) {
+        queued.reject(new Error("Gateway is stopping"));
+      }
+    }
+    this.channelLanes.clear();
     await this.disconnectChannels();
     if (this.agentDefinition?.hooks?.onStop) {
       try {
@@ -1135,6 +1919,38 @@ export class GatewayRuntime {
       }
     }
 
+    if (patch.controlApi) {
+      this.config.controlApi = {
+        ...(this.config.controlApi ?? {}),
+        ...patch.controlApi
+      };
+      applied.push("controlApi");
+      if (this.state === "running" || this.state === "degraded") {
+        await this.stopControlServer();
+        try {
+          await this.startControlServer();
+        } catch (error) {
+          this.degradedReasons.push(
+            `Control API failed to start during reload: ${error instanceof Error ? error.message : String(error)}`
+          );
+          this.state = "degraded";
+        }
+      }
+    }
+
+    if (patch.observability) {
+      this.config.observability = {
+        ...(this.config.observability ?? {}),
+        ...patch.observability
+      };
+      if (patch.observability.directory !== undefined) {
+        this.observabilityDirectory = path.resolve(patch.observability.directory);
+      }
+      this.observabilityWriteFailed = false;
+      this.ensureObservabilityDirectory();
+      applied.push("observability");
+    }
+
     if (patch.providers?.startupProbe) {
       const currentProviders = this.config.providers;
       if (!currentProviders) {
@@ -1204,6 +2020,108 @@ export class GatewayRuntime {
       this.state = "degraded";
     }
     this.persistSessionState(sessionId);
+  }
+
+  sessionExists(sessionId: string): boolean {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) {
+      return false;
+    }
+    const manager = this.ensureProviderManager();
+    if (manager?.getSession(normalizedSessionId)) {
+      return true;
+    }
+    if (!this.sessionStoreEnabled) {
+      return false;
+    }
+    return listSessionIds(this.sessionDirectory).includes(normalizedSessionId);
+  }
+
+  createSession(options?: {
+    channel?: string;
+    title?: string;
+    origin?: SessionOriginIdentity;
+    fromSessionId?: string;
+  }): string {
+    const channelPart = normalizeSessionChannelPart(options?.origin?.channel ?? options?.channel);
+    const timestamp = sessionTimestampToken();
+
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      const sessionId =
+        attempt === 0
+          ? `${channelPart}-${timestamp}`
+          : `${channelPart}-${timestamp}-${attempt + 1}`;
+      if (this.sessionExists(sessionId)) {
+        continue;
+      }
+      this.ensureSession(sessionId, {
+        title: options?.title,
+        origin: options?.origin
+      });
+      const fromSessionId = options?.fromSessionId?.trim();
+      if (fromSessionId && fromSessionId !== sessionId && this.sessionExists(fromSessionId)) {
+        this.scheduleSessionContinuity(fromSessionId, sessionId);
+      }
+      return sessionId;
+    }
+
+    throw new Error("Failed to allocate a unique session id");
+  }
+
+  private channelSessionKey(
+    identity: ChannelSessionIdentity,
+    mapping?: ChannelSessionMappingOptions
+  ): string {
+    return buildChannelSessionId(identity, mapping);
+  }
+
+  createChannelSession(params: {
+    identity: ChannelSessionIdentity;
+    mapping?: ChannelSessionMappingOptions;
+    title?: string;
+  }): string {
+    const channelKey = this.channelSessionKey(params.identity, params.mapping);
+    const previousSessionId = this.channelSessionAssignments.get(channelKey) ?? channelKey;
+    const sessionId = this.createSession({
+      channel: params.identity.channel,
+      title: params.title,
+      origin: createChannelSessionOrigin(params.identity),
+      fromSessionId: this.sessionExists(previousSessionId) ? previousSessionId : undefined
+    });
+    this.channelSessionAssignments.set(channelKey, sessionId);
+    return sessionId;
+  }
+
+  switchChannelSession(params: {
+    identity: ChannelSessionIdentity;
+    mapping?: ChannelSessionMappingOptions;
+    sessionId: string;
+    title?: string;
+  }): SessionMutationResult {
+    const targetSessionId = params.sessionId.trim();
+    if (!targetSessionId) {
+      return {
+        ok: false,
+        message: "Session id is required"
+      };
+    }
+    if (!this.sessionExists(targetSessionId)) {
+      return {
+        ok: false,
+        message: `Unknown session: ${targetSessionId}`
+      };
+    }
+
+    this.ensureSession(targetSessionId, {
+      title: params.title,
+      origin: createChannelSessionOrigin(params.identity)
+    });
+    this.channelSessionAssignments.set(this.channelSessionKey(params.identity, params.mapping), targetSessionId);
+    return {
+      ok: true,
+      message: `Active session switched to ${targetSessionId}`,
+      sessionId: targetSessionId
+    };
   }
 
   queueSessionProviderSwitch(sessionId: string, providerId: string): void {
@@ -1290,6 +2208,22 @@ export class GatewayRuntime {
         }
       }
     });
+    this.appendSessionEvent(params.sessionId, "tool.call.started", {
+      providerId,
+      toolName,
+      input: params.input
+    });
+    this.appendObservabilityRecord(
+      "tool-traces",
+      {
+        phase: "started",
+        sessionId: params.sessionId,
+        providerId,
+        toolName,
+        input: params.input
+      },
+      this.config.observability?.toolTracesEnabled
+    );
 
     const startedAt = Date.now();
     const result: ToolExecutionResult = await executeToolDefinition({
@@ -1320,6 +2254,28 @@ export class GatewayRuntime {
           }
         }
       });
+      this.appendSessionEvent(params.sessionId, "tool.call.completed", {
+        providerId,
+        toolName,
+        ok: false,
+        code: result.error?.code ?? "execution_error",
+        message: result.error?.message ?? "Tool execution failed",
+        durationMs: Date.now() - startedAt
+      });
+      this.appendObservabilityRecord(
+        "tool-traces",
+        {
+          phase: "completed",
+          sessionId: params.sessionId,
+          providerId,
+          toolName,
+          ok: false,
+          code: result.error?.code ?? "execution_error",
+          message: result.error?.message ?? "Tool execution failed",
+          durationMs: Date.now() - startedAt
+        },
+        this.config.observability?.toolTracesEnabled
+      );
 
       if (result.error?.code === "validation_error") {
         return {
@@ -1358,6 +2314,26 @@ export class GatewayRuntime {
         }
       }
     });
+    this.appendSessionEvent(params.sessionId, "tool.call.completed", {
+      providerId,
+      toolName,
+      ok: true,
+      output: result.output,
+      durationMs: Date.now() - startedAt
+    });
+    this.appendObservabilityRecord(
+      "tool-traces",
+      {
+        phase: "completed",
+        sessionId: params.sessionId,
+        providerId,
+        toolName,
+        ok: true,
+        output: result.output,
+        durationMs: Date.now() - startedAt
+      },
+      this.config.observability?.toolTracesEnabled
+    );
 
     return {
       toolName,
@@ -1560,6 +2536,8 @@ export class GatewayRuntime {
     if (!manager) {
       throw new Error("No provider manager configured");
     }
+    const turnStartedAtMs = Date.now();
+    const historyBeforeCount = manager.getSessionHistory(params.sessionId).length;
     const session = manager.getSession(params.sessionId);
     const activeProviderId = session?.activeProviderId;
     let input = params.input;
@@ -1576,12 +2554,21 @@ export class GatewayRuntime {
     }
 
     let runSucceeded = false;
+    const onEvent: StreamEventHandler = (event) => {
+      if (event.type !== "tool.call.started" && event.type !== "tool.call.completed") {
+        this.appendSessionEvent(params.sessionId, event.type, {
+          providerId: event.providerId,
+          payload: event.payload
+        });
+      }
+      params.onEvent(event);
+    };
     try {
       await manager.runTurn({
         sessionId: params.sessionId,
         input,
         authStore: this.authStore,
-        onEvent: params.onEvent,
+        onEvent,
         signal: params.signal,
         availableToolNames: this.listLoadedToolNames(),
         runTool: async (request) =>
@@ -1595,6 +2582,26 @@ export class GatewayRuntime {
       });
       runSucceeded = true;
     } finally {
+      if (runSucceeded) {
+        const history = manager.getSessionHistory(params.sessionId);
+        const assistantText = history
+          .filter((message) => message.role === "assistant")
+          .at(-1)?.content;
+        this.appendObservabilityRecord(
+          "usage-events",
+          {
+            kind: "session.turn",
+            sessionId: params.sessionId,
+            providerId: this.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId ?? "unknown",
+            durationMs: Date.now() - turnStartedAtMs,
+            inputChars: input.length,
+            outputChars: assistantText ? assistantText.length : 0,
+            historyBeforeCount,
+            historyAfterCount: history.length
+          },
+          this.config.observability?.usageEventsEnabled
+        );
+      }
       if (runSucceeded && this.agentDefinition?.hooks?.afterTurn) {
         try {
           await this.agentDefinition.hooks.afterTurn({
@@ -1617,21 +2624,46 @@ export class GatewayRuntime {
     }
   }
 
-  async runChannelTurn(params: ChannelTurnRequest): Promise<ChannelTurnResult> {
-    const sessionId = this.resolveChannelSession({
-      identity: params.identity,
-      mapping: params.mapping,
-      title: params.title
-    });
-    const onEvent: StreamEventHandler = params.onEvent ?? (() => undefined);
+  private resolveOrchestrationMode(): OrchestrationMode {
+    const mode = this.config.orchestration?.defaultMode ?? "queue";
+    if (mode === "interrupt" || mode === "collect" || mode === "steer" || mode === "steer_backlog") {
+      return mode;
+    }
+    return "queue";
+  }
+
+  private laneForSession(sessionId: string): ChannelLaneState {
+    const existing = this.channelLanes.get(sessionId);
+    if (existing) {
+      return existing;
+    }
+    const created: ChannelLaneState = {
+      mode: this.resolveOrchestrationMode(),
+      cap: Math.max(1, this.config.orchestration?.defaultCap ?? 32),
+      dropPolicy: this.config.orchestration?.dropPolicy ?? "old",
+      collectDebounceMs: Math.max(0, this.config.orchestration?.collectDebounceMs ?? 350),
+      queue: [],
+      active: null,
+      collectTimer: null
+    };
+    this.channelLanes.set(sessionId, created);
+    return created;
+  }
+
+  private async runChannelTurnDirect(params: {
+    sessionId: string;
+    input: string;
+    onEvent: StreamEventHandler;
+    signal?: AbortSignal;
+  }): Promise<ChannelTurnResult> {
     await this.runSessionTurn({
-      sessionId,
+      sessionId: params.sessionId,
       input: params.input,
-      onEvent,
+      onEvent: params.onEvent,
       signal: params.signal
     });
 
-    const history = this.getSessionHistory(sessionId);
+    const history = this.getSessionHistory(params.sessionId);
     let response = "";
     for (let index = history.length - 1; index >= 0; index -= 1) {
       const message = history[index];
@@ -1641,12 +2673,206 @@ export class GatewayRuntime {
       }
     }
 
-    const state = this.getSessionState(sessionId);
+    const state = this.getSessionState(params.sessionId);
     return {
-      sessionId,
+      sessionId: params.sessionId,
       providerId: state?.activeProviderId,
       response
     };
+  }
+
+  private queueDrop(lane: ChannelLaneState): PendingChannelTurn | null {
+    if (lane.queue.length < lane.cap) {
+      return null;
+    }
+    if (lane.dropPolicy === "new") {
+      return {
+        input: "",
+        onEvent: () => undefined,
+        resolve: () => undefined,
+        reject: () => undefined,
+        enqueuedAt: nowIso()
+      };
+    }
+    const dropped = lane.queue.shift() ?? null;
+    return dropped;
+  }
+
+  private startLaneExecution(sessionId: string, lane: ChannelLaneState): void {
+    if (lane.active) {
+      return;
+    }
+
+    const mode = lane.mode;
+    const takeNext = (): ActiveChannelTurn | null => {
+      if (lane.queue.length === 0) {
+        return null;
+      }
+      if (mode === "collect") {
+        const batch = [...lane.queue];
+        lane.queue.length = 0;
+        const input = batch.map((entry) => entry.input).join("\n\n");
+        const onEvent: StreamEventHandler = (event) => {
+          for (const entry of batch) {
+            entry.onEvent(event);
+          }
+        };
+        return {
+          input,
+          onEvent,
+          resolveMany: batch.map((entry) => entry.resolve),
+          rejectMany: batch.map((entry) => entry.reject),
+          controller: new AbortController()
+        };
+      }
+      const next = lane.queue.shift();
+      if (!next) {
+        return null;
+      }
+      return {
+        input: next.input,
+        onEvent: next.onEvent,
+        resolveMany: [next.resolve],
+        rejectMany: [next.reject],
+        controller: new AbortController()
+      };
+    };
+
+    const active = takeNext();
+    if (!active) {
+      return;
+    }
+    lane.active = active;
+    this.emitRuntimeEvent("orchestration.started", {
+      sessionId,
+      mode: lane.mode,
+      queued: lane.queue.length
+    });
+
+    void this.runChannelTurnDirect({
+      sessionId,
+      input: active.input,
+      onEvent: active.onEvent,
+      signal: active.controller.signal
+    })
+      .then((result) => {
+        for (const resolve of active.resolveMany) {
+          resolve(result);
+        }
+        this.emitRuntimeEvent("orchestration.completed", {
+          sessionId,
+          mode: lane.mode,
+          queued: lane.queue.length
+        });
+      })
+      .catch((error) => {
+        for (const reject of active.rejectMany) {
+          reject(error);
+        }
+      })
+      .finally(() => {
+        lane.active = null;
+        if (lane.collectTimer) {
+          clearTimeout(lane.collectTimer);
+          lane.collectTimer = null;
+        }
+        this.startLaneExecution(sessionId, lane);
+      });
+  }
+
+  private submitChannelTurnToLane(params: {
+    sessionId: string;
+    input: string;
+    onEvent: StreamEventHandler;
+  }): Promise<ChannelTurnResult> {
+    const lane = this.laneForSession(params.sessionId);
+    this.emitRuntimeEvent("orchestration.submitted", {
+      sessionId: params.sessionId,
+      mode: lane.mode,
+      queued: lane.queue.length
+    });
+
+    return new Promise<ChannelTurnResult>((resolve, reject) => {
+      const pending: PendingChannelTurn = {
+        input: params.input,
+        onEvent: params.onEvent,
+        resolve,
+        reject,
+        enqueuedAt: nowIso()
+      };
+
+      const effectiveMode: OrchestrationMode =
+        lane.mode === "steer" ? "interrupt" : lane.mode === "steer_backlog" ? "queue" : lane.mode;
+
+      if (effectiveMode === "interrupt") {
+        for (const queued of lane.queue.splice(0)) {
+          queued.reject(new Error("Dropped by interrupt queue policy"));
+        }
+        lane.active?.controller.abort();
+        lane.queue.push(pending);
+        this.startLaneExecution(params.sessionId, lane);
+        return;
+      }
+
+      const dropped = this.queueDrop(lane);
+      if (dropped) {
+        if (lane.dropPolicy === "new") {
+          reject(new Error("Queue is full (dropPolicy=new)"));
+          this.emitRuntimeEvent("orchestration.dropped", {
+            sessionId: params.sessionId,
+            mode: lane.mode,
+            dropPolicy: lane.dropPolicy
+          });
+          return;
+        }
+        dropped.reject(new Error("Dropped by queue capacity policy"));
+        this.emitRuntimeEvent("orchestration.dropped", {
+          sessionId: params.sessionId,
+          mode: lane.mode,
+          dropPolicy: lane.dropPolicy
+        });
+      }
+
+      lane.queue.push(pending);
+      if (effectiveMode === "collect" && lane.active) {
+        return;
+      }
+      if (effectiveMode === "collect" && lane.collectDebounceMs > 0) {
+        if (lane.collectTimer) {
+          clearTimeout(lane.collectTimer);
+        }
+        lane.collectTimer = setTimeout(() => {
+          lane.collectTimer = null;
+          this.startLaneExecution(params.sessionId, lane);
+        }, lane.collectDebounceMs);
+        return;
+      }
+      this.startLaneExecution(params.sessionId, lane);
+    });
+  }
+
+  async runChannelTurn(params: ChannelTurnRequest): Promise<ChannelTurnResult> {
+    const sessionId = this.resolveChannelSession({
+      identity: params.identity,
+      mapping: params.mapping,
+      title: params.title
+    });
+    const onEvent: StreamEventHandler = params.onEvent ?? (() => undefined);
+    const orchestrationEnabled = this.config.orchestration?.enabled ?? false;
+    if (!orchestrationEnabled) {
+      return await this.runChannelTurnDirect({
+        sessionId,
+        input: params.input,
+        onEvent,
+        signal: params.signal
+      });
+    }
+
+    return await this.submitChannelTurnToLane({
+      sessionId,
+      input: params.input,
+      onEvent
+    });
   }
 
   registerChannelAdapter(adapter: ChannelAdapter): void {
@@ -1670,6 +2896,11 @@ export class GatewayRuntime {
 
   listProviderProfiles(): ProviderProfile[] {
     return this.config.providers ? [...this.config.providers.profiles] : [];
+  }
+
+  getProviderFailoverStatus(): unknown {
+    const manager = this.ensureProviderManager();
+    return manager?.getFailoverStatus() ?? null;
   }
 
   async probeProviders(timeoutMs = 10_000): Promise<ProviderProbeResult[]> {
@@ -2020,16 +3251,144 @@ export class GatewayRuntime {
     return archived;
   }
 
+  enforceSessionRetention(): { archived: string[]; deleted: string[] } {
+    if (!this.sessionStoreEnabled) {
+      return {
+        archived: [],
+        deleted: []
+      };
+    }
+
+    const policy = this.config.sessionStore?.retention;
+    if (!policy) {
+      return {
+        archived: [],
+        deleted: []
+      };
+    }
+
+    const now = Date.now();
+    const manager = this.ensureProviderManager();
+    const archiveFirst = policy.archiveFirst ?? true;
+    const protectedSessions = new Set<string>();
+    for (const session of manager?.listSessions() ?? []) {
+      if (session.turnInProgress) {
+        protectedSessions.add(session.sessionId);
+      }
+    }
+
+    const entries = listSessionIndex(this.sessionDirectory);
+    const removed = new Set<string>();
+    const archived: string[] = [];
+    const deleted: string[] = [];
+
+    const removeSession = (sessionId: string): void => {
+      if (!sessionId || removed.has(sessionId) || protectedSessions.has(sessionId)) {
+        return;
+      }
+      if (archiveFirst) {
+        const archivedResult = archiveSessionRecord({
+          sessionDirectory: this.sessionDirectory,
+          sessionId,
+          lock: this.sessionLockOptions()
+        });
+        if (archivedResult) {
+          archived.push(sessionId);
+          removed.add(sessionId);
+          manager?.deleteSession(sessionId);
+          return;
+        }
+      }
+      const deletedResult = deleteSessionRecord({
+        sessionDirectory: this.sessionDirectory,
+        sessionId,
+        lock: this.sessionLockOptions()
+      });
+      if (deletedResult) {
+        deleted.push(sessionId);
+        removed.add(sessionId);
+        manager?.deleteSession(sessionId);
+      }
+    };
+
+    const maxAgeDays = policy.maxAgeDays ?? 0;
+    if (maxAgeDays > 0) {
+      const ageCutoffMs = now - maxAgeDays * 24 * 60 * 60 * 1000;
+      for (const entry of entries) {
+        const lastActivityMs = Date.parse(entry.lastActivityAt);
+        if (!Number.isFinite(lastActivityMs)) {
+          continue;
+        }
+        if (lastActivityMs <= ageCutoffMs) {
+          removeSession(entry.sessionId);
+        }
+      }
+    }
+
+    const archiveAfterIdleMs = policy.archiveAfterIdleMs ?? 0;
+    if (archiveAfterIdleMs > 0) {
+      for (const entry of entries) {
+        if (removed.has(entry.sessionId)) {
+          continue;
+        }
+        const lastActivityMs = Date.parse(entry.lastActivityAt);
+        if (!Number.isFinite(lastActivityMs)) {
+          continue;
+        }
+        if (now - lastActivityMs >= archiveAfterIdleMs) {
+          removeSession(entry.sessionId);
+        }
+      }
+    }
+
+    const remaining = entries
+      .filter((entry) => !removed.has(entry.sessionId))
+      .sort((left, right) => Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt));
+
+    const maxSessions = policy.maxSessions ?? 0;
+    if (maxSessions > 0 && remaining.length > maxSessions) {
+      for (const entry of remaining.slice(maxSessions)) {
+        removeSession(entry.sessionId);
+      }
+    }
+
+    const maxTotalBytes = policy.maxTotalBytes ?? 0;
+    if (maxTotalBytes > 0) {
+      const latestEntries = listSessionIndex(this.sessionDirectory)
+        .filter((entry) => !removed.has(entry.sessionId))
+        .sort((left, right) => Date.parse(left.lastActivityAt) - Date.parse(right.lastActivityAt));
+      let totalBytes = latestEntries.reduce((sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId), 0);
+      for (const entry of latestEntries) {
+        if (totalBytes <= maxTotalBytes) {
+          break;
+        }
+        const bytes = sessionStorageBytes(this.sessionDirectory, entry.sessionId);
+        removeSession(entry.sessionId);
+        totalBytes = Math.max(0, totalBytes - bytes);
+      }
+    }
+
+    return {
+      archived,
+      deleted
+    };
+  }
+
   resolveChannelSession(params: {
     identity: ChannelSessionIdentity;
     mapping?: ChannelSessionMappingOptions;
     title?: string;
   }): string {
-    const sessionId = buildChannelSessionId(params.identity, params.mapping);
+    const channelKey = this.channelSessionKey(params.identity, params.mapping);
+    const mapped = this.channelSessionAssignments.get(channelKey);
+    const sessionId = mapped ?? channelKey;
     this.ensureSession(sessionId, {
       title: params.title,
       origin: createChannelSessionOrigin(params.identity)
     });
+    if (!mapped) {
+      this.channelSessionAssignments.set(channelKey, sessionId);
+    }
     return sessionId;
   }
 
@@ -2042,6 +3401,13 @@ export class GatewayRuntime {
       return [];
     }
     return listSessionIds(this.sessionDirectory);
+  }
+
+  listContinuityJobs(limit = 20): unknown[] {
+    if (!this.continuityRuntime) {
+      return [];
+    }
+    return this.continuityRuntime.listJobs(limit);
   }
 }
 

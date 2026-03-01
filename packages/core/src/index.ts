@@ -133,6 +133,7 @@ export {
   loadSessionRecordWithDiagnostics,
   listSessionIndex,
   saveSessionRecord,
+  appendSessionEventRecord,
   deleteSessionRecord,
   renameSessionRecord,
   exportSessionRecord,
@@ -141,6 +142,13 @@ export {
   applySessionHistoryBudget,
   listSessionIds
 } from "./sessions.js";
+
+export type {
+  SessionContinuityConfig,
+  SessionContinuityJobRecord,
+  SessionContinuityStatus
+} from "./continuity.js";
+export { SessionContinuityRuntime } from "./continuity.js";
 
 export type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
 export { buildChannelSessionId, createChannelSessionOrigin } from "./session-mapping.js";
