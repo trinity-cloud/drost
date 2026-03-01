@@ -1,21 +1,16 @@
-import fs from "node:fs";
 import http from "node:http";
-import { execFile } from "node:child_process";
 import path from "node:path";
-import { promisify } from "node:util";
 import {
   DEFAULT_AUTH_STORE_PATH,
   DEFAULT_SESSION_DIRECTORY,
-  DEFAULT_TOOL_DIRECTORY,
-  RESTART_EXIT_CODE
+  DEFAULT_TOOL_DIRECTORY
 } from "./constants.js";
 import type { StreamEventHandler } from "./events.js";
 import type {
   GatewayConfig,
   GatewayRestartIntent,
-  GatewayRestartRequestContext,
-  GatewayGitCheckpointResult,
-  SessionStoreConfig
+  SessionStoreConfig,
+  SkillInjectionMode
 } from "./config.js";
 import type {
   ChannelAdapter,
@@ -25,250 +20,70 @@ import type {
   ChannelTurnResult
 } from "./channels.js";
 import type { ChannelCommandResult } from "./channel-commands.js";
-import { dispatchChannelCommand } from "./channel-commands.js";
 import type { AgentDefinition } from "./agent.js";
-import { loadAgentDefinition } from "./agent.js";
 import { loadAuthStore } from "./auth/store.js";
 import type { AuthStore } from "./auth/store.js";
 import { ProviderManager, type ProviderRouteSelection } from "./providers/manager.js";
-import { AnthropicMessagesAdapter } from "./providers/anthropic.js";
-import { CodexExecAdapter } from "./providers/codex-exec.js";
-import { OpenAIResponsesAdapter } from "./providers/openai-responses.js";
-import {
-  buildToolRegistry,
-  createDefaultBuiltInTools,
-  executeToolDefinition,
-  type ToolDefinition,
-  type ToolExecutionResult,
-  type ToolRegistryDiagnostics
-} from "./tools.js";
+import type { ToolDefinition, ToolRegistryDiagnostics } from "./tools.js";
 import type { ProviderProbeResult, ProviderProfile } from "./providers/types.js";
 import type { ChatMessage } from "./types.js";
-import {
-  SessionStoreError,
-  appendSessionEventRecord,
-  applySessionHistoryBudget,
-  archiveSessionRecord,
-  deleteSessionRecord,
-  exportSessionRecord,
-  importSessionRecord,
-  listSessionIds,
-  listSessionIndex,
-  loadSessionRecordWithDiagnostics,
-  renameSessionRecord,
-  saveSessionRecord,
-  type LoadedSessionRecord,
-  type SessionMetadata,
-  type SessionOriginIdentity
-} from "./sessions.js";
+import type { LoadedSessionRecord, SessionMetadata, SessionOriginIdentity } from "./sessions.js";
 import { SessionContinuityRuntime } from "./continuity.js";
-import { PluginRuntime } from "./plugins/runtime.js";
-import type { PluginRuntimeStatus } from "./plugins/types.js";
-import { SkillRuntime } from "./skills/runtime.js";
-import type { SkillRuntimeStatus } from "./skills/types.js";
-import { SubagentManager } from "./subagents/manager.js";
-import type { SubagentJobRecord, SubagentLogRecord, SubagentManagerStatus } from "./subagents/types.js";
-import { OptionalModuleRuntime, type OptionalModuleStatus } from "./optional/runtime.js";
-import {
-  buildChannelSessionId,
-  createChannelSessionOrigin,
-  type ChannelSessionIdentity,
-  type ChannelSessionMappingOptions
-} from "./session-mapping.js";
+import type { PluginRuntime } from "./plugins/runtime.js";
+import type { SkillRuntime } from "./skills/runtime.js";
+import type { SubagentManager } from "./subagents/manager.js";
+import type { SubagentJobRecord, SubagentLogRecord } from "./subagents/types.js";
+import type { OptionalModuleRuntime } from "./optional/runtime.js";
+import type { ChannelSessionIdentity, ChannelSessionMappingOptions } from "./session-mapping.js";
 import { normalizeMutableRoots } from "./path-policy.js";
-import type { SkillInjectionMode } from "./config.js";
+import * as controlApi from "./gateway/control-api.js";
+import * as execution from "./gateway/execution.js";
+import * as orchestration from "./gateway/orchestration.js";
+import * as sessionRuntime from "./gateway/session-runtime.js";
+import * as sessionAdmin from "./gateway/session-admin.js";
+import * as lifecycle from "./gateway/lifecycle.js";
+import * as providerRouting from "./gateway/provider-routing.js";
+import * as infrastructure from "./gateway/infrastructure.js";
+import * as restartConfig from "./gateway/restart-config.js";
+import * as runtimeCore from "./gateway/runtime-core.js";
+import type {
+  GatewayState,
+  GatewayStatus,
+  SessionSnapshot,
+  ToolRunResult,
+  SessionMutationResult,
+  GatewayRestartRequest,
+  GatewayRestartResult,
+  GatewayEvolutionRunRequest,
+  GatewayEvolutionRunResult,
+  GatewayRuntimeEvent,
+  GatewayRuntimeEventType,
+  GatewayConfigReloadResult,
+  GatewayEvolutionTransactionState
+} from "./gateway/types.js";
 
-const execFileAsync = promisify(execFile);
+export type {
+  GatewayState,
+  GatewayStatus,
+  SessionSnapshot,
+  ToolRunResult,
+  SessionMutationResult,
+  GatewayRestartRequest,
+  GatewayRestartResultCode,
+  GatewayRestartResult,
+  GatewayEvolutionStep,
+  GatewayEvolutionRunRequest,
+  GatewayEvolutionRunResultCode,
+  GatewayEvolutionRunResult,
+  GatewayRuntimeEventType,
+  GatewayRuntimeEvent,
+  GatewayConfigReloadRejection,
+  GatewayConfigReloadResult,
+  GatewayEvolutionTransactionState
+} from "./gateway/types.js";
+
 const DEFAULT_RESTART_HISTORY_FILE = path.join(".drost", "restart-history.json");
-const DEFAULT_RESTART_BUDGET_MAX = 5;
-const DEFAULT_RESTART_BUDGET_WINDOW_MS = 60 * 60 * 1000;
-const DEFAULT_RESTART_BUDGET_INTENTS: ReadonlySet<GatewayRestartIntent> = new Set(["self_mod", "config_change"]);
-const CONTROL_EVENT_STREAM_PING_MS = 15_000;
-const CONTROL_JSON_BODY_MAX_BYTES = 512_000;
-const OBS_MAX_TEXT_CHARS = 8_000;
-const OBS_REDACTED_TEXT = "[REDACTED]";
-const OBS_MAX_REDACTION_DEPTH = 10;
-const OBS_SENSITIVE_KEY_NAMES = new Set([
-  "authorization",
-  "cookie",
-  "set-cookie",
-  "x-api-key",
-  "api-key",
-  "apikey",
-  "api_key",
-  "password",
-  "passwd",
-  "passphrase",
-  "secret",
-  "client_secret",
-  "private_key",
-  "access_token",
-  "refresh_token",
-  "session_token",
-  "id_token",
-  "token"
-]);
 const ORCHESTRATION_STATE_FILE = path.join(".drost", "orchestration-lanes.json");
-
-export type GatewayState = "stopped" | "running" | "degraded";
-
-export interface GatewayStatus {
-  state: GatewayState;
-  startedAt?: string;
-  degradedReasons: string[];
-  toolDiagnostics?: ToolRegistryDiagnostics;
-  providerDiagnostics?: ProviderProbeResult[];
-  evolution?: {
-    activeTransactionId?: string;
-    activeSince?: string;
-    totalSteps?: number;
-    completedSteps?: number;
-  };
-  agent?: {
-    entryPath?: string;
-    loaded: boolean;
-    name?: string;
-    description?: string;
-  };
-  healthUrl?: string;
-  controlUrl?: string;
-  plugins?: PluginRuntimeStatus;
-  skills?: SkillRuntimeStatus;
-  subagents?: SubagentManagerStatus;
-  optionalModules?: OptionalModuleStatus[];
-}
-
-export interface SessionSnapshot {
-  sessionId: string;
-  activeProviderId: string;
-  pendingProviderId?: string;
-  turnInProgress: boolean;
-  historyCount: number;
-  metadata: SessionMetadata;
-}
-
-export interface ToolRunResult {
-  toolName: string;
-  ok: boolean;
-  output?: unknown;
-  error?: {
-    code: "tool_not_found" | "validation_error" | "execution_error" | "policy_denied";
-    message: string;
-    issues?: Array<{ path: string; message: string; code?: string }>;
-  };
-}
-
-export interface SessionMutationResult {
-  ok: boolean;
-  message: string;
-  sessionId?: string;
-}
-
-export interface GatewayRestartRequest {
-  intent?: GatewayRestartIntent;
-  reason?: string;
-  sessionId?: string;
-  providerId?: string;
-  dryRun?: boolean;
-}
-
-export type GatewayRestartResultCode =
-  | "allowed"
-  | "approval_required"
-  | "approval_denied"
-  | "budget_exceeded"
-  | "git_checkpoint_failed";
-
-export interface GatewayRestartResult {
-  ok: boolean;
-  code: GatewayRestartResultCode;
-  message: string;
-  intent: GatewayRestartIntent;
-  dryRun: boolean;
-}
-
-export interface GatewayEvolutionStep {
-  toolName: string;
-  input: unknown;
-  providerId?: string;
-}
-
-export interface GatewayEvolutionRunRequest {
-  sessionId: string;
-  summary?: string;
-  providerId?: string;
-  steps: GatewayEvolutionStep[];
-  requestRestart?: boolean;
-  restartDryRun?: boolean;
-  onEvent?: StreamEventHandler;
-}
-
-export type GatewayEvolutionRunResultCode = "completed" | "busy" | "failed" | "disabled" | "invalid_request";
-
-export interface GatewayEvolutionRunResult {
-  ok: boolean;
-  code: GatewayEvolutionRunResultCode;
-  message: string;
-  transactionId?: string;
-  failedStepIndex?: number;
-  stepsAttempted?: number;
-  activeTransactionId?: string;
-  stepResults?: ToolRunResult[];
-  restart?: GatewayRestartResult;
-}
-
-export type GatewayRuntimeEventType =
-  | "gateway.starting"
-  | "gateway.started"
-  | "gateway.degraded"
-  | "gateway.stopping"
-  | "gateway.stopped"
-  | "gateway.agent.loaded"
-  | "gateway.agent.failed"
-  | "gateway.restart.requested"
-  | "gateway.restart.validated"
-  | "gateway.restart.blocked"
-  | "gateway.restart.executing"
-  | "gateway.config.reloaded"
-  | "evolution.requested"
-  | "evolution.busy"
-  | "evolution.step.completed"
-  | "evolution.step.failed"
-  | "evolution.completed"
-  | "evolution.failed"
-  | "channel.connected"
-  | "channel.disconnected"
-  | "channel.connection_failed"
-  | "orchestration.submitted"
-  | "orchestration.started"
-  | "orchestration.completed"
-  | "orchestration.dropped"
-  | "tool.policy.denied"
-  | "subagent.job.queued"
-  | "subagent.job.running"
-  | "subagent.job.completed"
-  | "subagent.job.failed"
-  | "subagent.job.cancelled"
-  | "subagent.job.timed_out";
-
-export interface GatewayRuntimeEvent {
-  type: GatewayRuntimeEventType;
-  timestamp: string;
-  payload: Record<string, unknown>;
-}
-
-export interface GatewayConfigReloadRejection {
-  path: string;
-  reason: "restart_required" | "invalid_patch";
-  message: string;
-}
-
-export interface GatewayConfigReloadResult {
-  ok: boolean;
-  applied: string[];
-  rejected: GatewayConfigReloadRejection[];
-  restartRequired: boolean;
-}
 
 type OrchestrationMode = "queue" | "interrupt" | "collect" | "steer" | "steer_backlog";
 type OrchestrationDropPolicy = "old" | "new" | "summarize";
@@ -318,257 +133,6 @@ interface PersistedChannelLaneSnapshot {
 interface RestartHistoryEntry {
   timestamp: number;
   intent: GatewayRestartIntent;
-}
-
-type ControlAuthScope = "none" | "read" | "admin";
-
-interface ControlAuthResult {
-  ok: boolean;
-  statusCode?: number;
-  message?: string;
-  scope: ControlAuthScope;
-  mutationKey?: string;
-}
-
-export interface GatewayEvolutionTransactionState {
-  transactionId: string;
-  requestedAt: string;
-  sessionId: string;
-  summary?: string;
-  totalSteps: number;
-  completedSteps: number;
-}
-
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
-function ensureDirectory(dirPath: string): void {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function sessionStorageBytes(sessionDirectory: string, sessionId: string): number {
-  const encoded = encodeURIComponent(sessionId);
-  const files = [`${encoded}.jsonl`, `${encoded}.full.jsonl`];
-  let total = 0;
-  for (const fileName of files) {
-    const filePath = path.join(sessionDirectory, fileName);
-    try {
-      total += fs.statSync(filePath).size;
-    } catch {
-      // ignore missing files
-    }
-  }
-  return total;
-}
-
-function safeJsonStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function toText(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value instanceof Buffer) {
-    return value.toString("utf8");
-  }
-  return "";
-}
-
-function restartIntent(value: GatewayRestartRequest["intent"]): GatewayRestartIntent {
-  if (value === "self_mod" || value === "config_change" || value === "signal") {
-    return value;
-  }
-  return "manual";
-}
-
-function createEvolutionTransactionId(): string {
-  return `evo_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function pad2(value: number): string {
-  return value.toString().padStart(2, "0");
-}
-
-function pad3(value: number): string {
-  return value.toString().padStart(3, "0");
-}
-
-function sessionTimestampToken(date = new Date()): string {
-  const year = date.getUTCFullYear();
-  const month = pad2(date.getUTCMonth() + 1);
-  const day = pad2(date.getUTCDate());
-  const hours = pad2(date.getUTCHours());
-  const minutes = pad2(date.getUTCMinutes());
-  const seconds = pad2(date.getUTCSeconds());
-  const millis = pad3(date.getUTCMilliseconds());
-  return `${year}${month}${day}-${hours}${minutes}${seconds}-${millis}`;
-}
-
-function normalizeSessionChannelPart(value: string | undefined): string {
-  const trimmed = (value ?? "").trim().toLowerCase();
-  if (!trimmed) {
-    return "session";
-  }
-  const normalized = trimmed.replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return normalized || "session";
-}
-
-function readControlRequestBody(request: http.IncomingMessage, maxBytes = CONTROL_JSON_BODY_MAX_BYTES): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
-    request.on("data", (chunk) => {
-      if (!chunk) {
-        return;
-      }
-      const normalized = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      totalBytes += normalized.length;
-      if (totalBytes > maxBytes) {
-        reject(new Error(`Request body exceeds ${maxBytes} bytes`));
-        request.destroy();
-        return;
-      }
-      chunks.push(normalized);
-    });
-    request.on("error", reject);
-    request.on("end", () => {
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-  });
-}
-
-function isLoopbackRemoteAddress(value: string | undefined): boolean {
-  if (!value) {
-    return false;
-  }
-  const normalized = value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value;
-  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
-}
-
-function parseBearerToken(value: string | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-  const trimmed = value.trim();
-  if (!trimmed.toLowerCase().startsWith("bearer ")) {
-    return null;
-  }
-  const token = trimmed.slice(7).trim();
-  return token.length > 0 ? token : null;
-}
-
-function clipText(value: string, maxChars = OBS_MAX_TEXT_CHARS): string {
-  if (value.length <= maxChars) {
-    return value;
-  }
-  const dropped = value.length - maxChars;
-  return `${value.slice(0, maxChars)}...[truncated ${dropped} chars]`;
-}
-
-function isSensitiveObservabilityKey(key: string): boolean {
-  const normalized = key.trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  if (OBS_SENSITIVE_KEY_NAMES.has(normalized)) {
-    return true;
-  }
-  return (
-    normalized.includes("token") ||
-    normalized.includes("secret") ||
-    normalized.includes("password") ||
-    normalized.includes("passphrase") ||
-    normalized.includes("apikey") ||
-    normalized.includes("api_key")
-  );
-}
-
-function redactStringSecrets(value: string): string {
-  let sanitized = value;
-  sanitized = sanitized.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, `Bearer ${OBS_REDACTED_TEXT}`);
-  sanitized = sanitized.replace(/\b(?:sk|rk)-[A-Za-z0-9_-]{12,}\b/g, OBS_REDACTED_TEXT);
-  sanitized = sanitized.replace(/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gi, OBS_REDACTED_TEXT);
-  sanitized = sanitized.replace(/\b[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b/g, OBS_REDACTED_TEXT);
-  sanitized = sanitized.replace(
-    /\b(token|secret|password|passphrase|api[_-]?key)\s*[:=]\s*([^\s,;]+)/gi,
-    (_, label: string) => `${label}=${OBS_REDACTED_TEXT}`
-  );
-  return sanitized;
-}
-
-function sanitizeObservabilityValue(value: unknown, depth = 0, seen?: WeakSet<object>): unknown {
-  if (typeof value === "string") {
-    return redactStringSecrets(value);
-  }
-  if (value === null || value === undefined) {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return value;
-  }
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-  if (depth >= OBS_MAX_REDACTION_DEPTH) {
-    return "[Truncated depth]";
-  }
-
-  if (Buffer.isBuffer(value)) {
-    return redactStringSecrets(value.toString("utf8"));
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeObservabilityValue(entry, depth + 1, seen));
-  }
-
-  if (value instanceof Error) {
-    return {
-      name: value.name,
-      message: redactStringSecrets(value.message),
-      stack: value.stack ? redactStringSecrets(value.stack) : undefined
-    };
-  }
-
-  if (typeof value === "object") {
-    const references = seen ?? new WeakSet<object>();
-    const record = value as Record<string, unknown>;
-    if (references.has(record)) {
-      return "[Circular]";
-    }
-    references.add(record);
-    const sanitized: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(record)) {
-      if (isSensitiveObservabilityKey(key)) {
-        sanitized[key] = OBS_REDACTED_TEXT;
-      } else {
-        sanitized[key] = sanitizeObservabilityValue(entry, depth + 1, references);
-      }
-    }
-    return sanitized;
-  }
-
-  return redactStringSecrets(String(value));
-}
-
-function summarizeForObservability(value: unknown): unknown {
-  const sanitized = sanitizeObservabilityValue(value);
-  if (typeof sanitized === "string") {
-    return clipText(sanitized);
-  }
-  if (sanitized === null || sanitized === undefined) {
-    return sanitized;
-  }
-  try {
-    return JSON.parse(clipText(JSON.stringify(sanitized)));
-  } catch {
-    return clipText(String(sanitized));
-  }
 }
 
 export class GatewayRuntime {
@@ -653,600 +217,93 @@ export class GatewayRuntime {
   }
 
   getStatus(): GatewayStatus {
-    const activeEvolution = this.activeEvolutionTransaction;
-    return {
-      state: this.state,
-      startedAt: this.startedAt,
-      degradedReasons: [...this.degradedReasons],
-      providerDiagnostics: this.providerDiagnostics.length > 0 ? [...this.providerDiagnostics] : undefined,
-      toolDiagnostics: this._toolDiagnostics,
-      evolution: activeEvolution
-        ? {
-            activeTransactionId: activeEvolution.transactionId,
-            activeSince: activeEvolution.requestedAt,
-            totalSteps: activeEvolution.totalSteps,
-            completedSteps: activeEvolution.completedSteps
-          }
-        : undefined,
-      agent: {
-        entryPath: this.agentEntryPath ?? undefined,
-        loaded: Boolean(this.agentDefinition),
-        name: this.agentDefinition?.name,
-        description: this.agentDefinition?.description
-      },
-      healthUrl: this.healthUrl,
-      controlUrl: this.controlUrl,
-      plugins: this.pluginRuntime?.getStatus(),
-      skills: this.skillRuntime?.getStatus(),
-      subagents: this.subagentManager?.getStatus(),
-      optionalModules: this.optionalModuleRuntime?.listStatuses()
-    };
+    return runtimeCore.getStatus(this);
   }
 
   private _toolDiagnostics: ToolRegistryDiagnostics | undefined;
 
   onRuntimeEvent(handler: (event: GatewayRuntimeEvent) => void): () => void {
-    this.runtimeEventHandlers.add(handler);
-    return () => {
-      this.runtimeEventHandlers.delete(handler);
-    };
+    return runtimeCore.onRuntimeEvent(this, handler);
   }
 
   listRuntimeEvents(limit = 100): GatewayRuntimeEvent[] {
-    if (limit <= 0) {
-      return [];
-    }
-    return this.runtimeEvents.slice(-limit);
+    return runtimeCore.listRuntimeEvents(this, limit);
   }
 
   getActiveEvolutionTransaction(): GatewayEvolutionTransactionState | null {
-    if (!this.activeEvolutionTransaction) {
-      return null;
-    }
-    return {
-      ...this.activeEvolutionTransaction
-    };
+    return runtimeCore.getActiveEvolutionTransaction(this);
   }
 
   private emitRuntimeEvent(type: GatewayRuntimeEventType, payload: Record<string, unknown>): void {
-    const event: GatewayRuntimeEvent = {
-      type,
-      timestamp: nowIso(),
-      payload
-    };
-    this.runtimeEvents.push(event);
-    if (this.runtimeEvents.length > 500) {
-      this.runtimeEvents.splice(0, this.runtimeEvents.length - 500);
-    }
-    for (const handler of this.runtimeEventHandlers) {
-      handler(event);
-    }
-    this.broadcastControlRuntimeEvent(event);
-    this.appendObservabilityRecord("runtime-events", event, this.config.observability?.runtimeEventsEnabled);
+    runtimeCore.emitRuntimeEvent(this, type, payload);
   }
 
   private loadRestartHistory(): void {
-    try {
-      const raw = fs.readFileSync(this.restartHistoryPath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        this.restartHistory = [];
-        return;
-      }
-      this.restartHistory = parsed
-        .filter((entry) => entry && typeof entry === "object")
-        .map((entry) => entry as { timestamp?: unknown; intent?: unknown })
-        .filter((entry) => typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp))
-        .map((entry) => ({
-          timestamp: entry.timestamp as number,
-          intent: restartIntent(typeof entry.intent === "string" ? (entry.intent as GatewayRestartIntent) : "manual")
-        }));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        this.degradedReasons.push(
-          `Failed to load restart history: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-      this.restartHistory = [];
-    }
+    restartConfig.loadRestartHistory(this);
   }
 
   private saveRestartHistory(): void {
-    try {
-      ensureDirectory(path.dirname(this.restartHistoryPath));
-      fs.writeFileSync(this.restartHistoryPath, JSON.stringify(this.restartHistory, null, 2));
-    } catch (error) {
-      this.degradedReasons.push(
-        `Failed to save restart history: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
-  }
-
-  private pruneRestartHistory(windowMs: number, nowMs: number): void {
-    const earliest = nowMs - windowMs;
-    this.restartHistory = this.restartHistory.filter((entry) => entry.timestamp >= earliest);
-  }
-
-  private resolveBudgetPolicy(): {
-    enabled: boolean;
-    maxRestarts: number;
-    windowMs: number;
-    intents: ReadonlySet<GatewayRestartIntent>;
-  } {
-    const budget = this.config.restartPolicy?.budget;
-    const enabled = budget?.enabled ?? true;
-    const maxRestarts = budget?.maxRestarts ?? DEFAULT_RESTART_BUDGET_MAX;
-    const windowMs = budget?.windowMs ?? DEFAULT_RESTART_BUDGET_WINDOW_MS;
-    const intents = new Set<GatewayRestartIntent>(
-      budget?.intents && budget.intents.length > 0 ? budget.intents : Array.from(DEFAULT_RESTART_BUDGET_INTENTS)
-    );
-    return {
-      enabled,
-      maxRestarts,
-      windowMs,
-      intents
-    };
-  }
-
-  private async runGitCheckpoint(request: GatewayRestartRequestContext): Promise<GatewayGitCheckpointResult> {
-    const configured = this.config.restartPolicy?.gitSafety;
-    if (configured?.checkpoint) {
-      return await configured.checkpoint(request);
-    }
-
-    try {
-      await execFileAsync("git", ["-C", this.workspaceDir, "rev-parse", "--is-inside-work-tree"], {
-        encoding: "utf8"
-      });
-    } catch {
-      return {
-        ok: false,
-        message: "Workspace is not a git repository"
-      };
-    }
-
-    if (request.dryRun) {
-      return {
-        ok: true,
-        message: "Dry-run git checkpoint passed"
-      };
-    }
-
-    try {
-      await execFileAsync("git", ["-C", this.workspaceDir, "add", "-A"], {
-        encoding: "utf8"
-      });
-    } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error)
-      };
-    }
-
-    const checkpointMessage =
-      configured?.checkpointMessage ??
-      `drost: pre-restart checkpoint (${request.intent}) ${request.timestamp}`;
-    try {
-      await execFileAsync("git", ["-C", this.workspaceDir, "commit", "-m", checkpointMessage], {
-        encoding: "utf8"
-      });
-      return {
-        ok: true,
-        message: "Git checkpoint commit created"
-      };
-    } catch (error) {
-      const withStreams = error as Error & { stdout?: string | Buffer; stderr?: string | Buffer };
-      const detail = [toText(withStreams.stderr).trim(), toText(withStreams.stdout).trim()]
-        .filter((value) => value.length > 0)
-        .join(" | ");
-      if (detail.toLowerCase().includes("nothing to commit")) {
-        return {
-          ok: true,
-          message: "No changes to commit"
-        };
-      }
-      return {
-        ok: false,
-        message: detail || (error instanceof Error ? error.message : String(error))
-      };
-    }
+    restartConfig.saveRestartHistory(this);
   }
 
   async validateRestart(request: GatewayRestartRequest = {}): Promise<GatewayRestartResult> {
-    const now = nowIso();
-    const context: GatewayRestartRequestContext = {
-      intent: restartIntent(request.intent),
-      reason: request.reason,
-      sessionId: request.sessionId,
-      providerId: request.providerId,
-      dryRun: true,
-      timestamp: now
-    };
-    return await this.evaluateRestartPolicy(context);
-  }
-
-  private async evaluateRestartPolicy(
-    context: GatewayRestartRequestContext
-  ): Promise<GatewayRestartResult> {
-    return {
-      ok: true,
-      code: "allowed",
-      message: context.dryRun ? "Restart validation passed (dry-run)" : "Restart approved",
-      intent: context.intent,
-      dryRun: context.dryRun
-    };
+    return await restartConfig.validateRestart(this, request);
   }
 
   private ensureProviderManager(): ProviderManager | null {
-    if (this.providerManager) {
-      return this.providerManager;
-    }
-    if (!this.config.providers) {
-      return null;
-    }
-    const adapters = [
-      new CodexExecAdapter(),
-      new OpenAIResponsesAdapter(),
-      new AnthropicMessagesAdapter(),
-      ...(this.config.providers.adapters ?? [])
-    ];
-    this.providerManager = new ProviderManager({
-      profiles: this.config.providers.profiles,
-      adapters,
-      failover: this.config.failover
-    });
-    return this.providerManager;
-  }
-
-  private providerRouteMap(): Map<string, { id: string; primaryProviderId: string; fallbackProviderIds: string[] }> {
-    const routes = new Map<string, { id: string; primaryProviderId: string; fallbackProviderIds: string[] }>();
-    for (const route of this.config.providerRouter?.routes ?? []) {
-      const routeId = route.id.trim();
-      const primaryProviderId = route.primaryProviderId.trim();
-      if (!routeId || !primaryProviderId) {
-        continue;
-      }
-      routes.set(routeId, {
-        id: routeId,
-        primaryProviderId,
-        fallbackProviderIds: (route.fallbackProviderIds ?? [])
-          .map((providerId) => providerId.trim())
-          .filter((providerId) => providerId.length > 0 && providerId !== primaryProviderId)
-      });
-    }
-    return routes;
+    return providerRouting.ensureProviderManager(this);
   }
 
   private validateProviderRoutes(): void {
-    if (!(this.config.providerRouter?.enabled ?? false)) {
-      return;
-    }
-    const routes = this.providerRouteMap();
-    if (routes.size === 0) {
-      this.degradedReasons.push("providerRouter.enabled=true but no valid routes are configured");
-      this.state = "degraded";
-      return;
-    }
-    const knownProviderIds = new Set((this.config.providers?.profiles ?? []).map((profile) => profile.id));
-    for (const route of routes.values()) {
-      if (!knownProviderIds.has(route.primaryProviderId)) {
-        this.degradedReasons.push(
-          `Provider route ${route.id} references unknown primary provider ${route.primaryProviderId}`
-        );
-        this.state = "degraded";
-      }
-      for (const fallbackProviderId of route.fallbackProviderIds) {
-        if (!knownProviderIds.has(fallbackProviderId)) {
-          this.degradedReasons.push(
-            `Provider route ${route.id} references unknown fallback provider ${fallbackProviderId}`
-          );
-          this.state = "degraded";
-        }
-      }
-    }
-  }
-
-  private selectedRouteIdForSession(sessionId: string): string | null {
-    const override = this.sessionProviderRouteOverrides.get(sessionId)?.trim();
-    if (override) {
-      return override;
-    }
-    const fromMetadata = this.ensureProviderManager()?.getSession(sessionId)?.metadata.providerRouteId?.trim();
-    if (fromMetadata) {
-      return fromMetadata;
-    }
-    const defaultRoute = this.config.providerRouter?.defaultRoute?.trim();
-    return defaultRoute || null;
+    providerRouting.validateProviderRoutes(this);
   }
 
   private resolveProviderRouteSelection(sessionId: string): ProviderRouteSelection | null {
-    const enabled = this.config.providerRouter?.enabled ?? false;
-    if (!enabled) {
-      return null;
-    }
-    const routeId = this.selectedRouteIdForSession(sessionId);
-    if (!routeId) {
-      return null;
-    }
-    const route = this.providerRouteMap().get(routeId);
-    if (!route) {
-      const message = `Unknown provider route: ${routeId}`;
-      if (!this.degradedReasons.includes(message)) {
-        this.degradedReasons.push(message);
-      }
-      this.state = "degraded";
-      return null;
-    }
-    return {
-      routeId: route.id,
-      primaryProviderId: route.primaryProviderId,
-      fallbackProviderIds: route.fallbackProviderIds
-    };
+    return providerRouting.resolveProviderRouteSelection(this, sessionId);
   }
 
   listProviderRoutes(): Array<{ id: string; primaryProviderId: string; fallbackProviderIds: string[] }> {
-    return Array.from(this.providerRouteMap().values());
+    return providerRouting.listProviderRoutes(this);
   }
 
   getSessionProviderRoute(sessionId: string): string | undefined {
-    const manager = this.ensureProviderManager();
-    const routeId =
-      this.sessionProviderRouteOverrides.get(sessionId)?.trim() ??
-      manager?.getSession(sessionId)?.metadata.providerRouteId?.trim();
-    return routeId && routeId.length > 0 ? routeId : undefined;
+    return providerRouting.getSessionProviderRoute(this, sessionId);
   }
 
   setSessionProviderRoute(sessionId: string, routeId: string): SessionMutationResult {
-    const normalizedSessionId = sessionId.trim();
-    const normalizedRouteId = routeId.trim();
-    if (!normalizedSessionId || !normalizedRouteId) {
-      return {
-        ok: false,
-        message: "sessionId and routeId are required"
-      };
-    }
-    const route = this.providerRouteMap().get(normalizedRouteId);
-    if (!route) {
-      return {
-        ok: false,
-        message: `Unknown provider route: ${normalizedRouteId}`
-      };
-    }
-    if (!this.sessionExists(normalizedSessionId)) {
-      return {
-        ok: false,
-        message: `Unknown session: ${normalizedSessionId}`
-      };
-    }
-    this.ensureSession(normalizedSessionId);
-    this.sessionProviderRouteOverrides.set(normalizedSessionId, normalizedRouteId);
-    const manager = this.ensureProviderManager();
-    manager?.updateSessionMetadata(normalizedSessionId, {
-      providerRouteId: normalizedRouteId
-    });
-    this.persistSessionState(normalizedSessionId);
-    this.emitRuntimeEvent("gateway.config.reloaded", {
-      action: "session.provider_route",
-      sessionId: normalizedSessionId,
-      routeId: normalizedRouteId
-    });
-    return {
-      ok: true,
-      message: `Session ${normalizedSessionId} route set to ${normalizedRouteId}`,
-      sessionId: normalizedSessionId
-    };
+    return providerRouting.setSessionProviderRoute(this, sessionId, routeId);
   }
 
   private shouldPersistOrchestrationState(): boolean {
-    return (this.config.orchestration?.enabled ?? false) && (this.config.orchestration?.persistState ?? false);
+    return infrastructure.shouldPersistOrchestrationState(this);
   }
 
   private persistedLaneStateSnapshot(): PersistedChannelLaneSnapshot {
-    const lanes: PersistedChannelLaneState[] = [];
-    for (const [sessionId, lane] of this.channelLanes.entries()) {
-      lanes.push({
-        sessionId,
-        mode: lane.mode,
-        cap: lane.cap,
-        dropPolicy: lane.dropPolicy,
-        collectDebounceMs: lane.collectDebounceMs,
-        queuedInputs: lane.queue.map((entry) => entry.input),
-        activeInput: lane.active?.input
-      });
-    }
-    return {
-      version: 1,
-      updatedAt: nowIso(),
-      lanes
-    };
+    return infrastructure.persistedLaneStateSnapshot(this);
   }
 
   private writeOrchestrationState(snapshot: PersistedChannelLaneSnapshot): void {
-    ensureDirectory(path.dirname(this.orchestrationStatePath));
-    const next = JSON.stringify(snapshot, null, 2);
-    const tempPath = `${this.orchestrationStatePath}.tmp`;
-    fs.writeFileSync(tempPath, next, "utf8");
-    fs.renameSync(tempPath, this.orchestrationStatePath);
+    infrastructure.writeOrchestrationState(this, snapshot);
   }
 
   private persistOrchestrationState(): void {
-    if (!this.shouldPersistOrchestrationState() || this.suppressOrchestrationPersistence) {
-      return;
-    }
-    try {
-      this.writeOrchestrationState(this.persistedLaneStateSnapshot());
-    } catch (error) {
-      this.degradedReasons.push(
-        `Failed to persist orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
+    infrastructure.persistOrchestrationState(this);
   }
 
   private restoreOrchestrationState(): void {
-    if (!this.shouldPersistOrchestrationState()) {
-      return;
-    }
-    let raw: string;
-    try {
-      raw = fs.readFileSync(this.orchestrationStatePath, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return;
-      }
-      this.degradedReasons.push(
-        `Failed to read orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-      return;
-    }
-
-    try {
-      const parsed = JSON.parse(raw) as Partial<PersistedChannelLaneSnapshot>;
-      if (parsed.version !== 1 || !Array.isArray(parsed.lanes)) {
-        return;
-      }
-      for (const laneRecord of parsed.lanes) {
-        const sessionId = typeof laneRecord?.sessionId === "string" ? laneRecord.sessionId.trim() : "";
-        if (!sessionId) {
-          continue;
-        }
-        const lane: ChannelLaneState = {
-          mode:
-            laneRecord.mode === "interrupt" ||
-            laneRecord.mode === "collect" ||
-            laneRecord.mode === "steer" ||
-            laneRecord.mode === "steer_backlog"
-              ? laneRecord.mode
-              : "queue",
-          cap:
-            typeof laneRecord.cap === "number" && Number.isFinite(laneRecord.cap)
-              ? Math.max(1, Math.floor(laneRecord.cap))
-              : Math.max(1, this.config.orchestration?.defaultCap ?? 32),
-          dropPolicy:
-            laneRecord.dropPolicy === "new" || laneRecord.dropPolicy === "summarize"
-              ? laneRecord.dropPolicy
-              : "old",
-          collectDebounceMs:
-            typeof laneRecord.collectDebounceMs === "number" && Number.isFinite(laneRecord.collectDebounceMs)
-              ? Math.max(0, Math.floor(laneRecord.collectDebounceMs))
-              : Math.max(0, this.config.orchestration?.collectDebounceMs ?? 350),
-          queue: [],
-          active: null,
-          collectTimer: null
-        };
-
-        const restoredInputs: string[] = [];
-        if (typeof laneRecord.activeInput === "string" && laneRecord.activeInput.trim().length > 0) {
-          restoredInputs.push(laneRecord.activeInput);
-        }
-        if (Array.isArray(laneRecord.queuedInputs)) {
-          for (const input of laneRecord.queuedInputs) {
-            if (typeof input === "string" && input.trim().length > 0) {
-              restoredInputs.push(input);
-            }
-          }
-        }
-        for (const input of restoredInputs) {
-          lane.queue.push({
-            input,
-            onEvent: () => undefined,
-            resolve: () => undefined,
-            reject: () => undefined,
-            enqueuedAt: nowIso()
-          });
-        }
-        this.channelLanes.set(sessionId, lane);
-      }
-    } catch (error) {
-      this.degradedReasons.push(
-        `Failed to parse orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
+    infrastructure.restoreOrchestrationState(this);
   }
 
   private async startHealthServer(): Promise<void> {
-    if (this.healthServer) {
-      return;
-    }
-
-    const enabled = this.config.health?.enabled ?? false;
-    if (!enabled) {
-      this.healthUrl = undefined;
-      return;
-    }
-
-    const host = this.config.health?.host?.trim() || "127.0.0.1";
-    const port = this.config.health?.port ?? 8787;
-    const endpointPath = this.config.health?.path?.trim() || "/healthz";
-
-    const server = http.createServer((request, response) => {
-      const requestPath = (request.url ?? "").split("?")[0] ?? "";
-      if (requestPath !== endpointPath) {
-        response.statusCode = 404;
-        response.setHeader("content-type", "application/json; charset=utf-8");
-        response.end(JSON.stringify({ ok: false, error: "not_found" }));
-        return;
-      }
-
-      const status = this.getStatus();
-      const startedAtMs = status.startedAt ? Date.parse(status.startedAt) : NaN;
-      const uptimeSec =
-        Number.isFinite(startedAtMs) && startedAtMs > 0
-          ? Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000))
-          : 0;
-
-      response.statusCode = status.state === "degraded" ? 503 : 200;
-      response.setHeader("content-type", "application/json; charset=utf-8");
-      response.end(
-        JSON.stringify({
-          ok: status.state === "running",
-          state: status.state,
-          startedAt: status.startedAt,
-          uptimeSec,
-          degradedReasons: status.degradedReasons,
-          healthUrl: this.healthUrl
-        })
-      );
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(port, host, () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-
-    const address = server.address();
-    if (address && typeof address === "object") {
-      this.healthUrl = `http://${host}:${address.port}${endpointPath}`;
-    } else {
-      this.healthUrl = `http://${host}:${port}${endpointPath}`;
-    }
-    this.healthServer = server;
+    await infrastructure.startHealthServer(this);
   }
 
   private async stopHealthServer(): Promise<void> {
-    const server = this.healthServer;
-    this.healthServer = null;
-    this.healthUrl = undefined;
-    if (!server) {
-      return;
-    }
-
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    await infrastructure.stopHealthServer(this);
   }
 
   private ensureObservabilityDirectory(): void {
-    if (!(this.config.observability?.enabled ?? false)) {
-      return;
-    }
-    ensureDirectory(this.observabilityDirectory);
+    infrastructure.ensureObservabilityDirectory(this);
   }
 
   private appendObservabilityRecord(
@@ -1254,34 +311,7 @@ export class GatewayRuntime {
     payload: unknown,
     featureEnabled?: boolean
   ): void {
-    if (!(this.config.observability?.enabled ?? false)) {
-      return;
-    }
-    if (featureEnabled === false) {
-      return;
-    }
-    try {
-      this.ensureObservabilityDirectory();
-      const entry = {
-        timestamp: nowIso(),
-        stream,
-        payload: summarizeForObservability(payload)
-      };
-      fs.appendFileSync(
-        path.join(this.observabilityDirectory, `${stream}.jsonl`),
-        `${JSON.stringify(entry)}\n`,
-        "utf8"
-      );
-    } catch (error) {
-      if (this.observabilityWriteFailed) {
-        return;
-      }
-      this.observabilityWriteFailed = true;
-      this.degradedReasons.push(
-        `Observability write failed: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
+    infrastructure.appendObservabilityRecord(this, stream, payload, featureEnabled);
   }
 
   private writeControlJson(
@@ -1289,798 +319,57 @@ export class GatewayRuntime {
     statusCode: number,
     payload: Record<string, unknown>
   ): void {
-    response.statusCode = statusCode;
-    response.setHeader("content-type", "application/json; charset=utf-8");
-    response.end(JSON.stringify(payload));
-  }
-
-  private controlAuthResult(
-    request: http.IncomingMessage,
-    isMutation: boolean
-  ): ControlAuthResult {
-    const allowLoopbackWithoutAuth = this.config.controlApi?.allowLoopbackWithoutAuth ?? false;
-    const remoteAddress = request.socket.remoteAddress;
-    if (allowLoopbackWithoutAuth && isLoopbackRemoteAddress(remoteAddress)) {
-      return {
-        ok: true,
-        scope: "admin",
-        mutationKey: `loopback:${remoteAddress ?? "unknown"}`
-      };
-    }
-
-    const adminToken = this.config.controlApi?.token?.trim();
-    const readToken = this.config.controlApi?.readToken?.trim();
-    const bearer = parseBearerToken(
-      typeof request.headers.authorization === "string"
-        ? request.headers.authorization
-        : Array.isArray(request.headers.authorization)
-          ? request.headers.authorization[0]
-          : undefined
-    );
-    if (!bearer) {
-      return {
-        ok: false,
-        statusCode: 401,
-        message: "Missing bearer token",
-        scope: "none"
-      };
-    }
-
-    let scope: ControlAuthScope = "none";
-    if (adminToken && bearer === adminToken) {
-      scope = "admin";
-    } else if (readToken && bearer === readToken) {
-      scope = "read";
-    }
-
-    if (scope === "none") {
-      return {
-        ok: false,
-        statusCode: 401,
-        message: "Invalid bearer token",
-        scope: "none"
-      };
-    }
-    if (isMutation && scope !== "admin") {
-      return {
-        ok: false,
-        statusCode: 403,
-        message: "Mutation scope requires admin token",
-        scope
-      };
-    }
-    return {
-      ok: true,
-      scope,
-      mutationKey: `${scope}:${remoteAddress ?? "unknown"}:${bearer.slice(0, 12)}`
-    };
-  }
-
-  private consumeControlMutationBudget(key: string): boolean {
-    const limit = this.config.controlApi?.mutationRateLimitPerMinute ?? 60;
-    if (limit <= 0) {
-      return true;
-    }
-    const now = Date.now();
-    const earliest = now - 60_000;
-    const bucket = (this.controlMutationBuckets.get(key) ?? []).filter((timestamp) => timestamp >= earliest);
-    if (bucket.length >= limit) {
-      this.controlMutationBuckets.set(key, bucket);
-      return false;
-    }
-    bucket.push(now);
-    this.controlMutationBuckets.set(key, bucket);
-    return true;
-  }
-
-  private startControlEventStream(
-    request: http.IncomingMessage,
-    response: http.ServerResponse
-  ): void {
-    response.statusCode = 200;
-    response.setHeader("content-type", "text/event-stream; charset=utf-8");
-    response.setHeader("cache-control", "no-cache, no-transform");
-    response.setHeader("connection", "keep-alive");
-    response.setHeader("x-accel-buffering", "no");
-    response.flushHeaders?.();
-
-    const snapshot = {
-      status: this.getStatus(),
-      events: this.listRuntimeEvents(100)
-    };
-    response.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`);
-    this.controlEventStreams.add(response);
-
-    const ping = setInterval(() => {
-      if (!this.controlEventStreams.has(response)) {
-        clearInterval(ping);
-        return;
-      }
-      try {
-        response.write(": keepalive\n\n");
-      } catch {
-        this.controlEventStreams.delete(response);
-        clearInterval(ping);
-      }
-    }, CONTROL_EVENT_STREAM_PING_MS);
-
-    const onClose = () => {
-      clearInterval(ping);
-      this.controlEventStreams.delete(response);
-    };
-    request.on("close", onClose);
-    response.on("close", onClose);
-    response.on("error", onClose);
+    infrastructure.writeControlJson(this, response, statusCode, payload);
   }
 
   private broadcastControlRuntimeEvent(event: GatewayRuntimeEvent): void {
-    if (this.controlEventStreams.size === 0) {
-      return;
-    }
-    const sequence = ++this.controlEventSequence;
-    const frame = `id: ${sequence}\nevent: runtime\ndata: ${JSON.stringify(event)}\n\n`;
-    for (const stream of Array.from(this.controlEventStreams)) {
-      try {
-        stream.write(frame);
-      } catch {
-        this.controlEventStreams.delete(stream);
-      }
-    }
+    controlApi.broadcastControlRuntimeEvent(this, event);
   }
 
   private async handleControlRequest(
     request: http.IncomingMessage,
     response: http.ServerResponse
   ): Promise<void> {
-    const basePath = "/control/v1";
-    const method = (request.method ?? "GET").toUpperCase();
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
-    const pathname = url.pathname;
-    const isMutation = method !== "GET" && method !== "HEAD";
-    const auth = this.controlAuthResult(request, isMutation);
-    if (!auth.ok) {
-      this.writeControlJson(response, auth.statusCode ?? 401, {
-        ok: false,
-        error: auth.message ?? "unauthorized"
-      });
-      return;
-    }
-
-    if (isMutation && auth.mutationKey && !this.consumeControlMutationBudget(auth.mutationKey)) {
-      this.writeControlJson(response, 429, {
-        ok: false,
-        error: "mutation_rate_limited"
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/events`) {
-      this.startControlEventStream(request, response);
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/status`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        status: this.getStatus(),
-        loadedTools: this.listLoadedToolNames(),
-        sessions: this.listSessionSnapshots().length,
-        channels: this.listChannelAdapterIds(),
-        continuity: this.listContinuityJobs(20),
-        providerRoutes: this.listProviderRoutes(),
-        orchestrationLanes: this.listOrchestrationLaneStatuses(),
-        retention: this.getSessionRetentionStatus()
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/sessions`) {
-      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
-      const limit = Number.isFinite(requestedLimit)
-        ? Math.max(1, Math.min(200, requestedLimit))
-        : 50;
-      this.writeControlJson(response, 200, {
-        ok: true,
-        sessions: this.listSessionSnapshots().slice(0, limit),
-        total: this.listSessionSnapshots().length
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/sessions/retention`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        retention: this.getSessionRetentionStatus()
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/orchestration/lanes`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        lanes: this.listOrchestrationLaneStatuses()
-      });
-      return;
-    }
-
-    const sessionDetailMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)$/);
-    if (method === "GET" && sessionDetailMatch) {
-      const sessionId = decodeURIComponent(sessionDetailMatch[1] ?? "");
-      const record = this.exportSession(sessionId);
-      if (!record) {
-        this.writeControlJson(response, 404, {
-          ok: false,
-          error: "session_not_found",
-          sessionId
-        });
-        return;
-      }
-      this.writeControlJson(response, 200, {
-        ok: true,
-        session: record
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/providers/status`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        providerProfiles: this.listProviderProfiles(),
-        providerDiagnostics: this.providerDiagnostics,
-        failover: this.getProviderFailoverStatus(),
-        routes: this.listProviderRoutes()
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/plugins/status`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        plugins: this.pluginRuntime?.getStatus() ?? {
-          enabled: false,
-          loaded: [],
-          blocked: [],
-          runtimeErrors: []
-        }
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/skills`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        skills: {
-          status: this.skillRuntime?.getStatus() ?? {
-            enabled: false,
-            roots: [],
-            discovered: 0,
-            allowed: 0,
-            blocked: [],
-            injectionMode: "off",
-            maxInjected: 0
-          },
-          allowed: this.skillRuntime?.listAllowed() ?? [],
-          blocked: this.skillRuntime?.listBlocked() ?? []
-        }
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/subagents/jobs`) {
-      const sessionId = url.searchParams.get("sessionId") ?? undefined;
-      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
-      const limit = Number.isFinite(requestedLimit)
-        ? Math.max(1, Math.min(500, requestedLimit))
-        : 50;
-      const jobs = this.listSubagentJobs({
-        sessionId: sessionId?.trim() || undefined,
-        limit
-      });
-      this.writeControlJson(response, 200, {
-        ok: true,
-        jobs,
-        total: jobs.length
-      });
-      return;
-    }
-
-    const subagentJobMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)$/);
-    if (method === "GET" && subagentJobMatch) {
-      const jobId = decodeURIComponent(subagentJobMatch[1] ?? "");
-      const job = this.getSubagentJob(jobId);
-      if (!job) {
-        this.writeControlJson(response, 404, {
-          ok: false,
-          error: "subagent_job_not_found",
-          jobId
-        });
-        return;
-      }
-      this.writeControlJson(response, 200, {
-        ok: true,
-        job
-      });
-      return;
-    }
-
-    const subagentLogsMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)\/logs$/);
-    if (method === "GET" && subagentLogsMatch) {
-      const jobId = decodeURIComponent(subagentLogsMatch[1] ?? "");
-      const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
-      const limit = Number.isFinite(requestedLimit)
-        ? Math.max(1, Math.min(1000, requestedLimit))
-        : 200;
-      const logs = this.readSubagentLogs(jobId, limit);
-      this.writeControlJson(response, 200, {
-        ok: true,
-        jobId,
-        logs
-      });
-      return;
-    }
-
-    if (method === "GET" && pathname === `${basePath}/optional/status`) {
-      this.writeControlJson(response, 200, {
-        ok: true,
-        modules: this.optionalModuleRuntime?.doctor() ?? []
-      });
-      return;
-    }
-
-    let bodyText = "";
-    let body: Record<string, unknown> = {};
-    if (isMutation) {
-      try {
-        bodyText = await readControlRequestBody(request);
-      } catch (error) {
-        this.writeControlJson(response, 413, {
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        return;
-      }
-      if (bodyText.trim().length > 0) {
-        try {
-          const parsed = JSON.parse(bodyText);
-          if (parsed && typeof parsed === "object") {
-            body = parsed as Record<string, unknown>;
-          } else {
-            this.writeControlJson(response, 400, {
-              ok: false,
-              error: "JSON body must be an object"
-            });
-            return;
-          }
-        } catch (error) {
-          this.writeControlJson(response, 400, {
-            ok: false,
-            error: error instanceof Error ? error.message : "Invalid JSON"
-          });
-          return;
-        }
-      }
-    }
-
-    if (method === "POST" && pathname === `${basePath}/sessions`) {
-      const channel = typeof body.channel === "string" ? body.channel : undefined;
-      const title = typeof body.title === "string" ? body.title : undefined;
-      const fromSessionId = typeof body.fromSessionId === "string" ? body.fromSessionId : undefined;
-      const providerRouteId = typeof body.providerRouteId === "string" ? body.providerRouteId.trim() : "";
-      const sessionId = this.createSession({
-        channel,
-        title,
-        fromSessionId
-      });
-      if (providerRouteId) {
-        this.setSessionProviderRoute(sessionId, providerRouteId);
-      }
-      this.writeControlJson(response, 200, {
-        ok: true,
-        sessionId
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/sessions/prune`) {
-      const policyOverride =
-        body.policy && typeof body.policy === "object"
-          ? (body.policy as SessionStoreConfig["retention"])
-          : undefined;
-      const prune = this.pruneSessions({
-        dryRun: body.dryRun === true,
-        policyOverride
-      });
-      this.writeControlJson(response, 200, {
-        ok: true,
-        prune
-      });
-      return;
-    }
-
-    const switchMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/switch$/);
-    if (method === "POST" && switchMatch) {
-      const targetSessionId = decodeURIComponent(switchMatch[1] ?? "");
-      const identityRaw = body.identity;
-      if (!identityRaw || typeof identityRaw !== "object") {
-        this.writeControlJson(response, 400, {
-          ok: false,
-          error: "identity object is required"
-        });
-        return;
-      }
-      const identityRecord = identityRaw as Record<string, unknown>;
-      if (typeof identityRecord.channel !== "string") {
-        this.writeControlJson(response, 400, {
-          ok: false,
-          error: "identity.channel is required"
-        });
-        return;
-      }
-      const switchResult = this.switchChannelSession({
-        identity: {
-          channel: identityRecord.channel,
-          workspaceId:
-            typeof identityRecord.workspaceId === "string" ? identityRecord.workspaceId : undefined,
-          chatId: typeof identityRecord.chatId === "string" ? identityRecord.chatId : undefined,
-          userId: typeof identityRecord.userId === "string" ? identityRecord.userId : undefined,
-          threadId: typeof identityRecord.threadId === "string" ? identityRecord.threadId : undefined
-        },
-        mapping:
-          body.mapping && typeof body.mapping === "object"
-            ? (body.mapping as ChannelSessionMappingOptions)
-            : undefined,
-        sessionId: targetSessionId,
-        title: typeof body.title === "string" ? body.title : undefined
-      });
-      this.writeControlJson(response, switchResult.ok ? 200 : 400, {
-        ok: switchResult.ok,
-        message: switchResult.message,
-        sessionId: switchResult.sessionId
-      });
-      return;
-    }
-
-    const routeMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/route$/);
-    if (method === "POST" && routeMatch) {
-      const targetSessionId = decodeURIComponent(routeMatch[1] ?? "");
-      const routeId = typeof body.routeId === "string" ? body.routeId : "";
-      const result = this.setSessionProviderRoute(targetSessionId, routeId);
-      this.writeControlJson(response, result.ok ? 200 : 400, {
-        ok: result.ok,
-        message: result.message,
-        sessionId: result.sessionId
-      });
-      return;
-    }
-
-    const sessionSkillsMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/skills$/);
-    if (method === "POST" && sessionSkillsMatch) {
-      const targetSessionId = decodeURIComponent(sessionSkillsMatch[1] ?? "");
-      const hasMode = Object.prototype.hasOwnProperty.call(body, "injectionMode");
-      let requestedMode: SkillInjectionMode | undefined;
-      if (hasMode) {
-        if (body.injectionMode === null) {
-          requestedMode = undefined;
-        } else if (
-          body.injectionMode === "off" ||
-          body.injectionMode === "all" ||
-          body.injectionMode === "relevant"
-        ) {
-          requestedMode = body.injectionMode;
-        } else {
-          this.writeControlJson(response, 400, {
-            ok: false,
-            error: "injectionMode must be one of off|all|relevant|null"
-          });
-          return;
-        }
-      }
-      const result = this.setSessionSkillInjectionMode(targetSessionId, requestedMode);
-      this.writeControlJson(response, result.ok ? 200 : 400, {
-        ok: result.ok,
-        message: result.message,
-        sessionId: result.sessionId,
-        injectionMode: result.ok ? this.getSessionSkillInjectionMode(targetSessionId) : undefined
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/subagents/start`) {
-      if (!this.subagentManager) {
-        this.writeControlJson(response, 400, {
-          ok: false,
-          error: "subagents_disabled"
-        });
-        return;
-      }
-      const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
-      const input = typeof body.input === "string" ? body.input : "";
-      const providerId = typeof body.providerId === "string" ? body.providerId : undefined;
-      const timeoutMs = typeof body.timeoutMs === "number" ? body.timeoutMs : undefined;
-      const started = this.subagentManager.startJob({
-        sessionId,
-        input,
-        providerId,
-        timeoutMs
-      });
-      this.writeControlJson(response, started.ok ? 200 : 400, {
-        ok: started.ok,
-        message: started.message,
-        job: started.job
-      });
-      return;
-    }
-
-    const subagentCancelMatch = pathname.match(/^\/control\/v1\/subagents\/jobs\/([^/]+)\/cancel$/);
-    if (method === "POST" && subagentCancelMatch) {
-      const jobId = decodeURIComponent(subagentCancelMatch[1] ?? "");
-      const cancelled = this.cancelSubagentJob(jobId);
-      this.writeControlJson(response, cancelled.ok ? 200 : 400, {
-        ok: cancelled.ok,
-        message: cancelled.message,
-        job: cancelled.job
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/backup/create`) {
-      const outputDirectory = typeof body.outputDirectory === "string" ? body.outputDirectory : undefined;
-      const created = this.optionalModuleRuntime?.createBackup({
-        outputDirectory
-      }) ?? {
-        ok: false,
-        message: "Optional modules runtime unavailable"
-      };
-      this.writeControlJson(response, created.ok ? 200 : 400, {
-        ok: created.ok,
-        message: created.message,
-        backupPath: created.backupPath
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/backup/restore`) {
-      const backupPath = typeof body.backupPath === "string" ? body.backupPath : "";
-      const restored = this.optionalModuleRuntime?.restoreBackup({
-        backupPath
-      }) ?? {
-        ok: false,
-        message: "Optional modules runtime unavailable"
-      };
-      this.writeControlJson(response, restored.ok ? 200 : 400, {
-        ok: restored.ok,
-        message: restored.message
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/chat/send`) {
-      const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
-      const input = typeof body.input === "string" ? body.input : "";
-      if (!sessionId || !input) {
-        this.writeControlJson(response, 400, {
-          ok: false,
-          error: "sessionId and input are required"
-        });
-        return;
-      }
-      const includeEvents = body.includeEvents === true;
-      const events: unknown[] = [];
-      this.ensureSession(sessionId);
-      await this.runSessionTurn({
-        sessionId,
-        input,
-        onEvent: (event) => {
-          if (includeEvents) {
-            events.push(event);
-          }
-        }
-      });
-      const history = this.getSessionHistory(sessionId);
-      const responseText =
-        history
-          .filter((message) => message.role === "assistant")
-          .at(-1)?.content ?? "";
-      const sessionState = this.getSessionState(sessionId);
-      this.writeControlJson(response, 200, {
-        ok: true,
-        sessionId,
-        providerId: sessionState?.activeProviderId,
-        response: responseText,
-        events: includeEvents ? events : undefined
-      });
-      return;
-    }
-
-    if (method === "POST" && pathname === `${basePath}/runtime/restart`) {
-      const restart = await this.requestRestart({
-        intent:
-          body.intent === "manual" ||
-          body.intent === "self_mod" ||
-          body.intent === "config_change" ||
-          body.intent === "signal"
-            ? body.intent
-            : undefined,
-        reason: typeof body.reason === "string" ? body.reason : undefined,
-        sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
-        providerId: typeof body.providerId === "string" ? body.providerId : undefined,
-        dryRun: body.dryRun === true
-      });
-      if (restart && typeof restart === "object" && "ok" in restart) {
-        this.writeControlJson(response, restart.ok ? 200 : 400, {
-          ok: restart.ok,
-          code: restart.code,
-          message: restart.message,
-          intent: restart.intent,
-          dryRun: restart.dryRun
-        });
-      } else {
-        this.writeControlJson(response, 202, {
-          ok: true,
-          message: "restart_triggered"
-        });
-      }
-      return;
-    }
-
-    this.writeControlJson(response, 404, {
-      ok: false,
-      error: "not_found"
-    });
+    await controlApi.handleControlRequest(this, request, response);
   }
 
   private async startControlServer(): Promise<void> {
-    if (this.controlServer) {
-      return;
-    }
-
-    const enabled = this.config.controlApi?.enabled ?? false;
-    if (!enabled) {
-      this.controlUrl = undefined;
-      return;
-    }
-
-    const host = this.config.controlApi?.host?.trim() || "127.0.0.1";
-    const port = this.config.controlApi?.port ?? 8788;
-    const basePath = "/control/v1";
-
-    const server = http.createServer((request, response) => {
-      void this.handleControlRequest(request, response).catch((error) => {
-        this.writeControlJson(response, 500, {
-          ok: false,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(port, host, () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-
-    const address = server.address();
-    if (address && typeof address === "object") {
-      this.controlUrl = `http://${host}:${address.port}${basePath}`;
-    } else {
-      this.controlUrl = `http://${host}:${port}${basePath}`;
-    }
-    this.controlServer = server;
+    await controlApi.startControlServer(this);
   }
 
   private async stopControlServer(): Promise<void> {
-    for (const stream of this.controlEventStreams) {
-      try {
-        stream.end();
-      } catch {
-        // noop
-      }
-    }
-    this.controlEventStreams.clear();
-    this.controlMutationBuckets.clear();
-
-    const server = this.controlServer;
-    this.controlServer = null;
-    this.controlUrl = undefined;
-    if (!server) {
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      server.close(() => resolve());
-    });
+    await controlApi.stopControlServer(this);
   }
 
   private sessionLockOptions(): { timeoutMs?: number; staleMs?: number } {
-    return {
-      timeoutMs: this.config.sessionStore?.lock?.timeoutMs,
-      staleMs: this.config.sessionStore?.lock?.staleMs
-    };
+    return runtimeCore.sessionLockOptions(this);
   }
 
   private runtimeContext(): { workspaceDir: string; toolDirectory: string; mutableRoots: string[] } {
-    return {
-      workspaceDir: this.workspaceDir,
-      toolDirectory: this.toolDirectory,
-      mutableRoots: [...this.mutableRoots]
-    };
+    return runtimeCore.runtimeContext(this);
   }
 
   private channelContext(): ChannelAdapterContext {
-    return {
-      runTurn: async (request) => await this.runChannelTurn(request),
-      dispatchCommand: async (request) => await this.dispatchChannelCommandRequest(request)
-    };
+    return runtimeCore.channelContext(this);
   }
 
   private configuredSkillMode(): SkillInjectionMode {
-    const mode = this.config.skills?.injectionMode;
-    if (mode === "all" || mode === "relevant") {
-      return mode;
-    }
-    return "off";
+    return runtimeCore.configuredSkillMode(this);
   }
 
   private skillModeForSession(sessionId: string): SkillInjectionMode {
-    const override = this.sessionSkillInjectionOverrides.get(sessionId);
-    if (override) {
-      return override;
-    }
-    const metadataMode = this.getSessionState(sessionId)?.metadata?.skillInjectionMode;
-    if (metadataMode === "off" || metadataMode === "all" || metadataMode === "relevant") {
-      return metadataMode;
-    }
-    return this.configuredSkillMode();
+    return runtimeCore.skillModeForSession(this, sessionId);
   }
 
   setSessionSkillInjectionMode(
     sessionId: string,
     mode?: SkillInjectionMode
   ): SessionMutationResult {
-    const normalizedSessionId = sessionId.trim();
-    if (!normalizedSessionId) {
-      return {
-        ok: false,
-        message: "sessionId is required"
-      };
-    }
-    if (!this.sessionExists(normalizedSessionId)) {
-      return {
-        ok: false,
-        message: `Unknown session: ${normalizedSessionId}`
-      };
-    }
-    this.ensureSession(normalizedSessionId);
-    if (mode !== undefined && mode !== "off" && mode !== "all" && mode !== "relevant") {
-      return {
-        ok: false,
-        message: `Invalid skill injection mode: ${String(mode)}`
-      };
-    }
-
-    if (mode) {
-      this.sessionSkillInjectionOverrides.set(normalizedSessionId, mode);
-    } else {
-      this.sessionSkillInjectionOverrides.delete(normalizedSessionId);
-    }
-
-    const manager = this.ensureProviderManager();
-    manager?.updateSessionMetadata(normalizedSessionId, {
-      skillInjectionMode: mode
-    });
-    this.persistSessionState(normalizedSessionId);
-    return {
-      ok: true,
-      message: mode
-        ? `Session ${normalizedSessionId} skill injection mode set to ${mode}`
-        : `Session ${normalizedSessionId} skill injection mode cleared`,
-      sessionId: normalizedSessionId
-    };
+    return runtimeCore.setSessionSkillInjectionMode(this, sessionId, mode);
   }
 
   getSessionSkillInjectionMode(sessionId: string): SkillInjectionMode {
-    return this.skillModeForSession(sessionId);
+    return runtimeCore.getSessionSkillInjectionMode(this, sessionId);
   }
 
   private applySkillInjection(sessionId: string, input: string): {
@@ -2088,962 +377,77 @@ export class GatewayRuntime {
     mode: SkillInjectionMode;
     skillIds: string[];
   } {
-    const runtime = this.skillRuntime;
-    if (!runtime) {
-      return {
-        input,
-        mode: "off",
-        skillIds: []
-      };
-    }
-    const mode = this.skillModeForSession(sessionId);
-    const plan = runtime.buildInjectionPlan({
-      input,
-      mode
-    });
-    const skillIds = plan.selected.map((entry) => entry.skill.id);
-    if (!plan.text || skillIds.length === 0) {
-      return {
-        input,
-        mode: plan.mode,
-        skillIds
-      };
-    }
-    const injectedInput = `${plan.text}\n\n[USER REQUEST]\n${input}`;
-    return {
-      input: injectedInput,
-      mode: plan.mode,
-      skillIds
-    };
+    return runtimeCore.applySkillInjection(this, sessionId, input);
   }
 
   private createSubagentManager(): SubagentManager | null {
-    if (!(this.config.subagents?.enabled ?? false)) {
-      return null;
-    }
-    return new SubagentManager({
-      workspaceDir: this.workspaceDir,
-      config: this.config.subagents,
-      runtime: {
-        runDelegatedTurn: async (params) => {
-          this.ensureSession(params.subSessionId, {
-            title: `Subagent ${params.jobId}`,
-            origin: {
-              channel: "subagent",
-              threadId: params.sessionId
-            }
-          });
-          if (params.providerId) {
-            try {
-              this.queueSessionProviderSwitch(params.subSessionId, params.providerId);
-            } catch {
-              // provider override is best-effort for delegated run
-            }
-          }
-          await this.runSessionTurn({
-            sessionId: params.subSessionId,
-            input: params.input,
-            onEvent: () => undefined,
-            signal: params.signal
-          });
-          const response =
-            this.getSessionHistory(params.subSessionId)
-              .filter((message) => message.role === "assistant")
-              .at(-1)?.content ?? "";
-          return {
-            response
-          };
-        },
-        onStatusChange: (job) => {
-          const statusEventType = (() => {
-            if (job.status === "queued") {
-              return "subagent.job.queued";
-            }
-            if (job.status === "running") {
-              return "subagent.job.running";
-            }
-            if (job.status === "completed") {
-              return "subagent.job.completed";
-            }
-            if (job.status === "cancelled") {
-              return "subagent.job.cancelled";
-            }
-            if (job.status === "timed_out") {
-              return "subagent.job.timed_out";
-            }
-            return "subagent.job.failed";
-          })();
-          this.emitRuntimeEvent(statusEventType, {
-            jobId: job.jobId,
-            sessionId: job.sessionId,
-            status: job.status,
-            subSessionId: job.subSessionId,
-            error: job.error
-          });
-          this.appendSessionEvent(job.sessionId, "subagent.status", {
-            jobId: job.jobId,
-            status: job.status,
-            subSessionId: job.subSessionId,
-            error: job.error
-          });
-        }
-      }
-    });
+    return lifecycle.createSubagentManager(this);
   }
 
   listSubagentJobs(params?: { sessionId?: string; limit?: number }): SubagentJobRecord[] {
-    if (!this.subagentManager) {
-      return [];
-    }
-    return this.subagentManager.listJobs(params);
+    return runtimeCore.listSubagentJobs(this, params);
   }
 
   getSubagentJob(jobId: string): SubagentJobRecord | null {
-    return this.subagentManager?.getJob(jobId) ?? null;
+    return runtimeCore.getSubagentJob(this, jobId);
   }
 
   cancelSubagentJob(jobId: string): { ok: boolean; message: string; job?: SubagentJobRecord } {
-    if (!this.subagentManager) {
-      return {
-        ok: false,
-        message: "Subagent runtime is disabled"
-      };
-    }
-    return this.subagentManager.cancelJob(jobId);
+    return runtimeCore.cancelSubagentJob(this, jobId);
   }
 
   readSubagentLogs(jobId: string, limit = 200): SubagentLogRecord[] {
-    if (!this.subagentManager) {
-      return [];
-    }
-    return this.subagentManager.readJobLogs(jobId, limit);
+    return runtimeCore.readSubagentLogs(this, jobId, limit);
   }
 
   private async dispatchChannelCommandRequest(
     request: ChannelCommandRequest
   ): Promise<ChannelCommandResult> {
-    const sessionId = this.resolveChannelSession({
-      identity: request.identity,
-      mapping: request.mapping
-    });
-    const result = await dispatchChannelCommand(
-      this,
-      {
-        sessionId,
-        identity: request.identity,
-        mapping: request.mapping
-      },
-      request.input
-    );
-    return result;
+    return await lifecycle.dispatchChannelCommandRequest(this, request);
   }
 
   private scheduleSessionContinuity(fromSessionId: string, toSessionId: string): void {
-    if (!this.sessionStoreEnabled || !this.continuityRuntime) {
-      return;
-    }
-    const from = fromSessionId.trim();
-    const to = toSessionId.trim();
-    if (!from || !to || from === to) {
-      return;
-    }
-    const job = this.continuityRuntime.schedule({
-      fromSessionId: from,
-      toSessionId: to
-    });
-    if (!job) {
-      return;
-    }
-    this.appendSessionEvent(to, "continuity.queued", {
-      jobId: job.jobId,
-      fromSessionId: from,
-      toSessionId: to
-    });
-    this.emitRuntimeEvent("gateway.degraded", {
-      reason: "session_continuity_queued",
-      jobId: job.jobId,
-      fromSessionId: from,
-      toSessionId: to
-    });
+    lifecycle.scheduleSessionContinuity(this, fromSessionId, toSessionId);
   }
 
   private async connectChannels(): Promise<void> {
-    if (this.channelAdapters.size === 0) {
-      return;
-    }
-    const context = this.channelContext();
-    for (const adapter of this.channelAdapters.values()) {
-      try {
-        await adapter.connect(context);
-        this.emitRuntimeEvent("channel.connected", {
-          channelId: adapter.id
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.degradedReasons.push(`Channel ${adapter.id} failed to connect: ${message}`);
-        this.emitRuntimeEvent("channel.connection_failed", {
-          channelId: adapter.id,
-          message
-        });
-      }
-    }
+    await lifecycle.connectChannels(this);
   }
 
   private async disconnectChannels(): Promise<void> {
-    if (this.channelAdapters.size === 0) {
-      return;
-    }
-    for (const adapter of this.channelAdapters.values()) {
-      if (!adapter.disconnect) {
-        continue;
-      }
-      try {
-        await adapter.disconnect();
-        this.emitRuntimeEvent("channel.disconnected", {
-          channelId: adapter.id
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.degradedReasons.push(`Channel ${adapter.id} failed to disconnect: ${message}`);
-      }
-    }
+    await lifecycle.disconnectChannels(this);
   }
 
   private async loadConfiguredAgentDefinition(): Promise<void> {
-    this.agentDefinition = null;
-    if (!this.agentEntryPath) {
-      return;
-    }
-    if (!fs.existsSync(this.agentEntryPath)) {
-      const message = `Agent entry file not found: ${this.agentEntryPath}`;
-      this.degradedReasons.push(message);
-      this.emitRuntimeEvent("gateway.agent.failed", {
-        entryPath: this.agentEntryPath,
-        message
-      });
-      return;
-    }
-
-    const loaded = await loadAgentDefinition(this.agentEntryPath);
-    if (!loaded.ok || !loaded.agent) {
-      const message = `Failed to load agent entry ${this.agentEntryPath}: ${loaded.message ?? "unknown error"}`;
-      this.degradedReasons.push(message);
-      this.emitRuntimeEvent("gateway.agent.failed", {
-        entryPath: this.agentEntryPath,
-        message: loaded.message ?? "unknown error"
-      });
-      return;
-    }
-
-    this.agentDefinition = loaded.agent;
-    this.emitRuntimeEvent("gateway.agent.loaded", {
-      entryPath: this.agentEntryPath,
-      name: loaded.agent.name
-    });
+    await lifecycle.loadConfiguredAgentDefinition(this);
   }
 
   private buildBootToolList(): ToolDefinition[] {
-    const subagentEnabled = Boolean(this.subagentManager);
-    const builtInTools =
-      this.config.builtInTools ??
-      createDefaultBuiltInTools({
-        shellPolicy: this.config.shell,
-        agent: {
-          requestRestart: async (request) => {
-            return await this.requestRestart({
-              intent: restartIntent(request?.intent),
-              reason: request?.reason,
-              sessionId: request?.sessionId,
-              providerId: request?.providerId,
-              dryRun: request?.dryRun
-            });
-          },
-          readStatus: () => this.getStatus(),
-          listLoadedToolNames: () => this.listLoadedToolNames(),
-          listSessionSnapshots: () => this.listSessionSnapshots(),
-          startSubagent: subagentEnabled
-            ? (params) => this.subagentManager!.startJob(params)
-            : undefined,
-          pollSubagent: subagentEnabled
-            ? (jobId) => this.subagentManager!.getJob(jobId)
-            : undefined,
-          listSubagents: subagentEnabled
-            ? (params) => this.subagentManager!.listJobs(params)
-            : undefined,
-          cancelSubagent: subagentEnabled
-            ? (jobId) => this.subagentManager!.cancelJob(jobId)
-            : undefined,
-          readSubagentLogs: subagentEnabled
-            ? (jobId, limit) => this.subagentManager!.readJobLogs(jobId, limit)
-            : undefined
-        }
-      });
-
-    const names = new Set<string>();
-    const merged: ToolDefinition[] = [];
-    for (const tool of builtInTools) {
-      merged.push(tool);
-      names.add(tool.name);
-    }
-
-    for (const pluginTools of this.pluginRuntime?.listTools() ?? []) {
-      for (const tool of pluginTools.tools ?? []) {
-        const normalizedName = tool.name.trim();
-        if (names.has(normalizedName)) {
-          this.degradedReasons.push(
-            `Plugin tool "${normalizedName}" from ${pluginTools.pluginId} collides with existing tool name and was skipped`
-          );
-          continue;
-        }
-        names.add(normalizedName);
-        merged.push(tool);
-      }
-    }
-
-    if (!this.agentDefinition?.tools || this.agentDefinition.tools.length === 0) {
-      return merged;
-    }
-
-    for (const agentTool of this.agentDefinition.tools) {
-      const normalizedName = agentTool.name.trim();
-      if (names.has(normalizedName)) {
-        this.degradedReasons.push(
-          `Agent tool "${normalizedName}" collides with existing tool name and was skipped`
-        );
-        continue;
-      }
-      names.add(normalizedName);
-      merged.push(agentTool);
-    }
-
-    return merged;
-  }
-
-  private applySessionHistoryBudget(sessionId: string, history: ChatMessage[]): ChatMessage[] {
-    const policy = this.config.sessionStore?.history;
-    const trimmed = applySessionHistoryBudget({
-      sessionId,
-      history,
-      policy
-    });
-    if (trimmed.trimmed) {
-      this.emitRuntimeEvent("gateway.degraded", {
-        reason: "session_history_trimmed",
-        sessionId,
-        droppedMessages: trimmed.droppedMessages,
-        droppedCharacters: trimmed.droppedCharacters
-      });
-    }
-    return trimmed.history;
-  }
-
-  private restoreSessionState(sessionId: string): void {
-    if (!this.sessionStoreEnabled) {
-      return;
-    }
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return;
-    }
-    const loaded = loadSessionRecordWithDiagnostics(this.sessionDirectory, sessionId);
-    if (loaded.diagnostics && loaded.diagnostics.length > 0) {
-      for (const diagnostic of loaded.diagnostics) {
-        this.degradedReasons.push(
-          `Session ${sessionId} ${diagnostic.code}: ${diagnostic.message}${diagnostic.quarantinedPath ? ` (${diagnostic.quarantinedPath})` : ""}`
-        );
-      }
-      this.state = "degraded";
-    }
-    if (!loaded.record) {
-      return;
-    }
-
-    manager.hydrateSession({
-      sessionId,
-      history: loaded.record.history,
-      activeProviderId: loaded.record.activeProviderId,
-      pendingProviderId: loaded.record.pendingProviderId,
-      metadata: loaded.record.metadata
-    });
-    if (loaded.record.metadata.providerRouteId) {
-      this.sessionProviderRouteOverrides.set(sessionId, loaded.record.metadata.providerRouteId);
-    }
-    if (
-      loaded.record.metadata.skillInjectionMode === "off" ||
-      loaded.record.metadata.skillInjectionMode === "all" ||
-      loaded.record.metadata.skillInjectionMode === "relevant"
-    ) {
-      this.sessionSkillInjectionOverrides.set(sessionId, loaded.record.metadata.skillInjectionMode);
-    }
+    return lifecycle.buildBootToolList(this);
   }
 
   private persistSessionState(sessionId: string): void {
-    if (!this.sessionStoreEnabled) {
-      return;
-    }
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return;
-    }
-    const session = manager.getSession(sessionId);
-    if (!session) {
-      return;
-    }
-
-    session.history = this.applySessionHistoryBudget(sessionId, session.history);
-    session.metadata.lastActivityAt = nowIso();
-
-    saveSessionRecord({
-      sessionDirectory: this.sessionDirectory,
-      sessionId,
-      activeProviderId: session.activeProviderId,
-      pendingProviderId: session.pendingProviderId,
-      history: session.history,
-      metadata: session.metadata,
-      lock: this.sessionLockOptions()
-    });
-    try {
-      this.enforceSessionRetention();
-    } catch (error) {
-      this.degradedReasons.push(
-        `Session retention enforcement failed: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
+    sessionRuntime.persistSessionState(this, sessionId);
   }
 
   private appendSessionEvent(sessionId: string, eventType: string, payload: unknown): void {
-    if (!this.sessionStoreEnabled) {
-      return;
-    }
-    try {
-      appendSessionEventRecord({
-        sessionDirectory: this.sessionDirectory,
-        sessionId,
-        eventType,
-        payload,
-        timestamp: nowIso(),
-        lock: this.sessionLockOptions()
-      });
-    } catch (error) {
-      this.degradedReasons.push(
-        `Failed to append session event for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
+    sessionRuntime.appendSessionEvent(this, sessionId, eventType, payload);
   }
 
   async start(): Promise<GatewayStatus> {
-    if (this.state === "running" || this.state === "degraded") {
-      return this.getStatus();
-    }
-    this.suppressOrchestrationPersistence = false;
-
-    this.emitRuntimeEvent("gateway.starting", {
-      workspaceDir: this.workspaceDir,
-      toolDirectory: this.toolDirectory,
-      agentEntryPath: this.agentEntryPath
-    });
-
-    ensureDirectory(this.workspaceDir);
-    ensureDirectory(this.toolDirectory);
-    ensureDirectory(path.dirname(this.restartHistoryPath));
-    if (this.sessionStoreEnabled) {
-      ensureDirectory(this.sessionDirectory);
-    }
-    this.degradedReasons = [];
-    this.providerDiagnostics = [];
-    this.ensureObservabilityDirectory();
-    this.loadRestartHistory();
-    this.restoreOrchestrationState();
-    await this.loadConfiguredAgentDefinition();
-    this.pluginRuntime =
-      this.config.plugins?.enabled === true
-        ? new PluginRuntime({
-            workspaceDir: this.workspaceDir,
-            context: this.runtimeContext(),
-            config: this.config.plugins
-          })
-        : null;
-    if (this.pluginRuntime) {
-      await this.pluginRuntime.load();
-      for (const blocked of this.pluginRuntime.getStatus().blocked) {
-        this.degradedReasons.push(
-          `Plugin blocked (${blocked.reason}) ${blocked.pluginId ?? blocked.modulePath}: ${blocked.message}`
-        );
-      }
-      for (const pluginChannels of this.pluginRuntime.listChannels()) {
-        for (const channel of pluginChannels.channels ?? []) {
-          try {
-            this.registerChannelAdapter(channel);
-          } catch (error) {
-            this.degradedReasons.push(
-              `Plugin ${pluginChannels.pluginId} channel registration failed (${channel.id}): ${error instanceof Error ? error.message : String(error)}`
-            );
-          }
-        }
-      }
-    }
-    this.skillRuntime =
-      this.config.skills?.enabled === true
-        ? new SkillRuntime({
-            workspaceDir: this.workspaceDir,
-            config: this.config.skills
-          })
-        : null;
-    this.skillRuntime?.refresh();
-    this.subagentManager = this.createSubagentManager();
-    this.optionalModuleRuntime = new OptionalModuleRuntime({
-      workspaceDir: this.workspaceDir,
-      config: this.config.optionalModules
-    });
-
-    const toolRegistryResult = await buildToolRegistry({
-      builtInTools: this.buildBootToolList(),
-      customToolsDirectory: this.toolDirectory
-    });
-
-    this._toolDiagnostics = toolRegistryResult.diagnostics;
-    this.toolRegistry = toolRegistryResult.tools;
-    if (toolRegistryResult.diagnostics.skipped.length > 0) {
-      this.degradedReasons.push(
-        `Skipped ${toolRegistryResult.diagnostics.skipped.length} invalid or conflicting custom tool(s)`
-      );
-    }
-
-    if (this.config.providers) {
-      this.ensureProviderManager();
-      this.validateProviderRoutes();
-      const probeEnabled = this.config.providers.startupProbe?.enabled ?? true;
-      if (probeEnabled && this.providerManager) {
-        const timeoutMs = this.config.providers.startupProbe?.timeoutMs ?? 10_000;
-        this.providerDiagnostics = await this.providerManager.probeAll({
-          authStore: this.authStore,
-          timeoutMs
-        });
-        const failed = this.providerDiagnostics.filter((entry) => !entry.ok);
-        if (failed.length > 0) {
-          this.degradedReasons.push(
-            `${failed.length} provider profile(s) failed startup capability probe`
-          );
-        }
-      }
-    }
-
-    try {
-      await this.startHealthServer();
-    } catch (error) {
-      this.degradedReasons.push(
-        `Health endpoint failed to start: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-    try {
-      await this.startControlServer();
-    } catch (error) {
-      this.degradedReasons.push(
-        `Control API failed to start: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-
-    if (this.agentDefinition?.hooks?.onStart) {
-      try {
-        await this.agentDefinition.hooks.onStart(this.runtimeContext());
-      } catch (error) {
-        this.degradedReasons.push(
-          `Agent onStart hook failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
-    if (this.pluginRuntime) {
-      await this.pluginRuntime.start();
-      for (const runtimeError of this.pluginRuntime.getStatus().runtimeErrors) {
-        this.degradedReasons.push(
-          `Plugin ${runtimeError.pluginId} ${runtimeError.phase} error: ${runtimeError.message}`
-        );
-      }
-    }
-    this.optionalModuleRuntime.start();
-    for (const status of this.optionalModuleRuntime.listStatuses()) {
-      if (status.enabled && !status.healthy) {
-        this.degradedReasons.push(`Optional module ${status.module} unhealthy: ${status.message}`);
-      }
-    }
-    this.subagentManager?.start();
-
-    await this.connectChannels();
-
-    await this.config.hooks?.onStart?.();
-
-    this.startedAt = nowIso();
-    this.state = this.degradedReasons.length > 0 ? "degraded" : "running";
-    this.emitRuntimeEvent("gateway.started", {
-      state: this.state,
-      startedAt: this.startedAt,
-      healthUrl: this.healthUrl,
-      controlUrl: this.controlUrl
-    });
-    if (this.degradedReasons.length > 0) {
-      this.emitRuntimeEvent("gateway.degraded", {
-        reasons: [...this.degradedReasons]
-      });
-    }
-    try {
-      this.enforceSessionRetention();
-    } catch (error) {
-      this.degradedReasons.push(
-        `Session retention enforcement failed at startup: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
-    return this.getStatus();
+    return await lifecycle.start(this);
   }
 
   async stop(): Promise<void> {
-    if (this.state === "stopped") {
-      return;
-    }
-    this.emitRuntimeEvent("gateway.stopping", {
-      state: this.state
-    });
-    if (this.shouldPersistOrchestrationState()) {
-      try {
-        this.writeOrchestrationState(this.persistedLaneStateSnapshot());
-      } catch (error) {
-        this.degradedReasons.push(
-          `Failed to persist orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
-        );
-        this.state = "degraded";
-      }
-    }
-    this.suppressOrchestrationPersistence = true;
-    await this.stopControlServer();
-    await this.stopHealthServer();
-    for (const lane of this.channelLanes.values()) {
-      if (lane.collectTimer) {
-        clearTimeout(lane.collectTimer);
-        lane.collectTimer = null;
-      }
-      lane.active?.controller.abort();
-      lane.active = null;
-      for (const queued of lane.queue.splice(0)) {
-        queued.reject(new Error("Gateway is stopping"));
-      }
-    }
-    this.channelLanes.clear();
-    await this.disconnectChannels();
-    await this.subagentManager?.stop();
-    this.optionalModuleRuntime?.stop();
-    if (this.pluginRuntime) {
-      await this.pluginRuntime.stop();
-    }
-    if (this.agentDefinition?.hooks?.onStop) {
-      try {
-        await this.agentDefinition.hooks.onStop(this.runtimeContext());
-      } catch (error) {
-        this.degradedReasons.push(
-          `Agent onStop hook failed: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    }
-    await this.config.hooks?.onShutdown?.();
-    this.subagentManager = null;
-    this.skillRuntime = null;
-    this.pluginRuntime = null;
-    this.optionalModuleRuntime = null;
-    this.state = "stopped";
-    this.emitRuntimeEvent("gateway.stopped", {
-      state: this.state
-    });
+    await lifecycle.stop(this);
   }
 
   async requestRestart(request: GatewayRestartRequest = {}): Promise<GatewayRestartResult | never | void> {
-    const context: GatewayRestartRequestContext = {
-      intent: restartIntent(request.intent),
-      reason: request.reason,
-      sessionId: request.sessionId,
-      providerId: request.providerId,
-      dryRun: request.dryRun ?? false,
-      timestamp: nowIso()
-    };
-
-    this.emitRuntimeEvent("gateway.restart.requested", {
-      intent: context.intent,
-      reason: context.reason,
-      sessionId: context.sessionId,
-      providerId: context.providerId,
-      dryRun: context.dryRun
-    });
-
-    const decision = await this.evaluateRestartPolicy(context);
-    if (!decision.ok) {
-      this.emitRuntimeEvent("gateway.restart.blocked", {
-        intent: context.intent,
-        code: decision.code,
-        message: decision.message,
-        dryRun: context.dryRun
-      });
-      return decision;
-    }
-
-    this.emitRuntimeEvent("gateway.restart.validated", {
-      intent: context.intent,
-      dryRun: context.dryRun
-    });
-
-    if (context.dryRun) {
-      return decision;
-    }
-
-    await this.config.hooks?.onRestart?.();
-
-    this.restartHistory.push({
-      timestamp: Date.now(),
-      intent: context.intent
-    });
-    this.saveRestartHistory();
-
-    this.emitRuntimeEvent("gateway.restart.executing", {
-      intent: context.intent,
-      reason: context.reason
-    });
-
-    await this.stop();
-    return this.exit(RESTART_EXIT_CODE);
+    return await restartConfig.requestRestart(this, request);
   }
 
   async reloadConfig(patch: Partial<GatewayConfig>): Promise<GatewayConfigReloadResult> {
-    const applied: string[] = [];
-    const rejected: GatewayConfigReloadRejection[] = [];
-
-    if (patch.workspaceDir !== undefined && patch.workspaceDir !== this.config.workspaceDir) {
-      rejected.push({
-        path: "workspaceDir",
-        reason: "restart_required",
-        message: "workspaceDir requires restart and full gateway re-bootstrap"
-      });
-    }
-    if (patch.toolDirectory !== undefined && patch.toolDirectory !== this.config.toolDirectory) {
-      rejected.push({
-        path: "toolDirectory",
-        reason: "restart_required",
-        message: "toolDirectory requires restart to rebuild tool registry"
-      });
-    }
-    if (patch.authStorePath !== undefined && patch.authStorePath !== this.config.authStorePath) {
-      rejected.push({
-        path: "authStorePath",
-        reason: "restart_required",
-        message: "authStorePath requires restart to safely reload auth context"
-      });
-    }
-    if (patch.builtInTools !== undefined) {
-      rejected.push({
-        path: "builtInTools",
-        reason: "restart_required",
-        message: "builtInTools cannot be hot-reloaded"
-      });
-    }
-    if (patch.shell !== undefined) {
-      rejected.push({
-        path: "shell",
-        reason: "restart_required",
-        message: "shell policy currently requires restart"
-      });
-    }
-    if (patch.sessionStore !== undefined) {
-      rejected.push({
-        path: "sessionStore",
-        reason: "restart_required",
-        message: "sessionStore configuration requires restart"
-      });
-    }
-    if (patch.providers && (patch.providers.profiles || patch.providers.defaultSessionProvider || patch.providers.adapters)) {
-      rejected.push({
-        path: "providers.profiles/defaultSessionProvider/adapters",
-        reason: "restart_required",
-        message: "provider topology changes require restart"
-      });
-    }
-    if (patch.hooks !== undefined) {
-      rejected.push({
-        path: "hooks",
-        reason: "restart_required",
-        message: "hook updates require restart"
-      });
-    }
-    if (patch.agent !== undefined) {
-      rejected.push({
-        path: "agent",
-        reason: "restart_required",
-        message: "agent entry configuration requires restart"
-      });
-    }
-    if (patch.runtime !== undefined) {
-      rejected.push({
-        path: "runtime",
-        reason: "restart_required",
-        message: "runtime entry configuration requires restart"
-      });
-    }
-    if (patch.evolution !== undefined) {
-      rejected.push({
-        path: "evolution",
-        reason: "restart_required",
-        message: "evolution policy configuration requires restart"
-      });
-    }
-    if (patch.failover !== undefined) {
-      rejected.push({
-        path: "failover",
-        reason: "restart_required",
-        message: "failover configuration requires restart to rebuild provider manager"
-      });
-    }
-    if (patch.plugins !== undefined) {
-      rejected.push({
-        path: "plugins",
-        reason: "restart_required",
-        message: "plugin runtime configuration requires restart"
-      });
-    }
-    if (patch.skills !== undefined) {
-      rejected.push({
-        path: "skills",
-        reason: "restart_required",
-        message: "skills runtime configuration requires restart"
-      });
-    }
-    if (patch.subagents !== undefined) {
-      rejected.push({
-        path: "subagents",
-        reason: "restart_required",
-        message: "subagent runtime configuration requires restart"
-      });
-    }
-    if (patch.optionalModules !== undefined) {
-      rejected.push({
-        path: "optionalModules",
-        reason: "restart_required",
-        message: "optional module configuration requires restart"
-      });
-    }
-
-    if (patch.health) {
-      this.config.health = {
-        ...(this.config.health ?? {}),
-        ...patch.health
-      };
-      applied.push("health");
-      if (this.state === "running" || this.state === "degraded") {
-        await this.stopHealthServer();
-        try {
-          await this.startHealthServer();
-        } catch (error) {
-          this.degradedReasons.push(
-            `Health endpoint failed to start during reload: ${error instanceof Error ? error.message : String(error)}`
-          );
-          this.state = "degraded";
-        }
-      }
-    }
-
-    if (patch.toolPolicy) {
-      this.config.toolPolicy = {
-        ...(this.config.toolPolicy ?? {}),
-        ...patch.toolPolicy
-      };
-      applied.push("toolPolicy");
-    }
-
-    if (patch.providerRouter) {
-      this.config.providerRouter = {
-        ...(this.config.providerRouter ?? {}),
-        ...patch.providerRouter,
-        routes: patch.providerRouter.routes ?? this.config.providerRouter?.routes
-      };
-      applied.push("providerRouter");
-    }
-
-    if (patch.orchestration) {
-      this.config.orchestration = {
-        ...(this.config.orchestration ?? {}),
-        ...patch.orchestration
-      };
-      applied.push("orchestration");
-      this.persistOrchestrationState();
-    }
-
-    if (patch.controlApi) {
-      this.config.controlApi = {
-        ...(this.config.controlApi ?? {}),
-        ...patch.controlApi
-      };
-      applied.push("controlApi");
-      if (this.state === "running" || this.state === "degraded") {
-        await this.stopControlServer();
-        try {
-          await this.startControlServer();
-        } catch (error) {
-          this.degradedReasons.push(
-            `Control API failed to start during reload: ${error instanceof Error ? error.message : String(error)}`
-          );
-          this.state = "degraded";
-        }
-      }
-    }
-
-    if (patch.observability) {
-      this.config.observability = {
-        ...(this.config.observability ?? {}),
-        ...patch.observability
-      };
-      if (patch.observability.directory !== undefined) {
-        this.observabilityDirectory = path.resolve(patch.observability.directory);
-      }
-      this.observabilityWriteFailed = false;
-      this.ensureObservabilityDirectory();
-      applied.push("observability");
-    }
-
-    if (patch.providers?.startupProbe) {
-      const currentProviders = this.config.providers;
-      if (!currentProviders) {
-        rejected.push({
-          path: "providers.startupProbe",
-          reason: "invalid_patch",
-          message: "providers.startupProbe cannot be reloaded when providers are not configured"
-        });
-      } else {
-        currentProviders.startupProbe = {
-          ...(currentProviders.startupProbe ?? {}),
-          ...patch.providers.startupProbe
-        };
-        applied.push("providers.startupProbe");
-      }
-    }
-
-    if (patch.restartPolicy) {
-      this.config.restartPolicy = {
-        ...(this.config.restartPolicy ?? {}),
-        ...patch.restartPolicy
-      };
-      applied.push("restartPolicy");
-    }
-
-    const restartRequired = rejected.some((entry) => entry.reason === "restart_required");
-    const result: GatewayConfigReloadResult = {
-      ok: rejected.length === 0,
-      applied,
-      rejected,
-      restartRequired
-    };
-    this.emitRuntimeEvent("gateway.config.reloaded", {
-      ok: result.ok,
-      applied,
-      rejected,
-      restartRequired
-    });
-    return result;
+    return await restartConfig.reloadConfig(this, patch);
   }
 
   ensureSession(
@@ -3053,42 +457,11 @@ export class GatewayRuntime {
       origin?: SessionOriginIdentity;
     }
   ): void {
-    if (!this.config.providers) {
-      throw new Error("No provider manager configured");
-    }
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      throw new Error("No provider manager configured");
-    }
-    manager.ensureSession(sessionId, this.config.providers.defaultSessionProvider, {
-      title: options?.title,
-      origin: options?.origin,
-      lastActivityAt: nowIso()
-    });
-    try {
-      this.restoreSessionState(sessionId);
-    } catch (error) {
-      this.degradedReasons.push(
-        `Failed to restore session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      this.state = "degraded";
-    }
-    this.persistSessionState(sessionId);
+    sessionRuntime.ensureSession(this, sessionId, options);
   }
 
   sessionExists(sessionId: string): boolean {
-    const normalizedSessionId = sessionId.trim();
-    if (!normalizedSessionId) {
-      return false;
-    }
-    const manager = this.ensureProviderManager();
-    if (manager?.getSession(normalizedSessionId)) {
-      return true;
-    }
-    if (!this.sessionStoreEnabled) {
-      return false;
-    }
-    return listSessionIds(this.sessionDirectory).includes(normalizedSessionId);
+    return sessionRuntime.sessionExists(this, sessionId);
   }
 
   createSession(options?: {
@@ -3097,36 +470,14 @@ export class GatewayRuntime {
     origin?: SessionOriginIdentity;
     fromSessionId?: string;
   }): string {
-    const channelPart = normalizeSessionChannelPart(options?.origin?.channel ?? options?.channel);
-    const timestamp = sessionTimestampToken();
-
-    for (let attempt = 0; attempt < 1000; attempt += 1) {
-      const sessionId =
-        attempt === 0
-          ? `${channelPart}-${timestamp}`
-          : `${channelPart}-${timestamp}-${attempt + 1}`;
-      if (this.sessionExists(sessionId)) {
-        continue;
-      }
-      this.ensureSession(sessionId, {
-        title: options?.title,
-        origin: options?.origin
-      });
-      const fromSessionId = options?.fromSessionId?.trim();
-      if (fromSessionId && fromSessionId !== sessionId && this.sessionExists(fromSessionId)) {
-        this.scheduleSessionContinuity(fromSessionId, sessionId);
-      }
-      return sessionId;
-    }
-
-    throw new Error("Failed to allocate a unique session id");
+    return sessionRuntime.createSession(this, options);
   }
 
   private channelSessionKey(
     identity: ChannelSessionIdentity,
     mapping?: ChannelSessionMappingOptions
   ): string {
-    return buildChannelSessionId(identity, mapping);
+    return sessionRuntime.channelSessionKey(this, identity, mapping);
   }
 
   createChannelSession(params: {
@@ -3134,16 +485,7 @@ export class GatewayRuntime {
     mapping?: ChannelSessionMappingOptions;
     title?: string;
   }): string {
-    const channelKey = this.channelSessionKey(params.identity, params.mapping);
-    const previousSessionId = this.channelSessionAssignments.get(channelKey) ?? channelKey;
-    const sessionId = this.createSession({
-      channel: params.identity.channel,
-      title: params.title,
-      origin: createChannelSessionOrigin(params.identity),
-      fromSessionId: this.sessionExists(previousSessionId) ? previousSessionId : undefined
-    });
-    this.channelSessionAssignments.set(channelKey, sessionId);
-    return sessionId;
+    return sessionRuntime.createChannelSession(this, params);
   }
 
   switchChannelSession(params: {
@@ -3152,117 +494,25 @@ export class GatewayRuntime {
     sessionId: string;
     title?: string;
   }): SessionMutationResult {
-    const targetSessionId = params.sessionId.trim();
-    if (!targetSessionId) {
-      return {
-        ok: false,
-        message: "Session id is required"
-      };
-    }
-    if (!this.sessionExists(targetSessionId)) {
-      return {
-        ok: false,
-        message: `Unknown session: ${targetSessionId}`
-      };
-    }
-
-    this.ensureSession(targetSessionId, {
-      title: params.title,
-      origin: createChannelSessionOrigin(params.identity)
-    });
-    this.channelSessionAssignments.set(this.channelSessionKey(params.identity, params.mapping), targetSessionId);
-    return {
-      ok: true,
-      message: `Active session switched to ${targetSessionId}`,
-      sessionId: targetSessionId
-    };
+    return sessionRuntime.switchChannelSession(this, params);
   }
 
   queueSessionProviderSwitch(sessionId: string, providerId: string): void {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      throw new Error("No provider manager configured");
-    }
-    manager.queueProviderSwitch(sessionId, providerId);
-    this.persistSessionState(sessionId);
+    sessionRuntime.queueSessionProviderSwitch(this, sessionId, providerId);
   }
 
   getSessionState(
     sessionId: string
   ): { activeProviderId: string; pendingProviderId?: string; metadata?: SessionMetadata } | null {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return null;
-    }
-    const session = manager.getSession(sessionId);
-    if (!session) {
-      return null;
-    }
-    return {
-      activeProviderId: session.activeProviderId,
-      pendingProviderId: session.pendingProviderId,
-      metadata: {
-        ...session.metadata
-      }
-    };
+    return sessionRuntime.getSessionState(this, sessionId);
   }
 
   private resolveToolProviderId(sessionId: string, overrideProviderId?: string): string {
-    if (overrideProviderId && overrideProviderId.trim().length > 0) {
-      return overrideProviderId;
-    }
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return "local";
-    }
-    const session = manager.getSession(sessionId);
-    if (!session) {
-      return "local";
-    }
-    return session.activeProviderId;
+    return execution.resolveToolProviderId(this, sessionId, overrideProviderId);
   }
 
   private isToolAllowed(toolName: string): { allowed: boolean; reason?: string } {
-    const policy = this.config.toolPolicy;
-    if (!policy) {
-      return {
-        allowed: true
-      };
-    }
-
-    const denied = new Set((policy.deniedTools ?? []).map((name) => name.trim()).filter((name) => name.length > 0));
-    const allowed =
-      policy.allowedTools && policy.allowedTools.length > 0
-        ? new Set(policy.allowedTools.map((name) => name.trim()).filter((name) => name.length > 0))
-        : null;
-
-    if (denied.has(toolName)) {
-      return {
-        allowed: false,
-        reason: `Tool "${toolName}" denied by toolPolicy.deniedTools`
-      };
-    }
-    if (allowed && !allowed.has(toolName)) {
-      return {
-        allowed: false,
-        reason: `Tool "${toolName}" not in toolPolicy.allowedTools`
-      };
-    }
-
-    const profile = policy.profile ?? "balanced";
-    if (profile === "strict") {
-      const strictDefaultDenied = new Set(["shell", "web"]);
-      if (strictDefaultDenied.has(toolName) && !(allowed?.has(toolName) ?? false)) {
-        return {
-          allowed: false,
-          reason: `Tool "${toolName}" denied by strict tool policy profile`
-        };
-      }
-    }
-
-    return {
-      allowed: true
-    };
+    return execution.isToolAllowed(this, toolName);
   }
 
   async runTool(params: {
@@ -3272,440 +522,11 @@ export class GatewayRuntime {
     providerId?: string;
     onEvent?: StreamEventHandler;
   }): Promise<ToolRunResult> {
-    const toolName = params.toolName.trim();
-    if (!toolName) {
-      return {
-        toolName,
-        ok: false,
-        error: {
-          code: "tool_not_found",
-          message: "Tool name is required"
-        }
-      };
-    }
-
-    const tool = this.toolRegistry.get(toolName);
-    if (!tool) {
-      return {
-        toolName,
-        ok: false,
-        error: {
-          code: "tool_not_found",
-          message: `Unknown tool: ${toolName}`
-        }
-      };
-    }
-
-    const providerId = this.resolveToolProviderId(params.sessionId, params.providerId);
-    const policyCheck = this.isToolAllowed(toolName);
-    if (!policyCheck.allowed) {
-      const deniedReason = policyCheck.reason ?? `Tool "${toolName}" denied by policy`;
-      this.emitRuntimeEvent("tool.policy.denied", {
-        sessionId: params.sessionId,
-        toolName,
-        reason: deniedReason
-      });
-      this.appendSessionEvent(params.sessionId, "tool.policy.denied", {
-        toolName,
-        reason: deniedReason
-      });
-      this.appendObservabilityRecord(
-        "usage-events",
-        {
-          kind: "tool.policy.denied",
-          sessionId: params.sessionId,
-          toolName,
-          reason: deniedReason
-        },
-        this.config.observability?.usageEventsEnabled
-      );
-      await this.pluginRuntime?.runOnToolResult({
-        sessionId: params.sessionId,
-        providerId,
-        toolName,
-        input: params.input,
-        result: {
-          ok: false,
-          error: {
-            code: "policy_denied",
-            message: deniedReason
-          }
-        }
-      });
-      return {
-        toolName,
-        ok: false,
-        error: {
-          code: "policy_denied",
-          message: deniedReason
-        }
-      };
-    }
-    const timestamp = nowIso();
-    params.onEvent?.({
-      type: "tool.call.started",
-      sessionId: params.sessionId,
-      providerId,
-      timestamp,
-      payload: {
-        toolName,
-        metadata: {
-          input: safeJsonStringify(params.input)
-        }
-      }
-    });
-    this.appendSessionEvent(params.sessionId, "tool.call.started", {
-      providerId,
-      toolName,
-      input: params.input
-    });
-    this.appendObservabilityRecord(
-      "tool-traces",
-      {
-        phase: "started",
-        sessionId: params.sessionId,
-        providerId,
-        toolName,
-        input: params.input
-      },
-      this.config.observability?.toolTracesEnabled
-    );
-
-    const startedAt = Date.now();
-    const result: ToolExecutionResult = await executeToolDefinition({
-      tool,
-      input: params.input,
-      context: {
-        workspaceDir: this.workspaceDir,
-        mutableRoots: this.mutableRoots,
-        sessionId: params.sessionId,
-        providerId
-      }
-    });
-
-    if (!result.ok) {
-      const completedAt = nowIso();
-      params.onEvent?.({
-        type: "tool.call.completed",
-        sessionId: params.sessionId,
-        providerId,
-        timestamp: completedAt,
-        payload: {
-          toolName,
-          error: result.error?.message,
-          metadata: {
-            ok: false,
-            code: result.error?.code ?? "execution_error",
-            durationMs: Date.now() - startedAt
-          }
-        }
-      });
-      this.appendSessionEvent(params.sessionId, "tool.call.completed", {
-        providerId,
-        toolName,
-        ok: false,
-        code: result.error?.code ?? "execution_error",
-        message: result.error?.message ?? "Tool execution failed",
-        durationMs: Date.now() - startedAt
-      });
-      this.appendObservabilityRecord(
-        "tool-traces",
-        {
-          phase: "completed",
-          sessionId: params.sessionId,
-          providerId,
-          toolName,
-          ok: false,
-          code: result.error?.code ?? "execution_error",
-          message: result.error?.message ?? "Tool execution failed",
-          durationMs: Date.now() - startedAt
-        },
-        this.config.observability?.toolTracesEnabled
-      );
-
-      if (result.error?.code === "validation_error") {
-        await this.pluginRuntime?.runOnToolResult({
-          sessionId: params.sessionId,
-          providerId,
-          toolName,
-          input: params.input,
-          result: {
-            ok: false,
-            error: {
-              code: "validation_error",
-              message: result.error.message
-            }
-          }
-        });
-        return {
-          toolName,
-          ok: false,
-          error: {
-            code: "validation_error",
-            message: result.error.message,
-            issues: result.error.issues
-          }
-        };
-      }
-
-      await this.pluginRuntime?.runOnToolResult({
-        sessionId: params.sessionId,
-        providerId,
-        toolName,
-        input: params.input,
-        result: {
-          ok: false,
-          error: {
-            code: result.error?.code ?? "execution_error",
-            message: result.error?.message ?? "Tool execution failed"
-          }
-        }
-      });
-      return {
-        toolName,
-        ok: false,
-        error: {
-          code: "execution_error",
-          message: result.error?.message ?? "Tool execution failed"
-        }
-      };
-    }
-
-    const completedAt = nowIso();
-    params.onEvent?.({
-      type: "tool.call.completed",
-      sessionId: params.sessionId,
-      providerId,
-      timestamp: completedAt,
-      payload: {
-        toolName,
-        metadata: {
-          ok: true,
-          durationMs: Date.now() - startedAt,
-          output: safeJsonStringify(result.output)
-        }
-      }
-    });
-    this.appendSessionEvent(params.sessionId, "tool.call.completed", {
-      providerId,
-      toolName,
-      ok: true,
-      output: result.output,
-      durationMs: Date.now() - startedAt
-    });
-    this.appendObservabilityRecord(
-      "tool-traces",
-      {
-        phase: "completed",
-        sessionId: params.sessionId,
-        providerId,
-        toolName,
-        ok: true,
-        output: result.output,
-        durationMs: Date.now() - startedAt
-      },
-      this.config.observability?.toolTracesEnabled
-    );
-    await this.pluginRuntime?.runOnToolResult({
-      sessionId: params.sessionId,
-      providerId,
-      toolName,
-      input: params.input,
-      result: {
-        ok: true,
-        output: result.output
-      }
-    });
-
-    return {
-      toolName,
-      ok: true,
-      output: result.output
-    };
+    return await execution.runTool(this, params);
   }
 
   async runEvolution(params: GatewayEvolutionRunRequest): Promise<GatewayEvolutionRunResult> {
-    const evolutionEnabled = this.config.evolution?.enabled ?? true;
-    if (!evolutionEnabled) {
-      return {
-        ok: false,
-        code: "disabled",
-        message: "Evolution is disabled by configuration"
-      };
-    }
-
-    const sessionId = params.sessionId.trim();
-    if (!sessionId) {
-      return {
-        ok: false,
-        code: "invalid_request",
-        message: "sessionId is required"
-      };
-    }
-
-    if (!Array.isArray(params.steps) || params.steps.length === 0) {
-      return {
-        ok: false,
-        code: "invalid_request",
-        message: "At least one evolution step is required"
-      };
-    }
-
-    const active = this.activeEvolutionTransaction;
-    if (active) {
-      this.emitRuntimeEvent("evolution.busy", {
-        activeTransactionId: active.transactionId,
-        requestedSessionId: sessionId
-      });
-      return {
-        ok: false,
-        code: "busy",
-        message: `Evolution transaction already running: ${active.transactionId}`,
-        activeTransactionId: active.transactionId
-      };
-    }
-
-    const transaction: GatewayEvolutionTransactionState = {
-      transactionId: createEvolutionTransactionId(),
-      requestedAt: nowIso(),
-      sessionId,
-      summary: params.summary?.trim() || undefined,
-      totalSteps: params.steps.length,
-      completedSteps: 0
-    };
-    this.activeEvolutionTransaction = transaction;
-    this.emitRuntimeEvent("evolution.requested", {
-      transactionId: transaction.transactionId,
-      sessionId,
-      summary: transaction.summary,
-      totalSteps: transaction.totalSteps
-    });
-
-    const stepResults: ToolRunResult[] = [];
-    try {
-      for (let index = 0; index < params.steps.length; index += 1) {
-        const step = params.steps[index];
-        if (!step) {
-          this.emitRuntimeEvent("evolution.step.failed", {
-            transactionId: transaction.transactionId,
-            stepIndex: index,
-            reason: "missing_step_payload"
-          });
-          return {
-            ok: false,
-            code: "failed",
-            message: `Evolution step ${index + 1} payload is missing`,
-            transactionId: transaction.transactionId,
-            failedStepIndex: index,
-            stepsAttempted: stepResults.length,
-            stepResults
-          };
-        }
-        const toolName = step.toolName.trim();
-        if (!toolName) {
-          this.emitRuntimeEvent("evolution.step.failed", {
-            transactionId: transaction.transactionId,
-            stepIndex: index,
-            reason: "missing_tool_name"
-          });
-          return {
-            ok: false,
-            code: "failed",
-            message: `Evolution step ${index + 1} is missing toolName`,
-            transactionId: transaction.transactionId,
-            failedStepIndex: index,
-            stepsAttempted: stepResults.length,
-            stepResults
-          };
-        }
-
-        const toolResult = await this.runTool({
-          sessionId,
-          toolName,
-          input: step.input,
-          providerId: step.providerId ?? params.providerId,
-          onEvent: params.onEvent
-        });
-        stepResults.push(toolResult);
-        if (!toolResult.ok) {
-          this.emitRuntimeEvent("evolution.step.failed", {
-            transactionId: transaction.transactionId,
-            stepIndex: index,
-            toolName,
-            message: toolResult.error?.message ?? "unknown tool failure"
-          });
-          this.emitRuntimeEvent("evolution.failed", {
-            transactionId: transaction.transactionId,
-            failedStepIndex: index
-          });
-          return {
-            ok: false,
-            code: "failed",
-            message: `Evolution step ${index + 1} failed: ${toolResult.error?.message ?? "unknown tool failure"}`,
-            transactionId: transaction.transactionId,
-            failedStepIndex: index,
-            stepsAttempted: stepResults.length,
-            stepResults
-          };
-        }
-
-        transaction.completedSteps = index + 1;
-        this.emitRuntimeEvent("evolution.step.completed", {
-          transactionId: transaction.transactionId,
-          stepIndex: index,
-          toolName
-        });
-      }
-
-      let restartResult: GatewayRestartResult | undefined;
-      if (params.requestRestart) {
-        const restartResponse = await this.requestRestart({
-          intent: "self_mod",
-          reason: transaction.summary ?? `evolution transaction ${transaction.transactionId}`,
-          sessionId,
-          providerId: params.providerId,
-          dryRun: params.restartDryRun ?? false
-        });
-        if (restartResponse && typeof restartResponse === "object" && "ok" in restartResponse) {
-          restartResult = restartResponse;
-          if (!restartResult.ok) {
-            this.emitRuntimeEvent("evolution.failed", {
-              transactionId: transaction.transactionId,
-              failedStepIndex: stepResults.length - 1,
-              restartCode: restartResult.code
-            });
-            return {
-              ok: false,
-              code: "failed",
-              message: `Evolution restart blocked: ${restartResult.message}`,
-              transactionId: transaction.transactionId,
-              failedStepIndex: stepResults.length - 1,
-              stepsAttempted: stepResults.length,
-              stepResults,
-              restart: restartResult
-            };
-          }
-        }
-      }
-
-      this.emitRuntimeEvent("evolution.completed", {
-        transactionId: transaction.transactionId,
-        stepsCompleted: transaction.completedSteps,
-        restartRequested: Boolean(params.requestRestart),
-        restartDryRun: params.restartDryRun ?? false
-      });
-      return {
-        ok: true,
-        code: "completed",
-        message: "Evolution transaction completed",
-        transactionId: transaction.transactionId,
-        stepsAttempted: stepResults.length,
-        stepResults,
-        restart: restartResult
-      };
-    } finally {
-      this.activeEvolutionTransaction = null;
-    }
+    return await execution.runEvolution(this, params);
   }
 
   async runSessionTurn(params: {
@@ -3714,162 +535,15 @@ export class GatewayRuntime {
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }): Promise<void> {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      throw new Error("No provider manager configured");
-    }
-    const turnStartedAtMs = Date.now();
-    const historyBeforeCount = manager.getSessionHistory(params.sessionId).length;
-    const session = manager.getSession(params.sessionId);
-    const activeProviderId = session?.activeProviderId;
-    const runtimeContext = this.runtimeContext();
-    let input = params.input;
-    input = await this.pluginRuntime?.runBeforeTurn({
-      sessionId: params.sessionId,
-      input,
-      providerId: activeProviderId
-    }) ?? input;
-    if (this.agentDefinition?.hooks?.beforeTurn) {
-      const hookResult = await this.agentDefinition.hooks.beforeTurn({
-        sessionId: params.sessionId,
-        input,
-        providerId: activeProviderId,
-        runtime: runtimeContext
-      });
-      if (hookResult && typeof hookResult.input === "string") {
-        input = hookResult.input;
-      }
-    }
-    const skillInjection = this.applySkillInjection(params.sessionId, input);
-    input = skillInjection.input;
-    if (skillInjection.skillIds.length > 0) {
-      this.appendSessionEvent(params.sessionId, "skills.injected", {
-        mode: skillInjection.mode,
-        skills: skillInjection.skillIds
-      });
-    }
-
-    let runSucceeded = false;
-    const routeSelection = this.resolveProviderRouteSelection(params.sessionId);
-    if (routeSelection?.routeId) {
-      manager.updateSessionMetadata(params.sessionId, {
-        providerRouteId: routeSelection.routeId
-      });
-    }
-    const onEvent: StreamEventHandler = (event) => {
-      if (event.type !== "tool.call.started" && event.type !== "tool.call.completed") {
-        this.appendSessionEvent(params.sessionId, event.type, {
-          providerId: event.providerId,
-          payload: event.payload
-        });
-      }
-      params.onEvent(event);
-    };
-    try {
-      await manager.runTurn({
-        sessionId: params.sessionId,
-        input,
-        authStore: this.authStore,
-        route: routeSelection ?? undefined,
-        onEvent,
-        signal: params.signal,
-        availableToolNames: this.listLoadedToolNames(),
-        runTool: async (request) =>
-          this.runTool({
-            sessionId: request.sessionId,
-            toolName: request.toolName,
-            input: request.input,
-            providerId: request.providerId,
-            onEvent: request.onEvent
-          })
-      });
-      runSucceeded = true;
-    } finally {
-      if (runSucceeded) {
-        const history = manager.getSessionHistory(params.sessionId);
-        const assistantText = history
-          .filter((message) => message.role === "assistant")
-          .at(-1)?.content;
-        this.appendObservabilityRecord(
-          "usage-events",
-          {
-            kind: "session.turn",
-            sessionId: params.sessionId,
-            providerId: this.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId ?? "unknown",
-            durationMs: Date.now() - turnStartedAtMs,
-            inputChars: input.length,
-            outputChars: assistantText ? assistantText.length : 0,
-            historyBeforeCount,
-            historyAfterCount: history.length,
-            skillInjectionMode: skillInjection.mode,
-            skillsInjected: skillInjection.skillIds
-          },
-          this.config.observability?.usageEventsEnabled
-        );
-      }
-      if (runSucceeded && this.agentDefinition?.hooks?.afterTurn) {
-        try {
-          await this.agentDefinition.hooks.afterTurn({
-            sessionId: params.sessionId,
-            input,
-            providerId: activeProviderId,
-            runtime: runtimeContext,
-            output: {
-              historyCount: manager.getSessionHistory(params.sessionId).length
-            }
-          });
-        } catch (error) {
-          this.degradedReasons.push(
-            `Agent afterTurn hook failed: ${error instanceof Error ? error.message : String(error)}`
-          );
-          this.state = "degraded";
-        }
-      }
-      if (runSucceeded && this.pluginRuntime) {
-        const history = manager.getSessionHistory(params.sessionId);
-        const assistantResponse =
-          history
-            .filter((message) => message.role === "assistant")
-            .at(-1)?.content;
-        await this.pluginRuntime.runAfterTurn({
-          sessionId: params.sessionId,
-          input,
-          providerId: this.getSessionState(params.sessionId)?.activeProviderId ?? activeProviderId,
-          output: {
-            historyCount: history.length,
-            response: assistantResponse
-          }
-        });
-      }
-      this.persistSessionState(params.sessionId);
-    }
+    await execution.runSessionTurn(this, params);
   }
 
   private resolveOrchestrationMode(): OrchestrationMode {
-    const mode = this.config.orchestration?.defaultMode ?? "queue";
-    if (mode === "interrupt" || mode === "collect" || mode === "steer" || mode === "steer_backlog") {
-      return mode;
-    }
-    return "queue";
+    return orchestration.resolveOrchestrationMode(this);
   }
 
   private laneForSession(sessionId: string): ChannelLaneState {
-    const existing = this.channelLanes.get(sessionId);
-    if (existing) {
-      return existing;
-    }
-    const created: ChannelLaneState = {
-      mode: this.resolveOrchestrationMode(),
-      cap: Math.max(1, this.config.orchestration?.defaultCap ?? 32),
-      dropPolicy: this.config.orchestration?.dropPolicy ?? "old",
-      collectDebounceMs: Math.max(0, this.config.orchestration?.collectDebounceMs ?? 350),
-      queue: [],
-      active: null,
-      collectTimer: null
-    };
-    this.channelLanes.set(sessionId, created);
-    this.persistOrchestrationState();
-    return created;
+    return orchestration.laneForSession(this, sessionId);
   }
 
   private async runChannelTurnDirect(params: {
@@ -3878,131 +552,15 @@ export class GatewayRuntime {
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }): Promise<ChannelTurnResult> {
-    await this.runSessionTurn({
-      sessionId: params.sessionId,
-      input: params.input,
-      onEvent: params.onEvent,
-      signal: params.signal
-    });
-
-    const history = this.getSessionHistory(params.sessionId);
-    let response = "";
-    for (let index = history.length - 1; index >= 0; index -= 1) {
-      const message = history[index];
-      if (message?.role === "assistant") {
-        response = message.content;
-        break;
-      }
-    }
-
-    const state = this.getSessionState(params.sessionId);
-    return {
-      sessionId: params.sessionId,
-      providerId: state?.activeProviderId,
-      response
-    };
+    return await orchestration.runChannelTurnDirect(this, params);
   }
 
   private queueDrop(lane: ChannelLaneState): PendingChannelTurn | null {
-    if (lane.queue.length < lane.cap) {
-      return null;
-    }
-    if (lane.dropPolicy === "new") {
-      return {
-        input: "",
-        onEvent: () => undefined,
-        resolve: () => undefined,
-        reject: () => undefined,
-        enqueuedAt: nowIso()
-      };
-    }
-    const dropped = lane.queue.shift() ?? null;
-    return dropped;
+    return orchestration.queueDrop(this, lane);
   }
 
   private startLaneExecution(sessionId: string, lane: ChannelLaneState): void {
-    if (lane.active) {
-      return;
-    }
-
-    const mode = lane.mode;
-    const takeNext = (): ActiveChannelTurn | null => {
-      if (lane.queue.length === 0) {
-        return null;
-      }
-      if (mode === "collect") {
-        const batch = [...lane.queue];
-        lane.queue.length = 0;
-        const input = batch.map((entry) => entry.input).join("\n\n");
-        const onEvent: StreamEventHandler = (event) => {
-          for (const entry of batch) {
-            entry.onEvent(event);
-          }
-        };
-        return {
-          input,
-          onEvent,
-          resolveMany: batch.map((entry) => entry.resolve),
-          rejectMany: batch.map((entry) => entry.reject),
-          controller: new AbortController()
-        };
-      }
-      const next = lane.queue.shift();
-      if (!next) {
-        return null;
-      }
-      return {
-        input: next.input,
-        onEvent: next.onEvent,
-        resolveMany: [next.resolve],
-        rejectMany: [next.reject],
-        controller: new AbortController()
-      };
-    };
-
-    const active = takeNext();
-    if (!active) {
-      this.persistOrchestrationState();
-      return;
-    }
-    lane.active = active;
-    this.persistOrchestrationState();
-    this.emitRuntimeEvent("orchestration.started", {
-      sessionId,
-      mode: lane.mode,
-      queued: lane.queue.length
-    });
-
-    void this.runChannelTurnDirect({
-      sessionId,
-      input: active.input,
-      onEvent: active.onEvent,
-      signal: active.controller.signal
-    })
-      .then((result) => {
-        for (const resolve of active.resolveMany) {
-          resolve(result);
-        }
-        this.emitRuntimeEvent("orchestration.completed", {
-          sessionId,
-          mode: lane.mode,
-          queued: lane.queue.length
-        });
-      })
-      .catch((error) => {
-        for (const reject of active.rejectMany) {
-          reject(error);
-        }
-      })
-      .finally(() => {
-        lane.active = null;
-        if (lane.collectTimer) {
-          clearTimeout(lane.collectTimer);
-          lane.collectTimer = null;
-        }
-        this.persistOrchestrationState();
-        this.startLaneExecution(sessionId, lane);
-      });
+    orchestration.startLaneExecution(this, sessionId, lane);
   }
 
   private submitChannelTurnToLane(params: {
@@ -4010,660 +568,84 @@ export class GatewayRuntime {
     input: string;
     onEvent: StreamEventHandler;
   }): Promise<ChannelTurnResult> {
-    const lane = this.laneForSession(params.sessionId);
-    this.emitRuntimeEvent("orchestration.submitted", {
-      sessionId: params.sessionId,
-      mode: lane.mode,
-      queued: lane.queue.length
-    });
-
-    return new Promise<ChannelTurnResult>((resolve, reject) => {
-      const pending: PendingChannelTurn = {
-        input: params.input,
-        onEvent: params.onEvent,
-        resolve,
-        reject,
-        enqueuedAt: nowIso()
-      };
-
-      const effectiveMode: OrchestrationMode =
-        lane.mode === "steer" ? "interrupt" : lane.mode === "steer_backlog" ? "queue" : lane.mode;
-
-      if (effectiveMode === "interrupt") {
-        for (const queued of lane.queue.splice(0)) {
-          queued.reject(new Error("Dropped by interrupt queue policy"));
-        }
-        lane.active?.controller.abort();
-        lane.queue.push(pending);
-        this.persistOrchestrationState();
-        this.startLaneExecution(params.sessionId, lane);
-        return;
-      }
-
-      const dropped = this.queueDrop(lane);
-      if (dropped) {
-        if (lane.dropPolicy === "new") {
-          reject(new Error("Queue is full (dropPolicy=new)"));
-          this.emitRuntimeEvent("orchestration.dropped", {
-            sessionId: params.sessionId,
-            mode: lane.mode,
-            dropPolicy: lane.dropPolicy
-          });
-          this.persistOrchestrationState();
-          return;
-        }
-        dropped.reject(new Error("Dropped by queue capacity policy"));
-        this.emitRuntimeEvent("orchestration.dropped", {
-          sessionId: params.sessionId,
-          mode: lane.mode,
-          dropPolicy: lane.dropPolicy
-        });
-      }
-
-      lane.queue.push(pending);
-      this.persistOrchestrationState();
-      if (effectiveMode === "collect" && lane.active) {
-        return;
-      }
-      if (effectiveMode === "collect" && lane.collectDebounceMs > 0) {
-        if (lane.collectTimer) {
-          clearTimeout(lane.collectTimer);
-        }
-        lane.collectTimer = setTimeout(() => {
-          lane.collectTimer = null;
-          this.startLaneExecution(params.sessionId, lane);
-        }, lane.collectDebounceMs);
-        return;
-      }
-      this.startLaneExecution(params.sessionId, lane);
-    });
+    return orchestration.submitChannelTurnToLane(this, params);
   }
 
   async runChannelTurn(params: ChannelTurnRequest): Promise<ChannelTurnResult> {
-    const sessionId = this.resolveChannelSession({
-      identity: params.identity,
-      mapping: params.mapping,
-      title: params.title
-    });
-    const onEvent: StreamEventHandler = params.onEvent ?? (() => undefined);
-    const orchestrationEnabled = this.config.orchestration?.enabled ?? false;
-    if (!orchestrationEnabled) {
-      return await this.runChannelTurnDirect({
-        sessionId,
-        input: params.input,
-        onEvent,
-        signal: params.signal
-      });
-    }
-
-    return await this.submitChannelTurnToLane({
-      sessionId,
-      input: params.input,
-      onEvent
-    });
+    return await orchestration.runChannelTurn(this, params);
   }
 
   registerChannelAdapter(adapter: ChannelAdapter): void {
-    const channelId = adapter.id.trim();
-    if (!channelId) {
-      throw new Error("Channel adapter id is required");
-    }
-    if (this.channelAdapters.has(channelId)) {
-      throw new Error(`Channel adapter already registered: ${channelId}`);
-    }
-    this.channelAdapters.set(channelId, adapter);
+    runtimeCore.registerChannelAdapter(this, adapter);
   }
 
   unregisterChannelAdapter(channelId: string): boolean {
-    return this.channelAdapters.delete(channelId.trim());
+    return runtimeCore.unregisterChannelAdapter(this, channelId);
   }
 
   listChannelAdapterIds(): string[] {
-    return Array.from(this.channelAdapters.keys()).sort((left, right) => left.localeCompare(right));
+    return runtimeCore.listChannelAdapterIds(this);
   }
 
   listProviderProfiles(): ProviderProfile[] {
-    return this.config.providers ? [...this.config.providers.profiles] : [];
+    return runtimeCore.listProviderProfiles(this);
   }
 
   getProviderFailoverStatus(): unknown {
-    const manager = this.ensureProviderManager();
-    return manager?.getFailoverStatus() ?? null;
+    return runtimeCore.getProviderFailoverStatus(this);
   }
 
   async probeProviders(timeoutMs = 10_000): Promise<ProviderProbeResult[]> {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return [];
-    }
-    const diagnostics = await manager.probeAll({
-      authStore: this.authStore,
-      timeoutMs
-    });
-    this.providerDiagnostics = diagnostics;
-    return diagnostics;
+    return await runtimeCore.probeProviders(this, timeoutMs);
   }
 
   listSessionSnapshots(): SessionSnapshot[] {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return [];
-    }
-    const snapshots = new Map<string, SessionSnapshot>();
-    for (const session of manager.listSessions()) {
-      snapshots.set(session.sessionId, {
-        sessionId: session.sessionId,
-        activeProviderId: session.activeProviderId,
-        pendingProviderId: session.pendingProviderId,
-        turnInProgress: session.turnInProgress,
-        historyCount: session.history.length,
-        metadata: {
-          ...session.metadata
-        }
-      });
-    }
-
-    if (this.sessionStoreEnabled) {
-      for (const entry of listSessionIndex(this.sessionDirectory)) {
-        if (snapshots.has(entry.sessionId)) {
-          continue;
-        }
-        snapshots.set(entry.sessionId, {
-          sessionId: entry.sessionId,
-          activeProviderId: entry.activeProviderId ?? this.config.providers?.defaultSessionProvider ?? "local",
-          pendingProviderId: entry.pendingProviderId,
-          turnInProgress: false,
-          historyCount: entry.historyCount,
-          metadata: {
-            createdAt: entry.createdAt,
-            lastActivityAt: entry.lastActivityAt,
-            title: entry.title,
-            origin: entry.origin
-          }
-        });
-      }
-    }
-
-    return Array.from(snapshots.values()).sort((left, right) => {
-      const leftTs = Date.parse(left.metadata.lastActivityAt);
-      const rightTs = Date.parse(right.metadata.lastActivityAt);
-      if (Number.isFinite(leftTs) && Number.isFinite(rightTs) && leftTs !== rightTs) {
-        return rightTs - leftTs;
-      }
-      return left.sessionId.localeCompare(right.sessionId);
-    });
+    return sessionRuntime.listSessionSnapshots(this);
   }
 
   getSessionHistory(sessionId: string): ChatMessage[] {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return [];
-    }
-    const liveHistory = manager.getSessionHistory(sessionId);
-    if (liveHistory.length > 0) {
-      return liveHistory;
-    }
-    if (!this.sessionStoreEnabled) {
-      return [];
-    }
-    return loadSessionRecordWithDiagnostics(this.sessionDirectory, sessionId).record?.history ?? [];
+    return sessionRuntime.getSessionHistory(this, sessionId);
   }
 
   deleteSession(sessionId: string): SessionMutationResult {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return {
-        ok: false,
-        message: "No provider manager configured"
-      };
-    }
-
-    let deletedLive = false;
-    const live = manager.getSession(sessionId);
-    if (live) {
-      try {
-        deletedLive = manager.deleteSession(sessionId);
-      } catch (error) {
-        return {
-          ok: false,
-          message: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-
-    let deletedPersisted = false;
-    if (this.sessionStoreEnabled) {
-      deletedPersisted = deleteSessionRecord({
-        sessionDirectory: this.sessionDirectory,
-        sessionId,
-        lock: this.sessionLockOptions()
-      });
-    }
-
-    if (!deletedLive && !deletedPersisted) {
-      return {
-        ok: false,
-        message: `Unknown session: ${sessionId}`
-      };
-    }
-
-    this.emitRuntimeEvent("gateway.config.reloaded", {
-      action: "session.delete",
-      sessionId
-    });
-    this.sessionProviderRouteOverrides.delete(sessionId);
-    this.sessionSkillInjectionOverrides.delete(sessionId);
-    return {
-      ok: true,
-      message: `Deleted session ${sessionId}`,
-      sessionId
-    };
+    return sessionAdmin.deleteSession(this, sessionId);
   }
 
   renameSession(params: { fromSessionId: string; toSessionId: string }): SessionMutationResult {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return {
-        ok: false,
-        message: "No provider manager configured"
-      };
-    }
-
-    if (manager.getSession(params.toSessionId)) {
-      return {
-        ok: false,
-        message: `Session already exists: ${params.toSessionId}`
-      };
-    }
-    const sourceLive = manager.getSession(params.fromSessionId);
-    if (sourceLive?.turnInProgress) {
-      return {
-        ok: false,
-        message: `Cannot rename session in progress: ${params.fromSessionId}`
-      };
-    }
-
-    let renamedPersisted = false;
-    if (this.sessionStoreEnabled) {
-      try {
-        renameSessionRecord({
-          sessionDirectory: this.sessionDirectory,
-          fromSessionId: params.fromSessionId,
-          toSessionId: params.toSessionId,
-          lock: this.sessionLockOptions()
-        });
-        renamedPersisted = true;
-      } catch (error) {
-        const loaded = manager.getSession(params.fromSessionId);
-        if (!loaded || !(error instanceof SessionStoreError) || error.code !== "not_found") {
-          return {
-            ok: false,
-            message: error instanceof Error ? error.message : String(error)
-          };
-        }
-      }
-    }
-
-    let renamedLive = false;
-    if (sourceLive) {
-      try {
-        manager.renameSession({
-          fromSessionId: params.fromSessionId,
-          toSessionId: params.toSessionId
-        });
-        renamedLive = true;
-      } catch (error) {
-        if (renamedPersisted) {
-          try {
-            renameSessionRecord({
-              sessionDirectory: this.sessionDirectory,
-              fromSessionId: params.toSessionId,
-              toSessionId: params.fromSessionId,
-              overwrite: true,
-              lock: this.sessionLockOptions()
-            });
-          } catch {
-            // best effort rollback
-          }
-        }
-        return {
-          ok: false,
-          message: error instanceof Error ? error.message : String(error)
-        };
-      }
-    }
-
-    if (!renamedPersisted && !renamedLive) {
-      return {
-        ok: false,
-        message: `Unknown session: ${params.fromSessionId}`
-      };
-    }
-
-    this.emitRuntimeEvent("gateway.config.reloaded", {
-      action: "session.rename",
-      fromSessionId: params.fromSessionId,
-      toSessionId: params.toSessionId
-    });
-    const routeOverride = this.sessionProviderRouteOverrides.get(params.fromSessionId);
-    this.sessionProviderRouteOverrides.delete(params.fromSessionId);
-    if (routeOverride) {
-      this.sessionProviderRouteOverrides.set(params.toSessionId, routeOverride);
-    }
-    const skillModeOverride = this.sessionSkillInjectionOverrides.get(params.fromSessionId);
-    this.sessionSkillInjectionOverrides.delete(params.fromSessionId);
-    if (skillModeOverride) {
-      this.sessionSkillInjectionOverrides.set(params.toSessionId, skillModeOverride);
-    }
-    return {
-      ok: true,
-      message: `Renamed session ${params.fromSessionId} -> ${params.toSessionId}`,
-      sessionId: params.toSessionId
-    };
+    return sessionAdmin.renameSession(this, params);
   }
 
   exportSession(sessionId: string): LoadedSessionRecord | null {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return null;
-    }
-    const live = manager.getSession(sessionId);
-    if (live) {
-      return {
-        sessionId: live.sessionId,
-        activeProviderId: live.activeProviderId,
-        pendingProviderId: live.pendingProviderId,
-        history: [...live.history],
-        metadata: {
-          ...live.metadata
-        },
-        revision: 0,
-        updatedAt: nowIso()
-      };
-    }
-    if (!this.sessionStoreEnabled) {
-      return null;
-    }
-    return exportSessionRecord({
-      sessionDirectory: this.sessionDirectory,
-      sessionId
-    });
+    return sessionAdmin.exportSession(this, sessionId);
   }
 
   importSession(params: {
     record: LoadedSessionRecord;
     overwrite?: boolean;
   }): SessionMutationResult {
-    const manager = this.ensureProviderManager();
-    if (!manager) {
-      return {
-        ok: false,
-        message: "No provider manager configured"
-      };
-    }
-
-    const existing = manager.getSession(params.record.sessionId);
-    if (existing && !params.overwrite) {
-      return {
-        ok: false,
-        message: `Session already exists: ${params.record.sessionId}`
-      };
-    }
-    if (existing?.turnInProgress) {
-      return {
-        ok: false,
-        message: `Cannot overwrite session in progress: ${params.record.sessionId}`
-      };
-    }
-
-    try {
-      const imported = this.sessionStoreEnabled
-        ? importSessionRecord({
-            sessionDirectory: this.sessionDirectory,
-            record: params.record,
-            overwrite: params.overwrite,
-            lock: this.sessionLockOptions()
-          })
-        : params.record;
-      const initialProviderId =
-        imported.activeProviderId ?? this.config.providers?.defaultSessionProvider ?? params.record.activeProviderId;
-      if (!initialProviderId) {
-        return {
-          ok: false,
-          message: "Imported session must define an active provider"
-        };
-      }
-      manager.ensureSession(imported.sessionId, initialProviderId);
-      manager.hydrateSession({
-        sessionId: imported.sessionId,
-        history: imported.history,
-        activeProviderId: imported.activeProviderId,
-        pendingProviderId: imported.pendingProviderId,
-        metadata: imported.metadata
-      });
-      if (imported.metadata.providerRouteId) {
-        this.sessionProviderRouteOverrides.set(imported.sessionId, imported.metadata.providerRouteId);
-      }
-      if (
-        imported.metadata.skillInjectionMode === "off" ||
-        imported.metadata.skillInjectionMode === "all" ||
-        imported.metadata.skillInjectionMode === "relevant"
-      ) {
-        this.sessionSkillInjectionOverrides.set(imported.sessionId, imported.metadata.skillInjectionMode);
-      }
-      return {
-        ok: true,
-        message: `Imported session ${imported.sessionId}`,
-        sessionId: imported.sessionId
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error)
-      };
-    }
+    return sessionAdmin.importSession(this, params);
   }
 
   archiveStaleSessions(maxIdleMs?: number): string[] {
-    if (!this.sessionStoreEnabled) {
-      return [];
-    }
-    const idleMs = maxIdleMs ?? this.config.sessionStore?.retention?.archiveAfterIdleMs;
-    if (!idleMs || idleMs <= 0) {
-      return [];
-    }
-    const now = Date.now();
-    const archived: string[] = [];
-    const index = listSessionIndex(this.sessionDirectory);
-    const manager = this.ensureProviderManager();
-    for (const entry of index) {
-      const lastActivity = Date.parse(entry.lastActivityAt);
-      if (!Number.isFinite(lastActivity)) {
-        continue;
-      }
-      if (now - lastActivity < idleMs) {
-        continue;
-      }
-      const live = manager?.getSession(entry.sessionId);
-      if (live?.turnInProgress) {
-        continue;
-      }
-      const result = archiveSessionRecord({
-        sessionDirectory: this.sessionDirectory,
-        sessionId: entry.sessionId,
-        lock: this.sessionLockOptions()
-      });
-      if (result) {
-        archived.push(entry.sessionId);
-        manager?.deleteSession(entry.sessionId);
-      }
-    }
-    return archived;
+    return sessionAdmin.archiveStaleSessions(this, maxIdleMs);
   }
 
   private applySessionRetentionPlan(
     dryRun: boolean,
     policyOverride?: SessionStoreConfig["retention"]
   ): { archived: string[]; deleted: string[] } {
-    if (!this.sessionStoreEnabled) {
-      return {
-        archived: [],
-        deleted: []
-      };
-    }
-
-    const policy = policyOverride ?? this.config.sessionStore?.retention;
-    if (!policy || policy.enabled === false) {
-      return {
-        archived: [],
-        deleted: []
-      };
-    }
-
-    const now = Date.now();
-    const manager = this.ensureProviderManager();
-    const archiveFirst = policy.archiveFirst ?? true;
-    const protectedSessions = new Set<string>();
-    for (const session of manager?.listSessions() ?? []) {
-      if (session.turnInProgress) {
-        protectedSessions.add(session.sessionId);
-      }
-    }
-
-    const entries = listSessionIndex(this.sessionDirectory);
-    const removed = new Set<string>();
-    const archived: string[] = [];
-    const deleted: string[] = [];
-
-    const removeSession = (sessionId: string): void => {
-      if (!sessionId || removed.has(sessionId) || protectedSessions.has(sessionId)) {
-        return;
-      }
-
-      if (archiveFirst) {
-        if (dryRun) {
-          archived.push(sessionId);
-          removed.add(sessionId);
-          return;
-        }
-        const archivedResult = archiveSessionRecord({
-          sessionDirectory: this.sessionDirectory,
-          sessionId,
-          lock: this.sessionLockOptions()
-        });
-        if (archivedResult) {
-          archived.push(sessionId);
-          removed.add(sessionId);
-          try {
-            manager?.deleteSession(sessionId);
-          } catch {
-            // best effort
-          }
-          return;
-        }
-      }
-
-      if (dryRun) {
-        deleted.push(sessionId);
-        removed.add(sessionId);
-        return;
-      }
-      const deletedResult = deleteSessionRecord({
-        sessionDirectory: this.sessionDirectory,
-        sessionId,
-        lock: this.sessionLockOptions()
-      });
-      if (deletedResult) {
-        deleted.push(sessionId);
-        removed.add(sessionId);
-        try {
-          manager?.deleteSession(sessionId);
-        } catch {
-          // best effort
-        }
-      }
-    };
-
-    const maxAgeDays = policy.maxAgeDays ?? 0;
-    if (maxAgeDays > 0) {
-      const ageCutoffMs = now - maxAgeDays * 24 * 60 * 60 * 1000;
-      for (const entry of entries) {
-        const lastActivityMs = Date.parse(entry.lastActivityAt);
-        if (!Number.isFinite(lastActivityMs)) {
-          continue;
-        }
-        if (lastActivityMs <= ageCutoffMs) {
-          removeSession(entry.sessionId);
-        }
-      }
-    }
-
-    const archiveAfterIdleMs = policy.archiveAfterIdleMs ?? 0;
-    if (archiveAfterIdleMs > 0) {
-      for (const entry of entries) {
-        if (removed.has(entry.sessionId)) {
-          continue;
-        }
-        const lastActivityMs = Date.parse(entry.lastActivityAt);
-        if (!Number.isFinite(lastActivityMs)) {
-          continue;
-        }
-        if (now - lastActivityMs >= archiveAfterIdleMs) {
-          removeSession(entry.sessionId);
-        }
-      }
-    }
-
-    const remaining = entries
-      .filter((entry) => !removed.has(entry.sessionId))
-      .sort((left, right) => Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt));
-
-    const maxSessions = policy.maxSessions ?? 0;
-    if (maxSessions > 0 && remaining.length > maxSessions) {
-      for (const entry of remaining.slice(maxSessions)) {
-        removeSession(entry.sessionId);
-      }
-    }
-
-    const maxTotalBytes = policy.maxTotalBytes ?? 0;
-    if (maxTotalBytes > 0) {
-      const latestEntries = listSessionIndex(this.sessionDirectory)
-        .filter((entry) => !removed.has(entry.sessionId))
-        .sort((left, right) => Date.parse(left.lastActivityAt) - Date.parse(right.lastActivityAt));
-      let totalBytes = latestEntries.reduce(
-        (sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId),
-        0
-      );
-      for (const entry of latestEntries) {
-        if (totalBytes <= maxTotalBytes) {
-          break;
-        }
-        const bytes = sessionStorageBytes(this.sessionDirectory, entry.sessionId);
-        removeSession(entry.sessionId);
-        totalBytes = Math.max(0, totalBytes - bytes);
-      }
-    }
-
-    return {
-      archived,
-      deleted
-    };
+    return sessionAdmin.applySessionRetentionPlan(this, dryRun, policyOverride);
   }
 
   enforceSessionRetention(): { archived: string[]; deleted: string[] } {
-    return this.applySessionRetentionPlan(false);
+    return sessionAdmin.enforceSessionRetention(this);
   }
 
   pruneSessions(params?: {
     dryRun?: boolean;
     policyOverride?: SessionStoreConfig["retention"];
   }): { archived: string[]; deleted: string[]; dryRun: boolean } {
-    const dryRun = params?.dryRun === true;
-    const result = this.applySessionRetentionPlan(dryRun, params?.policyOverride);
-    return {
-      ...result,
-      dryRun
-    };
+    return sessionAdmin.pruneSessions(this, params);
   }
 
   getSessionRetentionStatus(): {
@@ -4672,23 +654,7 @@ export class GatewayRuntime {
     totalSessions: number;
     totalBytes: number;
   } {
-    const enabled = (this.config.sessionStore?.retention?.enabled ?? true) && this.sessionStoreEnabled;
-    if (!this.sessionStoreEnabled) {
-      return {
-        enabled: false,
-        policy: this.config.sessionStore?.retention,
-        totalSessions: 0,
-        totalBytes: 0
-      };
-    }
-    const index = listSessionIndex(this.sessionDirectory);
-    const totalBytes = index.reduce((sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId), 0);
-    return {
-      enabled,
-      policy: this.config.sessionStore?.retention,
-      totalSessions: index.length,
-      totalBytes
-    };
+    return sessionAdmin.getSessionRetentionStatus(this);
   }
 
   resolveChannelSession(params: {
@@ -4696,17 +662,7 @@ export class GatewayRuntime {
     mapping?: ChannelSessionMappingOptions;
     title?: string;
   }): string {
-    const channelKey = this.channelSessionKey(params.identity, params.mapping);
-    const mapped = this.channelSessionAssignments.get(channelKey);
-    const sessionId = mapped ?? channelKey;
-    this.ensureSession(sessionId, {
-      title: params.title,
-      origin: createChannelSessionOrigin(params.identity)
-    });
-    if (!mapped) {
-      this.channelSessionAssignments.set(channelKey, sessionId);
-    }
-    return sessionId;
+    return sessionRuntime.resolveChannelSession(this, params);
   }
 
   listOrchestrationLaneStatuses(): Array<{
@@ -4718,35 +674,19 @@ export class GatewayRuntime {
     queued: number;
     active: boolean;
   }> {
-    return Array.from(this.channelLanes.entries())
-      .map(([sessionId, lane]) => ({
-        sessionId,
-        mode: lane.mode,
-        cap: lane.cap,
-        dropPolicy: lane.dropPolicy,
-        collectDebounceMs: lane.collectDebounceMs,
-        queued: lane.queue.length,
-        active: Boolean(lane.active)
-      }))
-      .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    return orchestration.listOrchestrationLaneStatuses(this);
   }
 
   listLoadedToolNames(): string[] {
-    return Array.from(this.toolRegistry.keys()).sort((left, right) => left.localeCompare(right));
+    return runtimeCore.listLoadedToolNames(this);
   }
 
   listPersistedSessionIds(): string[] {
-    if (!this.sessionStoreEnabled) {
-      return [];
-    }
-    return listSessionIds(this.sessionDirectory);
+    return sessionRuntime.listPersistedSessionIds(this);
   }
 
   listContinuityJobs(limit = 20): unknown[] {
-    if (!this.continuityRuntime) {
-      return [];
-    }
-    return this.continuityRuntime.listJobs(limit);
+    return sessionRuntime.listContinuityJobs(this, limit);
   }
 }
 
