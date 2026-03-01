@@ -6,6 +6,8 @@
 
 **Drost is an open-source framework for persistent, self-evolving AI agents.**
 
+Current release candidate: `v0.1.0-rc.1`
+
 An agent in Drost is a long-running runtime, not a one-shot prompt wrapper.
 
 ## Why Drost
@@ -16,7 +18,7 @@ An agent in Drost is a long-running runtime, not a one-shot prompt wrapper.
 - Built-in and custom tools
 - Workspace memory and prompt files
 - Terminal-first operation (TUI + plain modes)
-- No built-in mutation boundaries or restart approval gates in default runtime
+- Policy-driven mutation boundaries and operational control surfaces
 
 ## Quickstart (Repo = Agent Workspace)
 
@@ -79,8 +81,12 @@ drost providers probe 20000
 - Providers `openai` / `openai-compatible` via **Responses API only**
 - Provider `anthropic` (setup-token/OAuth-compatible flow)
 - Session persistence + rehydration
+- Session continuity handoff and retention policies
 - Built-in tools + custom tool loading + tool lifecycle events
-- File/code tools are not constrained by `mutableRoots` boundaries in current default behavior
+- Tool policy enforcement and mutable-root safety boundaries
+- Provider routing + failover/cooldown tracking
+- Control API (`/control/v1`) + SSE runtime events
+- Observability JSONL streams for runtime/tool/usage
 - Ink-based TUI and plain CLI mode
 
 ## Docs
@@ -88,11 +94,15 @@ drost providers probe 20000
 - [Getting Started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
+- [Config Reference (P0)](docs/config-reference.md)
+- [Control API](docs/control-api.md)
 - [Auth & Providers](docs/auth-and-providers.md)
 - [Telegram Channel Setup](docs/telegram.md)
 - [Runtime Operations](docs/runtime-operations.md)
 - [Self-Evolution](docs/self-evolution.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Release v0.1.0-rc.1](docs/releases/v0.1.0-rc.1.md)
+- [P0 RC1 Migration](docs/migrations/2026-03-01-p0-rc1.md)
 
 ## Planning
 
@@ -102,6 +112,7 @@ drost providers probe 20000
 ## Contributing
 
 ```bash
+pnpm smoke
 pnpm test
 pnpm build
 ```

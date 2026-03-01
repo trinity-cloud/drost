@@ -41,6 +41,7 @@ drost tool new <name> [--template <id>]
 - `/session`
 - `/session <id>`
 - `/sessions`
+- `/new`
 - `/status`
 - `/tools`
 - `/tool <name> [json]`
@@ -59,13 +60,12 @@ drost tool new <name> [--template <id>]
 
 ## Default Safety Model
 
-Current default runtime behavior is permissive:
+Current runtime safety is policy-driven:
 
-- built-in file/code tools are not hard-limited by `mutableRoots`
-- restart path is not gated by approval/budget/git checkpoint policy
-- shell tool does not enforce allow/deny prefix lists
-
-Apply environment-level controls when strict isolation is required.
+- built-in file/code/shell operations enforce mutable-root boundaries.
+- shell tool can be constrained with allow/deny command prefixes.
+- tool execution can be constrained with `toolPolicy`.
+- restart flow remains configurable through `restartPolicy`.
 
 ## Restart Contract
 
@@ -79,5 +79,8 @@ When `sessionStore.enabled` is true, session history and metadata persist under 
 
 Important:
 
-- if you delete `.drost/sessions`, you start fresh.
+- each session stores both transcript and full event logs (`.jsonl` + `.full.jsonl`).
 - if you keep the project and restart runtime, sessions rehydrate.
+- if you are upgrading from older pre-P0 state, reset `.drost` once.
+
+See [P0 RC1 Migration](migrations/2026-03-01-p0-rc1.md).

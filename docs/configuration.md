@@ -28,7 +28,48 @@ export default {
   },
   sessionStore: {
     enabled: true,
-    directory: "./.drost/sessions"
+    directory: "./.drost/sessions",
+    continuity: {
+      enabled: true
+    },
+    retention: {
+      enabled: true,
+      maxSessions: 250
+    }
+  },
+  orchestration: {
+    enabled: true,
+    defaultMode: "queue",
+    persistState: true
+  },
+  providerRouter: {
+    enabled: true,
+    defaultRoute: "route-default",
+    routes: [
+      {
+        id: "route-default",
+        primaryProviderId: "openai-main",
+        fallbackProviderIds: ["anthropic-fallback"]
+      }
+    ]
+  },
+  failover: {
+    enabled: true
+  },
+  toolPolicy: {
+    profile: "balanced"
+  },
+  controlApi: {
+    enabled: true,
+    host: "127.0.0.1",
+    port: 8788,
+    token: process.env.DROST_CONTROL_ADMIN_TOKEN,
+    readToken: process.env.DROST_CONTROL_READ_TOKEN,
+    allowLoopbackWithoutAuth: false
+  },
+  observability: {
+    enabled: true,
+    directory: "./.drost/observability"
   },
   health: {
     enabled: true,
@@ -60,9 +101,17 @@ export default {
 - `sessionStore`: persistent session settings.
 - `health`: health endpoint settings.
 - `shell`: shell execution settings (`timeoutMs`, `maxBufferBytes`).
+- `toolPolicy`: gateway-level tool allow/deny and profile controls.
+- `orchestration`: channel lane mode/cap/drop/persistence settings.
+- `providerRouter`: session route-to-provider mapping and defaults.
+- `failover`: retry/cooldown policy for provider fallback behavior.
+- `controlApi`: authenticated `/control/v1` server options.
+- `observability`: JSONL telemetry stream settings.
 - `providers`: provider topology and startup probes.
-- `restartPolicy`: restart policy config shape (currently permissive by default runtime behavior).
+- `restartPolicy`: restart policy, budget, and git checkpoint controls.
 - `hooks`: gateway lifecycle hooks.
+
+For full P0 blocks and examples, see [Config Reference (P0)](config-reference.md).
 
 ## Provider Profiles
 
@@ -92,12 +141,15 @@ Restart-required examples:
 - `workspaceDir`
 - `toolDirectory`
 - provider topology
+- `failover`
 - `agent` / `runtime`
 - `evolution`
 
-## Notes On `evolution` (Current State)
+## Mutable Roots and Tool Boundaries
 
-The `evolution` block remains useful for orchestration metadata and forward compatibility.
-In current default runtime behavior, built-in tools are not hard-gated by `evolution.mutableRoots`.
+Built-in file/code/shell operations enforce mutable-root boundaries.
 
-See `product-planning/03-self-evolving-agent-code/`.
+- default mutable root: `workspaceDir`
+- override roots: `evolution.mutableRoots`
+
+Tool policy and shell prefix policy can further restrict execution.

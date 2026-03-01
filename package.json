@@ -1,5 +1,6 @@
 {
   "name": "drost-monorepo",
+  "version": "0.1.0-rc.1",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -8,6 +9,10 @@
     "build": "pnpm -r --if-present build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "smoke:cli": "node scripts/smoke/cli-smoke.mjs",
+    "smoke:control-api": "node scripts/smoke/control-api-smoke.mjs",
+    "smoke": "pnpm run smoke:cli && pnpm run smoke:control-api",
+    "release:rc": "pnpm build && pnpm test && pnpm smoke",
     "lint": "echo 'lint not configured yet'"
   },
   "devDependencies": {
