@@ -14,7 +14,8 @@ import type {
   GatewayConfig,
   GatewayRestartIntent,
   GatewayRestartRequestContext,
-  GatewayGitCheckpointResult
+  GatewayGitCheckpointResult,
+  SessionStoreConfig
 } from "./config.js";
 import type {
   ChannelAdapter,
@@ -29,7 +30,7 @@ import type { AgentDefinition } from "./agent.js";
 import { loadAgentDefinition } from "./agent.js";
 import { loadAuthStore } from "./auth/store.js";
 import type { AuthStore } from "./auth/store.js";
-import { ProviderManager } from "./providers/manager.js";
+import { ProviderManager, type ProviderRouteSelection } from "./providers/manager.js";
 import { AnthropicMessagesAdapter } from "./providers/anthropic.js";
 import { CodexExecAdapter } from "./providers/codex-exec.js";
 import { OpenAIResponsesAdapter } from "./providers/openai-responses.js";
@@ -77,6 +78,7 @@ const DEFAULT_RESTART_BUDGET_INTENTS: ReadonlySet<GatewayRestartIntent> = new Se
 const CONTROL_EVENT_STREAM_PING_MS = 15_000;
 const CONTROL_JSON_BODY_MAX_BYTES = 512_000;
 const OBS_MAX_TEXT_CHARS = 8_000;
+const ORCHESTRATION_STATE_FILE = path.join(".drost", "orchestration-lanes.json");
 
 export type GatewayState = "stopped" | "running" | "degraded";
 
@@ -116,7 +118,7 @@ export interface ToolRunResult {
   ok: boolean;
   output?: unknown;
   error?: {
-    code: "tool_not_found" | "validation_error" | "execution_error";
+    code: "tool_not_found" | "validation_error" | "execution_error" | "policy_denied";
     message: string;
     issues?: Array<{ path: string; message: string; code?: string }>;
   };
@@ -206,7 +208,8 @@ export type GatewayRuntimeEventType =
   | "orchestration.submitted"
   | "orchestration.started"
   | "orchestration.completed"
-  | "orchestration.dropped";
+  | "orchestration.dropped"
+  | "tool.policy.denied";
 
 export interface GatewayRuntimeEvent {
   type: GatewayRuntimeEventType;
@@ -254,6 +257,22 @@ interface ChannelLaneState {
   queue: PendingChannelTurn[];
   active: ActiveChannelTurn | null;
   collectTimer: NodeJS.Timeout | null;
+}
+
+interface PersistedChannelLaneState {
+  sessionId: string;
+  mode: OrchestrationMode;
+  cap: number;
+  dropPolicy: OrchestrationDropPolicy;
+  collectDebounceMs: number;
+  queuedInputs: string[];
+  activeInput?: string;
+}
+
+interface PersistedChannelLaneSnapshot {
+  version: 1;
+  updatedAt: string;
+  lanes: PersistedChannelLaneState[];
 }
 
 interface RestartHistoryEntry {
@@ -456,7 +475,10 @@ export class GatewayRuntime {
   private runtimeEvents: GatewayRuntimeEvent[] = [];
   private channelAdapters = new Map<string, ChannelAdapter>();
   private channelSessionAssignments = new Map<string, string>();
+  private sessionProviderRouteOverrides = new Map<string, string>();
   private channelLanes = new Map<string, ChannelLaneState>();
+  private orchestrationStatePath: string;
+  private suppressOrchestrationPersistence = false;
   private continuityRuntime: SessionContinuityRuntime | null = null;
   private observabilityDirectory: string;
   private observabilityWriteFailed = false;
@@ -482,6 +504,7 @@ export class GatewayRuntime {
     this.observabilityDirectory = path.resolve(
       this.config.observability?.directory ?? path.join(this.workspaceDir, ".drost", "observability")
     );
+    this.orchestrationStatePath = path.resolve(this.workspaceDir, ORCHESTRATION_STATE_FILE);
     this.agentEntryPath = this.config.agent?.entry ? path.resolve(this.config.agent.entry) : null;
     this.restartHistoryPath = path.resolve(this.workspaceDir, DEFAULT_RESTART_HISTORY_FILE);
     this.sessionStoreEnabled = this.config.sessionStore?.enabled ?? true;
@@ -741,6 +764,274 @@ export class GatewayRuntime {
     return this.providerManager;
   }
 
+  private providerRouteMap(): Map<string, { id: string; primaryProviderId: string; fallbackProviderIds: string[] }> {
+    const routes = new Map<string, { id: string; primaryProviderId: string; fallbackProviderIds: string[] }>();
+    for (const route of this.config.providerRouter?.routes ?? []) {
+      const routeId = route.id.trim();
+      const primaryProviderId = route.primaryProviderId.trim();
+      if (!routeId || !primaryProviderId) {
+        continue;
+      }
+      routes.set(routeId, {
+        id: routeId,
+        primaryProviderId,
+        fallbackProviderIds: (route.fallbackProviderIds ?? [])
+          .map((providerId) => providerId.trim())
+          .filter((providerId) => providerId.length > 0 && providerId !== primaryProviderId)
+      });
+    }
+    return routes;
+  }
+
+  private validateProviderRoutes(): void {
+    if (!(this.config.providerRouter?.enabled ?? false)) {
+      return;
+    }
+    const routes = this.providerRouteMap();
+    if (routes.size === 0) {
+      this.degradedReasons.push("providerRouter.enabled=true but no valid routes are configured");
+      this.state = "degraded";
+      return;
+    }
+    const knownProviderIds = new Set((this.config.providers?.profiles ?? []).map((profile) => profile.id));
+    for (const route of routes.values()) {
+      if (!knownProviderIds.has(route.primaryProviderId)) {
+        this.degradedReasons.push(
+          `Provider route ${route.id} references unknown primary provider ${route.primaryProviderId}`
+        );
+        this.state = "degraded";
+      }
+      for (const fallbackProviderId of route.fallbackProviderIds) {
+        if (!knownProviderIds.has(fallbackProviderId)) {
+          this.degradedReasons.push(
+            `Provider route ${route.id} references unknown fallback provider ${fallbackProviderId}`
+          );
+          this.state = "degraded";
+        }
+      }
+    }
+  }
+
+  private selectedRouteIdForSession(sessionId: string): string | null {
+    const override = this.sessionProviderRouteOverrides.get(sessionId)?.trim();
+    if (override) {
+      return override;
+    }
+    const fromMetadata = this.ensureProviderManager()?.getSession(sessionId)?.metadata.providerRouteId?.trim();
+    if (fromMetadata) {
+      return fromMetadata;
+    }
+    const defaultRoute = this.config.providerRouter?.defaultRoute?.trim();
+    return defaultRoute || null;
+  }
+
+  private resolveProviderRouteSelection(sessionId: string): ProviderRouteSelection | null {
+    const enabled = this.config.providerRouter?.enabled ?? false;
+    if (!enabled) {
+      return null;
+    }
+    const routeId = this.selectedRouteIdForSession(sessionId);
+    if (!routeId) {
+      return null;
+    }
+    const route = this.providerRouteMap().get(routeId);
+    if (!route) {
+      const message = `Unknown provider route: ${routeId}`;
+      if (!this.degradedReasons.includes(message)) {
+        this.degradedReasons.push(message);
+      }
+      this.state = "degraded";
+      return null;
+    }
+    return {
+      routeId: route.id,
+      primaryProviderId: route.primaryProviderId,
+      fallbackProviderIds: route.fallbackProviderIds
+    };
+  }
+
+  listProviderRoutes(): Array<{ id: string; primaryProviderId: string; fallbackProviderIds: string[] }> {
+    return Array.from(this.providerRouteMap().values());
+  }
+
+  getSessionProviderRoute(sessionId: string): string | undefined {
+    const manager = this.ensureProviderManager();
+    const routeId =
+      this.sessionProviderRouteOverrides.get(sessionId)?.trim() ??
+      manager?.getSession(sessionId)?.metadata.providerRouteId?.trim();
+    return routeId && routeId.length > 0 ? routeId : undefined;
+  }
+
+  setSessionProviderRoute(sessionId: string, routeId: string): SessionMutationResult {
+    const normalizedSessionId = sessionId.trim();
+    const normalizedRouteId = routeId.trim();
+    if (!normalizedSessionId || !normalizedRouteId) {
+      return {
+        ok: false,
+        message: "sessionId and routeId are required"
+      };
+    }
+    const route = this.providerRouteMap().get(normalizedRouteId);
+    if (!route) {
+      return {
+        ok: false,
+        message: `Unknown provider route: ${normalizedRouteId}`
+      };
+    }
+    if (!this.sessionExists(normalizedSessionId)) {
+      return {
+        ok: false,
+        message: `Unknown session: ${normalizedSessionId}`
+      };
+    }
+    this.ensureSession(normalizedSessionId);
+    this.sessionProviderRouteOverrides.set(normalizedSessionId, normalizedRouteId);
+    const manager = this.ensureProviderManager();
+    manager?.updateSessionMetadata(normalizedSessionId, {
+      providerRouteId: normalizedRouteId
+    });
+    this.persistSessionState(normalizedSessionId);
+    this.emitRuntimeEvent("gateway.config.reloaded", {
+      action: "session.provider_route",
+      sessionId: normalizedSessionId,
+      routeId: normalizedRouteId
+    });
+    return {
+      ok: true,
+      message: `Session ${normalizedSessionId} route set to ${normalizedRouteId}`,
+      sessionId: normalizedSessionId
+    };
+  }
+
+  private shouldPersistOrchestrationState(): boolean {
+    return (this.config.orchestration?.enabled ?? false) && (this.config.orchestration?.persistState ?? false);
+  }
+
+  private persistedLaneStateSnapshot(): PersistedChannelLaneSnapshot {
+    const lanes: PersistedChannelLaneState[] = [];
+    for (const [sessionId, lane] of this.channelLanes.entries()) {
+      lanes.push({
+        sessionId,
+        mode: lane.mode,
+        cap: lane.cap,
+        dropPolicy: lane.dropPolicy,
+        collectDebounceMs: lane.collectDebounceMs,
+        queuedInputs: lane.queue.map((entry) => entry.input),
+        activeInput: lane.active?.input
+      });
+    }
+    return {
+      version: 1,
+      updatedAt: nowIso(),
+      lanes
+    };
+  }
+
+  private writeOrchestrationState(snapshot: PersistedChannelLaneSnapshot): void {
+    ensureDirectory(path.dirname(this.orchestrationStatePath));
+    const next = JSON.stringify(snapshot, null, 2);
+    const tempPath = `${this.orchestrationStatePath}.tmp`;
+    fs.writeFileSync(tempPath, next, "utf8");
+    fs.renameSync(tempPath, this.orchestrationStatePath);
+  }
+
+  private persistOrchestrationState(): void {
+    if (!this.shouldPersistOrchestrationState() || this.suppressOrchestrationPersistence) {
+      return;
+    }
+    try {
+      this.writeOrchestrationState(this.persistedLaneStateSnapshot());
+    } catch (error) {
+      this.degradedReasons.push(
+        `Failed to persist orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+    }
+  }
+
+  private restoreOrchestrationState(): void {
+    if (!this.shouldPersistOrchestrationState()) {
+      return;
+    }
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.orchestrationStatePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return;
+      }
+      this.degradedReasons.push(
+        `Failed to read orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as Partial<PersistedChannelLaneSnapshot>;
+      if (parsed.version !== 1 || !Array.isArray(parsed.lanes)) {
+        return;
+      }
+      for (const laneRecord of parsed.lanes) {
+        const sessionId = typeof laneRecord?.sessionId === "string" ? laneRecord.sessionId.trim() : "";
+        if (!sessionId) {
+          continue;
+        }
+        const lane: ChannelLaneState = {
+          mode:
+            laneRecord.mode === "interrupt" ||
+            laneRecord.mode === "collect" ||
+            laneRecord.mode === "steer" ||
+            laneRecord.mode === "steer_backlog"
+              ? laneRecord.mode
+              : "queue",
+          cap:
+            typeof laneRecord.cap === "number" && Number.isFinite(laneRecord.cap)
+              ? Math.max(1, Math.floor(laneRecord.cap))
+              : Math.max(1, this.config.orchestration?.defaultCap ?? 32),
+          dropPolicy:
+            laneRecord.dropPolicy === "new" || laneRecord.dropPolicy === "summarize"
+              ? laneRecord.dropPolicy
+              : "old",
+          collectDebounceMs:
+            typeof laneRecord.collectDebounceMs === "number" && Number.isFinite(laneRecord.collectDebounceMs)
+              ? Math.max(0, Math.floor(laneRecord.collectDebounceMs))
+              : Math.max(0, this.config.orchestration?.collectDebounceMs ?? 350),
+          queue: [],
+          active: null,
+          collectTimer: null
+        };
+
+        const restoredInputs: string[] = [];
+        if (typeof laneRecord.activeInput === "string" && laneRecord.activeInput.trim().length > 0) {
+          restoredInputs.push(laneRecord.activeInput);
+        }
+        if (Array.isArray(laneRecord.queuedInputs)) {
+          for (const input of laneRecord.queuedInputs) {
+            if (typeof input === "string" && input.trim().length > 0) {
+              restoredInputs.push(input);
+            }
+          }
+        }
+        for (const input of restoredInputs) {
+          lane.queue.push({
+            input,
+            onEvent: () => undefined,
+            resolve: () => undefined,
+            reject: () => undefined,
+            enqueuedAt: nowIso()
+          });
+        }
+        this.channelLanes.set(sessionId, lane);
+      }
+    } catch (error) {
+      this.degradedReasons.push(
+        `Failed to parse orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.state = "degraded";
+    }
+  }
+
   private async startHealthServer(): Promise<void> {
     if (this.healthServer) {
       return;
@@ -872,7 +1163,7 @@ export class GatewayRuntime {
     request: http.IncomingMessage,
     isMutation: boolean
   ): ControlAuthResult {
-    const allowLoopbackWithoutAuth = this.config.controlApi?.allowLoopbackWithoutAuth ?? true;
+    const allowLoopbackWithoutAuth = this.config.controlApi?.allowLoopbackWithoutAuth ?? false;
     const remoteAddress = request.socket.remoteAddress;
     if (allowLoopbackWithoutAuth && isLoopbackRemoteAddress(remoteAddress)) {
       return {
@@ -1040,7 +1331,10 @@ export class GatewayRuntime {
         loadedTools: this.listLoadedToolNames(),
         sessions: this.listSessionSnapshots().length,
         channels: this.listChannelAdapterIds(),
-        continuity: this.listContinuityJobs(20)
+        continuity: this.listContinuityJobs(20),
+        providerRoutes: this.listProviderRoutes(),
+        orchestrationLanes: this.listOrchestrationLaneStatuses(),
+        retention: this.getSessionRetentionStatus()
       });
       return;
     }
@@ -1054,6 +1348,22 @@ export class GatewayRuntime {
         ok: true,
         sessions: this.listSessionSnapshots().slice(0, limit),
         total: this.listSessionSnapshots().length
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/sessions/retention`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        retention: this.getSessionRetentionStatus()
+      });
+      return;
+    }
+
+    if (method === "GET" && pathname === `${basePath}/orchestration/lanes`) {
+      this.writeControlJson(response, 200, {
+        ok: true,
+        lanes: this.listOrchestrationLaneStatuses()
       });
       return;
     }
@@ -1082,7 +1392,8 @@ export class GatewayRuntime {
         ok: true,
         providerProfiles: this.listProviderProfiles(),
         providerDiagnostics: this.providerDiagnostics,
-        failover: this.getProviderFailoverStatus()
+        failover: this.getProviderFailoverStatus(),
+        routes: this.listProviderRoutes()
       });
       return;
     }
@@ -1125,14 +1436,34 @@ export class GatewayRuntime {
       const channel = typeof body.channel === "string" ? body.channel : undefined;
       const title = typeof body.title === "string" ? body.title : undefined;
       const fromSessionId = typeof body.fromSessionId === "string" ? body.fromSessionId : undefined;
+      const providerRouteId = typeof body.providerRouteId === "string" ? body.providerRouteId.trim() : "";
       const sessionId = this.createSession({
         channel,
         title,
         fromSessionId
       });
+      if (providerRouteId) {
+        this.setSessionProviderRoute(sessionId, providerRouteId);
+      }
       this.writeControlJson(response, 200, {
         ok: true,
         sessionId
+      });
+      return;
+    }
+
+    if (method === "POST" && pathname === `${basePath}/sessions/prune`) {
+      const policyOverride =
+        body.policy && typeof body.policy === "object"
+          ? (body.policy as SessionStoreConfig["retention"])
+          : undefined;
+      const prune = this.pruneSessions({
+        dryRun: body.dryRun === true,
+        policyOverride
+      });
+      this.writeControlJson(response, 200, {
+        ok: true,
+        prune
       });
       return;
     }
@@ -1176,6 +1507,19 @@ export class GatewayRuntime {
         ok: switchResult.ok,
         message: switchResult.message,
         sessionId: switchResult.sessionId
+      });
+      return;
+    }
+
+    const routeMatch = pathname.match(/^\/control\/v1\/sessions\/([^/]+)\/route$/);
+    if (method === "POST" && routeMatch) {
+      const targetSessionId = decodeURIComponent(routeMatch[1] ?? "");
+      const routeId = typeof body.routeId === "string" ? body.routeId : "";
+      const result = this.setSessionProviderRoute(targetSessionId, routeId);
+      this.writeControlJson(response, result.ok ? 200 : 400, {
+        ok: result.ok,
+        message: result.message,
+        sessionId: result.sessionId
       });
       return;
     }
@@ -1559,6 +1903,9 @@ export class GatewayRuntime {
       pendingProviderId: loaded.record.pendingProviderId,
       metadata: loaded.record.metadata
     });
+    if (loaded.record.metadata.providerRouteId) {
+      this.sessionProviderRouteOverrides.set(sessionId, loaded.record.metadata.providerRouteId);
+    }
   }
 
   private persistSessionState(sessionId: string): void {
@@ -1621,6 +1968,7 @@ export class GatewayRuntime {
     if (this.state === "running" || this.state === "degraded") {
       return this.getStatus();
     }
+    this.suppressOrchestrationPersistence = false;
 
     this.emitRuntimeEvent("gateway.starting", {
       workspaceDir: this.workspaceDir,
@@ -1634,11 +1982,11 @@ export class GatewayRuntime {
     if (this.sessionStoreEnabled) {
       ensureDirectory(this.sessionDirectory);
     }
-    this.ensureObservabilityDirectory();
-    this.loadRestartHistory();
-
     this.degradedReasons = [];
     this.providerDiagnostics = [];
+    this.ensureObservabilityDirectory();
+    this.loadRestartHistory();
+    this.restoreOrchestrationState();
     await this.loadConfiguredAgentDefinition();
 
     const toolRegistryResult = await buildToolRegistry({
@@ -1656,6 +2004,7 @@ export class GatewayRuntime {
 
     if (this.config.providers) {
       this.ensureProviderManager();
+      this.validateProviderRoutes();
       const probeEnabled = this.config.providers.startupProbe?.enabled ?? true;
       if (probeEnabled && this.providerManager) {
         const timeoutMs = this.config.providers.startupProbe?.timeoutMs ?? 10_000;
@@ -1732,6 +2081,17 @@ export class GatewayRuntime {
     this.emitRuntimeEvent("gateway.stopping", {
       state: this.state
     });
+    if (this.shouldPersistOrchestrationState()) {
+      try {
+        this.writeOrchestrationState(this.persistedLaneStateSnapshot());
+      } catch (error) {
+        this.degradedReasons.push(
+          `Failed to persist orchestration lane state: ${error instanceof Error ? error.message : String(error)}`
+        );
+        this.state = "degraded";
+      }
+    }
+    this.suppressOrchestrationPersistence = true;
     await this.stopControlServer();
     await this.stopHealthServer();
     for (const lane of this.channelLanes.values()) {
@@ -1899,6 +2259,13 @@ export class GatewayRuntime {
         message: "evolution policy configuration requires restart"
       });
     }
+    if (patch.failover !== undefined) {
+      rejected.push({
+        path: "failover",
+        reason: "restart_required",
+        message: "failover configuration requires restart to rebuild provider manager"
+      });
+    }
 
     if (patch.health) {
       this.config.health = {
@@ -1917,6 +2284,32 @@ export class GatewayRuntime {
           this.state = "degraded";
         }
       }
+    }
+
+    if (patch.toolPolicy) {
+      this.config.toolPolicy = {
+        ...(this.config.toolPolicy ?? {}),
+        ...patch.toolPolicy
+      };
+      applied.push("toolPolicy");
+    }
+
+    if (patch.providerRouter) {
+      this.config.providerRouter = {
+        ...(this.config.providerRouter ?? {}),
+        ...patch.providerRouter,
+        routes: patch.providerRouter.routes ?? this.config.providerRouter?.routes
+      };
+      applied.push("providerRouter");
+    }
+
+    if (patch.orchestration) {
+      this.config.orchestration = {
+        ...(this.config.orchestration ?? {}),
+        ...patch.orchestration
+      };
+      applied.push("orchestration");
+      this.persistOrchestrationState();
     }
 
     if (patch.controlApi) {
@@ -2133,7 +2526,9 @@ export class GatewayRuntime {
     this.persistSessionState(sessionId);
   }
 
-  getSessionState(sessionId: string): { activeProviderId: string; pendingProviderId?: string } | null {
+  getSessionState(
+    sessionId: string
+  ): { activeProviderId: string; pendingProviderId?: string; metadata?: SessionMetadata } | null {
     const manager = this.ensureProviderManager();
     if (!manager) {
       return null;
@@ -2144,7 +2539,10 @@ export class GatewayRuntime {
     }
     return {
       activeProviderId: session.activeProviderId,
-      pendingProviderId: session.pendingProviderId
+      pendingProviderId: session.pendingProviderId,
+      metadata: {
+        ...session.metadata
+      }
     };
   }
 
@@ -2161,6 +2559,49 @@ export class GatewayRuntime {
       return "local";
     }
     return session.activeProviderId;
+  }
+
+  private isToolAllowed(toolName: string): { allowed: boolean; reason?: string } {
+    const policy = this.config.toolPolicy;
+    if (!policy) {
+      return {
+        allowed: true
+      };
+    }
+
+    const denied = new Set((policy.deniedTools ?? []).map((name) => name.trim()).filter((name) => name.length > 0));
+    const allowed =
+      policy.allowedTools && policy.allowedTools.length > 0
+        ? new Set(policy.allowedTools.map((name) => name.trim()).filter((name) => name.length > 0))
+        : null;
+
+    if (denied.has(toolName)) {
+      return {
+        allowed: false,
+        reason: `Tool "${toolName}" denied by toolPolicy.deniedTools`
+      };
+    }
+    if (allowed && !allowed.has(toolName)) {
+      return {
+        allowed: false,
+        reason: `Tool "${toolName}" not in toolPolicy.allowedTools`
+      };
+    }
+
+    const profile = policy.profile ?? "balanced";
+    if (profile === "strict") {
+      const strictDefaultDenied = new Set(["shell", "web"]);
+      if (strictDefaultDenied.has(toolName) && !(allowed?.has(toolName) ?? false)) {
+        return {
+          allowed: false,
+          reason: `Tool "${toolName}" denied by strict tool policy profile`
+        };
+      }
+    }
+
+    return {
+      allowed: true
+    };
   }
 
   async runTool(params: {
@@ -2190,6 +2631,38 @@ export class GatewayRuntime {
         error: {
           code: "tool_not_found",
           message: `Unknown tool: ${toolName}`
+        }
+      };
+    }
+
+    const policyCheck = this.isToolAllowed(toolName);
+    if (!policyCheck.allowed) {
+      const deniedReason = policyCheck.reason ?? `Tool "${toolName}" denied by policy`;
+      this.emitRuntimeEvent("tool.policy.denied", {
+        sessionId: params.sessionId,
+        toolName,
+        reason: deniedReason
+      });
+      this.appendSessionEvent(params.sessionId, "tool.policy.denied", {
+        toolName,
+        reason: deniedReason
+      });
+      this.appendObservabilityRecord(
+        "usage-events",
+        {
+          kind: "tool.policy.denied",
+          sessionId: params.sessionId,
+          toolName,
+          reason: deniedReason
+        },
+        this.config.observability?.usageEventsEnabled
+      );
+      return {
+        toolName,
+        ok: false,
+        error: {
+          code: "policy_denied",
+          message: deniedReason
         }
       };
     }
@@ -2554,6 +3027,12 @@ export class GatewayRuntime {
     }
 
     let runSucceeded = false;
+    const routeSelection = this.resolveProviderRouteSelection(params.sessionId);
+    if (routeSelection?.routeId) {
+      manager.updateSessionMetadata(params.sessionId, {
+        providerRouteId: routeSelection.routeId
+      });
+    }
     const onEvent: StreamEventHandler = (event) => {
       if (event.type !== "tool.call.started" && event.type !== "tool.call.completed") {
         this.appendSessionEvent(params.sessionId, event.type, {
@@ -2568,6 +3047,7 @@ export class GatewayRuntime {
         sessionId: params.sessionId,
         input,
         authStore: this.authStore,
+        route: routeSelection ?? undefined,
         onEvent,
         signal: params.signal,
         availableToolNames: this.listLoadedToolNames(),
@@ -2647,6 +3127,7 @@ export class GatewayRuntime {
       collectTimer: null
     };
     this.channelLanes.set(sessionId, created);
+    this.persistOrchestrationState();
     return created;
   }
 
@@ -2740,9 +3221,11 @@ export class GatewayRuntime {
 
     const active = takeNext();
     if (!active) {
+      this.persistOrchestrationState();
       return;
     }
     lane.active = active;
+    this.persistOrchestrationState();
     this.emitRuntimeEvent("orchestration.started", {
       sessionId,
       mode: lane.mode,
@@ -2776,6 +3259,7 @@ export class GatewayRuntime {
           clearTimeout(lane.collectTimer);
           lane.collectTimer = null;
         }
+        this.persistOrchestrationState();
         this.startLaneExecution(sessionId, lane);
       });
   }
@@ -2810,6 +3294,7 @@ export class GatewayRuntime {
         }
         lane.active?.controller.abort();
         lane.queue.push(pending);
+        this.persistOrchestrationState();
         this.startLaneExecution(params.sessionId, lane);
         return;
       }
@@ -2823,6 +3308,7 @@ export class GatewayRuntime {
             mode: lane.mode,
             dropPolicy: lane.dropPolicy
           });
+          this.persistOrchestrationState();
           return;
         }
         dropped.reject(new Error("Dropped by queue capacity policy"));
@@ -2834,6 +3320,7 @@ export class GatewayRuntime {
       }
 
       lane.queue.push(pending);
+      this.persistOrchestrationState();
       if (effectiveMode === "collect" && lane.active) {
         return;
       }
@@ -3023,6 +3510,7 @@ export class GatewayRuntime {
       action: "session.delete",
       sessionId
     });
+    this.sessionProviderRouteOverrides.delete(sessionId);
     return {
       ok: true,
       message: `Deleted session ${sessionId}`,
@@ -3115,6 +3603,11 @@ export class GatewayRuntime {
       fromSessionId: params.fromSessionId,
       toSessionId: params.toSessionId
     });
+    const routeOverride = this.sessionProviderRouteOverrides.get(params.fromSessionId);
+    this.sessionProviderRouteOverrides.delete(params.fromSessionId);
+    if (routeOverride) {
+      this.sessionProviderRouteOverrides.set(params.toSessionId, routeOverride);
+    }
     return {
       ok: true,
       message: `Renamed session ${params.fromSessionId} -> ${params.toSessionId}`,
@@ -3201,6 +3694,9 @@ export class GatewayRuntime {
         pendingProviderId: imported.pendingProviderId,
         metadata: imported.metadata
       });
+      if (imported.metadata.providerRouteId) {
+        this.sessionProviderRouteOverrides.set(imported.sessionId, imported.metadata.providerRouteId);
+      }
       return {
         ok: true,
         message: `Imported session ${imported.sessionId}`,
@@ -3251,7 +3747,10 @@ export class GatewayRuntime {
     return archived;
   }
 
-  enforceSessionRetention(): { archived: string[]; deleted: string[] } {
+  private applySessionRetentionPlan(
+    dryRun: boolean,
+    policyOverride?: SessionStoreConfig["retention"]
+  ): { archived: string[]; deleted: string[] } {
     if (!this.sessionStoreEnabled) {
       return {
         archived: [],
@@ -3259,8 +3758,8 @@ export class GatewayRuntime {
       };
     }
 
-    const policy = this.config.sessionStore?.retention;
-    if (!policy) {
+    const policy = policyOverride ?? this.config.sessionStore?.retention;
+    if (!policy || policy.enabled === false) {
       return {
         archived: [],
         deleted: []
@@ -3286,7 +3785,13 @@ export class GatewayRuntime {
       if (!sessionId || removed.has(sessionId) || protectedSessions.has(sessionId)) {
         return;
       }
+
       if (archiveFirst) {
+        if (dryRun) {
+          archived.push(sessionId);
+          removed.add(sessionId);
+          return;
+        }
         const archivedResult = archiveSessionRecord({
           sessionDirectory: this.sessionDirectory,
           sessionId,
@@ -3295,9 +3800,19 @@ export class GatewayRuntime {
         if (archivedResult) {
           archived.push(sessionId);
           removed.add(sessionId);
-          manager?.deleteSession(sessionId);
+          try {
+            manager?.deleteSession(sessionId);
+          } catch {
+            // best effort
+          }
           return;
         }
+      }
+
+      if (dryRun) {
+        deleted.push(sessionId);
+        removed.add(sessionId);
+        return;
       }
       const deletedResult = deleteSessionRecord({
         sessionDirectory: this.sessionDirectory,
@@ -3307,7 +3822,11 @@ export class GatewayRuntime {
       if (deletedResult) {
         deleted.push(sessionId);
         removed.add(sessionId);
-        manager?.deleteSession(sessionId);
+        try {
+          manager?.deleteSession(sessionId);
+        } catch {
+          // best effort
+        }
       }
     };
 
@@ -3357,7 +3876,10 @@ export class GatewayRuntime {
       const latestEntries = listSessionIndex(this.sessionDirectory)
         .filter((entry) => !removed.has(entry.sessionId))
         .sort((left, right) => Date.parse(left.lastActivityAt) - Date.parse(right.lastActivityAt));
-      let totalBytes = latestEntries.reduce((sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId), 0);
+      let totalBytes = latestEntries.reduce(
+        (sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId),
+        0
+      );
       for (const entry of latestEntries) {
         if (totalBytes <= maxTotalBytes) {
           break;
@@ -3371,6 +3893,47 @@ export class GatewayRuntime {
     return {
       archived,
       deleted
+    };
+  }
+
+  enforceSessionRetention(): { archived: string[]; deleted: string[] } {
+    return this.applySessionRetentionPlan(false);
+  }
+
+  pruneSessions(params?: {
+    dryRun?: boolean;
+    policyOverride?: SessionStoreConfig["retention"];
+  }): { archived: string[]; deleted: string[]; dryRun: boolean } {
+    const dryRun = params?.dryRun === true;
+    const result = this.applySessionRetentionPlan(dryRun, params?.policyOverride);
+    return {
+      ...result,
+      dryRun
+    };
+  }
+
+  getSessionRetentionStatus(): {
+    enabled: boolean;
+    policy?: SessionStoreConfig["retention"];
+    totalSessions: number;
+    totalBytes: number;
+  } {
+    const enabled = (this.config.sessionStore?.retention?.enabled ?? true) && this.sessionStoreEnabled;
+    if (!this.sessionStoreEnabled) {
+      return {
+        enabled: false,
+        policy: this.config.sessionStore?.retention,
+        totalSessions: 0,
+        totalBytes: 0
+      };
+    }
+    const index = listSessionIndex(this.sessionDirectory);
+    const totalBytes = index.reduce((sum, entry) => sum + sessionStorageBytes(this.sessionDirectory, entry.sessionId), 0);
+    return {
+      enabled,
+      policy: this.config.sessionStore?.retention,
+      totalSessions: index.length,
+      totalBytes
     };
   }
 
@@ -3390,6 +3953,28 @@ export class GatewayRuntime {
       this.channelSessionAssignments.set(channelKey, sessionId);
     }
     return sessionId;
+  }
+
+  listOrchestrationLaneStatuses(): Array<{
+    sessionId: string;
+    mode: OrchestrationMode;
+    cap: number;
+    dropPolicy: OrchestrationDropPolicy;
+    collectDebounceMs: number;
+    queued: number;
+    active: boolean;
+  }> {
+    return Array.from(this.channelLanes.entries())
+      .map(([sessionId, lane]) => ({
+        sessionId,
+        mode: lane.mode,
+        cap: lane.cap,
+        dropPolicy: lane.dropPolicy,
+        collectDebounceMs: lane.collectDebounceMs,
+        queued: lane.queue.length,
+        active: Boolean(lane.active)
+      }))
+      .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
   }
 
   listLoadedToolNames(): string[] {

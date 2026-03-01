@@ -27,6 +27,7 @@ export interface SessionMetadata {
   lastActivityAt: string;
   title?: string;
   origin?: SessionOriginIdentity;
+  providerRouteId?: string;
 }
 
 export interface LoadedSessionRecord {
@@ -50,6 +51,7 @@ export interface SessionIndexEntry {
   lastActivityAt: string;
   title?: string;
   origin?: SessionOriginIdentity;
+  providerRouteId?: string;
 }
 
 interface SessionIndexLine extends SessionIndexEntry {
@@ -288,6 +290,17 @@ function normalizeMetadata(params: {
   if (origin) {
     metadata.origin = origin;
   }
+  const routeIdCandidate =
+    typeof params.override?.providerRouteId === "string"
+      ? params.override.providerRouteId.trim()
+      : typeof raw.providerRouteId === "string"
+        ? raw.providerRouteId.trim()
+        : typeof previous?.providerRouteId === "string"
+          ? previous.providerRouteId.trim()
+          : "";
+  if (routeIdCandidate.length > 0) {
+    metadata.providerRouteId = routeIdCandidate;
+  }
 
   return metadata;
 }
@@ -323,7 +336,8 @@ function toIndexEntry(record: LoadedSessionRecord): SessionIndexEntry {
     createdAt: record.metadata.createdAt,
     lastActivityAt: record.metadata.lastActivityAt,
     title: record.metadata.title,
-    origin: record.metadata.origin
+    origin: record.metadata.origin,
+    providerRouteId: record.metadata.providerRouteId
   };
 }
 
@@ -376,6 +390,9 @@ function parseIndexLine(value: unknown): SessionIndexEntry | null {
   const origin = normalizeOrigin(record.origin);
   if (origin) {
     entry.origin = origin;
+  }
+  if (typeof record.providerRouteId === "string" && record.providerRouteId.trim().length > 0) {
+    entry.providerRouteId = record.providerRouteId.trim();
   }
   return entry;
 }

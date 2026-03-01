@@ -45,18 +45,28 @@ export interface ProviderFailoverStatus {
   }>;
 }
 
+export interface ProviderRouteSelection {
+  routeId?: string;
+  primaryProviderId: string;
+  fallbackProviderIds?: string[];
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
 
 function createSessionMetadata(seed?: Partial<SessionMetadata>): SessionMetadata {
   const now = nowIso();
-  return {
+  const metadata: SessionMetadata = {
     createdAt: seed?.createdAt ?? now,
     lastActivityAt: seed?.lastActivityAt ?? seed?.createdAt ?? now,
     title: seed?.title,
     origin: seed?.origin
   };
+  if (typeof seed?.providerRouteId === "string" && seed.providerRouteId.trim().length > 0) {
+    metadata.providerRouteId = seed.providerRouteId.trim();
+  }
+  return metadata;
 }
 
 function createUserMessage(content: string): ChatMessage {
@@ -420,9 +430,16 @@ export class ProviderManager {
     });
   }
 
-  private resolveFailoverCandidates(primaryProviderId: string): string[] {
+  private resolveFailoverCandidates(primaryProviderId: string, fallbackProviderIds?: string[]): string[] {
     const chain = [primaryProviderId];
     if (this.failover.enabled) {
+      for (const providerId of fallbackProviderIds ?? []) {
+        const normalized = providerId.trim();
+        if (!normalized || normalized === primaryProviderId) {
+          continue;
+        }
+        chain.push(normalized);
+      }
       for (const providerId of this.failover.chain) {
         const normalized = providerId.trim();
         if (!normalized || normalized === primaryProviderId) {
@@ -642,6 +659,7 @@ export class ProviderManager {
     authStore: AuthStore;
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
+    route?: ProviderRouteSelection;
     availableToolNames?: string[];
     maxToolCalls?: number;
     runTool?: (request: {
@@ -670,6 +688,16 @@ export class ProviderManager {
       throw new Error(`Unknown active provider profile: ${session.activeProviderId}`);
     }
     let activeProviderId = session.activeProviderId;
+    if (params.route?.primaryProviderId) {
+      const routeProviderId = params.route.primaryProviderId.trim();
+      if (!this.profileById.get(routeProviderId)) {
+        throw new Error(`Unknown route primary provider profile: ${routeProviderId}`);
+      }
+      if (session.activeProviderId !== routeProviderId) {
+        session.activeProviderId = routeProviderId;
+      }
+      activeProviderId = routeProviderId;
+    }
 
     session.history.push(createUserMessage(params.input));
     session.metadata.lastActivityAt = nowIso();
@@ -688,6 +716,8 @@ export class ProviderManager {
         const turnResult = await this.runProviderTurnWithFailover({
           sessionId: session.sessionId,
           primaryProviderId: activeProviderId,
+          routeId: params.route?.routeId,
+          fallbackProviderIds: params.route?.fallbackProviderIds,
           authStore: params.authStore,
           messages: buildTurnMessages(session.history, canRunTools ? availableToolNames : []),
           onEvent: params.onEvent,
@@ -755,12 +785,14 @@ export class ProviderManager {
   private async runProviderTurnWithFailover(params: {
     sessionId: string;
     primaryProviderId: string;
+    routeId?: string;
+    fallbackProviderIds?: string[];
     authStore: AuthStore;
     messages: ChatMessage[];
     onEvent: StreamEventHandler;
     signal?: AbortSignal;
   }): Promise<{ providerId: string; assistantBuffer: string }> {
-    const candidates = this.resolveFailoverCandidates(params.primaryProviderId);
+    const candidates = this.resolveFailoverCandidates(params.primaryProviderId, params.fallbackProviderIds);
     let lastError: unknown = null;
     let attempt = 0;
 
@@ -817,7 +849,9 @@ export class ProviderManager {
             metadata: {
               attempt,
               failureClass,
-              failoverEnabled: this.failover.enabled
+              failoverEnabled: this.failover.enabled,
+              ...(params.routeId ? { routeId: params.routeId } : {}),
+              cooldownSeconds: this.remainingCooldownSeconds(profile.id)
             }
           }
         });

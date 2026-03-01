@@ -154,6 +154,96 @@ describe("gateway control api and observability", () => {
       const turnPayload = (await turn.json()) as { ok: boolean; response?: string };
       expect(turnPayload.ok).toBe(true);
       expect(turnPayload.response).toContain("echo:hello control api");
+
+      const retention = await fetch(`${controlUrl}/sessions/retention`, {
+        headers: {
+          authorization: "Bearer read-token"
+        }
+      });
+      expect(retention.status).toBe(200);
+      const retentionPayload = (await retention.json()) as { ok: boolean; retention?: { totalSessions?: number } };
+      expect(retentionPayload.ok).toBe(true);
+      expect(retentionPayload.retention?.totalSessions).toBeGreaterThan(0);
+
+      const prune = await fetch(`${controlUrl}/sessions/prune`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer admin-token"
+        },
+        body: JSON.stringify({
+          dryRun: true
+        })
+      });
+      expect(prune.status).toBe(200);
+      const prunePayload = (await prune.json()) as {
+        ok: boolean;
+        prune?: { dryRun?: boolean };
+      };
+      expect(prunePayload.ok).toBe(true);
+      expect(prunePayload.prune?.dryRun).toBe(true);
+    } finally {
+      await gateway.stop();
+    }
+  });
+
+  it("enforces control mutation rate limiting", async () => {
+    const workspaceDir = makeTempDir();
+    const gateway = createGateway({
+      workspaceDir,
+      controlApi: {
+        enabled: true,
+        host: "127.0.0.1",
+        port: 0,
+        token: "admin-token",
+        readToken: "read-token",
+        allowLoopbackWithoutAuth: false,
+        mutationRateLimitPerMinute: 1
+      },
+      providers: {
+        defaultSessionProvider: "echo",
+        startupProbe: {
+          enabled: false
+        },
+        profiles: [
+          {
+            id: "echo",
+            adapterId: "test-echo-adapter",
+            kind: "openai-compatible",
+            model: "test",
+            authProfileId: "auth:echo"
+          }
+        ],
+        adapters: [new EchoAdapter()]
+      }
+    });
+
+    await gateway.start();
+    try {
+      const controlUrl = gateway.getStatus().controlUrl as string;
+      const first = await fetch(`${controlUrl}/sessions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer admin-token"
+        },
+        body: JSON.stringify({
+          channel: "local"
+        })
+      });
+      expect(first.status).toBe(200);
+
+      const second = await fetch(`${controlUrl}/sessions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer admin-token"
+        },
+        body: JSON.stringify({
+          channel: "local"
+        })
+      });
+      expect(second.status).toBe(429);
     } finally {
       await gateway.stop();
     }
