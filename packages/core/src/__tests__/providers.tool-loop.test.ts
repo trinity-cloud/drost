@@ -231,6 +231,128 @@ class NativeToolCallAdapter implements ProviderAdapter {
   }
 }
 
+class NativeWebEmptyInputAdapter implements ProviderAdapter {
+  readonly id = "native-web-empty";
+  readonly supportsNativeToolCalls = true;
+  turns = 0;
+
+  async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
+    return {
+      providerId: profile.id,
+      ok: true,
+      code: "ok",
+      message: "ok"
+    };
+  }
+
+  async runTurn(request: ProviderTurnRequest): Promise<{ nativeToolCalls?: Array<{ id: string; name: string; input: unknown }> }> {
+    this.turns += 1;
+    const hasToolResult = request.messages.some(
+      (message) => message.role === "tool" && message.content.startsWith("TOOL_RESULT")
+    );
+    if (!hasToolResult) {
+      return {
+        nativeToolCalls: [
+          {
+            id: "call_web_1",
+            name: "web",
+            input: {}
+          }
+        ]
+      };
+    }
+
+    request.emit({
+      type: "response.delta",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "Web call complete."
+      }
+    });
+    request.emit({
+      type: "response.completed",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text: "Web call complete."
+      }
+    });
+    return {};
+  }
+}
+
+class EndlessValidationNativeAdapter implements ProviderAdapter {
+  readonly id = "native-validation-loop";
+  readonly supportsNativeToolCalls = true;
+  turns = 0;
+
+  async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
+    return {
+      providerId: profile.id,
+      ok: true,
+      code: "ok",
+      message: "ok"
+    };
+  }
+
+  async runTurn(_request: ProviderTurnRequest): Promise<{ nativeToolCalls?: Array<{ id: string; name: string; input: unknown }> }> {
+    this.turns += 1;
+    return {
+      nativeToolCalls: [
+        {
+          id: `call_validation_${this.turns}`,
+          name: "web",
+          input: {}
+        }
+      ]
+    };
+  }
+}
+
+class NativeWebFallbackAdapter implements ProviderAdapter {
+  readonly id = "native-web-fallback";
+  readonly supportsNativeToolCalls = true;
+  turns = 0;
+
+  async probe(profile: ProviderProfile, _context: ProviderProbeContext): Promise<ProviderProbeResult> {
+    return {
+      providerId: profile.id,
+      ok: true,
+      code: "ok",
+      message: "ok"
+    };
+  }
+
+  async runTurn(request: ProviderTurnRequest): Promise<void> {
+    this.turns += 1;
+    const hasToolResult = request.messages.some(
+      (message) => message.role === "tool" && message.content.startsWith("TOOL_RESULT")
+    );
+    const text = hasToolResult ? "Fresh results after auto web tool." : "I will answer from memory.";
+    request.emit({
+      type: "response.delta",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text
+      }
+    });
+    request.emit({
+      type: "response.completed",
+      sessionId: request.sessionId,
+      providerId: request.providerId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        text
+      }
+    });
+  }
+}
+
 function authStore(): AuthStore {
   return {
     version: 1,
@@ -497,5 +619,161 @@ describe("provider tool loop", () => {
     expect(history[2]?.content).toContain("call_native_1");
     expect(history[3]?.role).toBe("assistant");
     expect(history[3]?.content).toContain("Final answer from native tool call.");
+  });
+
+  it("normalizes empty native web inputs to search calls using the latest user message", async () => {
+    const adapter = new NativeWebEmptyInputAdapter();
+    const manager = new ProviderManager({
+      profiles: [profile("native-web-empty")],
+      adapters: [adapter]
+    });
+    manager.ensureSession("s-1", "provider");
+
+    const toolCalls: Array<{ name: string; input: unknown }> = [];
+    await manager.runTurn({
+      sessionId: "s-1",
+      input: "search for today's news on Iran",
+      authStore: authStore(),
+      availableToolNames: ["web"],
+      availableTools: [
+        {
+          name: "web",
+          inputSchema: {
+            type: "object",
+            additionalProperties: true
+          }
+        }
+      ],
+      onEvent: () => {},
+      runTool: async (request) => {
+        toolCalls.push({
+          name: request.toolName,
+          input: request.input
+        });
+        return {
+          ok: true,
+          output: {
+            ok: true
+          }
+        };
+      }
+    });
+
+    expect(toolCalls).toEqual([
+      {
+        name: "web",
+        input: {
+          action: "search",
+          query: "search for today's news on Iran"
+        }
+      }
+    ]);
+  });
+
+  it("auto-runs web search once when a native provider emits no tool call for a fresh query", async () => {
+    const adapter = new NativeWebFallbackAdapter();
+    const manager = new ProviderManager({
+      profiles: [profile("native-web-fallback")],
+      adapters: [adapter]
+    });
+    manager.ensureSession("s-1", "provider");
+
+    const toolCalls: Array<{ name: string; input: unknown }> = [];
+    await manager.runTurn({
+      sessionId: "s-1",
+      input: "Can you search for today's news on Iran?",
+      authStore: authStore(),
+      availableToolNames: ["web"],
+      availableTools: [
+        {
+          name: "web",
+          inputSchema: {
+            type: "object",
+            additionalProperties: true
+          }
+        }
+      ],
+      onEvent: () => {},
+      runTool: async (request) => {
+        toolCalls.push({
+          name: request.toolName,
+          input: request.input
+        });
+        return {
+          ok: true,
+          output: {
+            headlines: 5
+          }
+        };
+      }
+    });
+
+    expect(adapter.turns).toBe(2);
+    expect(toolCalls).toEqual([
+      {
+        name: "web",
+        input: {
+          action: "search",
+          query: "Can you search for today's news on Iran?"
+        }
+      }
+    ]);
+
+    const history = manager.getSessionHistory("s-1");
+    expect(history[1]?.role).toBe("tool");
+    expect(history[1]?.content).toContain("TOOL_NATIVE_CALLS");
+    expect(history[2]?.role).toBe("tool");
+    expect(history[2]?.content).toContain("TOOL_RESULT");
+    expect(history[3]?.role).toBe("assistant");
+    expect(history[3]?.content).toContain("Fresh results after auto web tool.");
+  });
+
+  it("stops repeated validation-error native tool loops early", async () => {
+    const adapter = new EndlessValidationNativeAdapter();
+    const manager = new ProviderManager({
+      profiles: [profile("native-validation-loop")],
+      adapters: [adapter]
+    });
+    manager.ensureSession("s-1", "provider");
+
+    let runToolCalls = 0;
+    await manager.runTurn({
+      sessionId: "s-1",
+      input: "search iran news",
+      authStore: authStore(),
+      availableToolNames: ["web"],
+      availableTools: [
+        {
+          name: "web",
+          inputSchema: {
+            type: "object",
+            additionalProperties: true
+          }
+        }
+      ],
+      onEvent: () => {},
+      runTool: async () => {
+        runToolCalls += 1;
+        return {
+          ok: false,
+          error: {
+            code: "validation_error",
+            message: "Invalid discriminator value. Expected 'fetch' | 'search'",
+            issues: [
+              {
+                path: "action",
+                message: "Invalid discriminator value. Expected 'fetch' | 'search'",
+                code: "invalid_union_discriminator"
+              }
+            ]
+          }
+        };
+      }
+    });
+
+    expect(runToolCalls).toBe(3);
+    const history = manager.getSessionHistory("s-1");
+    const lastAssistant = history.filter((message) => message.role === "assistant").at(-1);
+    expect(lastAssistant?.content).toContain("Stopped repeated validation-error tool loop (web)");
   });
 });

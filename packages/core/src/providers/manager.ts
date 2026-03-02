@@ -42,6 +42,135 @@ interface ToolRunResult {
   };
 }
 
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function lastUserMessageText(history: ChatMessage[]): string {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const message = history[index];
+    if (message?.role !== "user") {
+      continue;
+    }
+    const text = message.content.trim();
+    if (text.length > 0) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function userMessageWantsWebSearch(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (/\b(search|look\s*up|lookup|find|browse|web|internet)\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\b(news|headline|headlines|update|updates)\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\b(today|latest|current|recent|right now|breaking)\b/.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
+function shouldAutoRunWebTool(
+  history: ChatMessage[],
+  availableToolNames: string[],
+  attempted: boolean
+): boolean {
+  if (attempted || !availableToolNames.includes("web")) {
+    return false;
+  }
+
+  const latestUserText = lastUserMessageText(history);
+  return userMessageWantsWebSearch(latestUserText);
+}
+
+function normalizeWebToolInput(input: unknown, history: ChatMessage[]): unknown {
+  const record = toRecord(input);
+  if (!record) {
+    if (typeof input === "string" && input.trim().length > 0) {
+      return {
+        action: "search",
+        query: input.trim()
+      };
+    }
+    return input;
+  }
+
+  const action = typeof record.action === "string" ? record.action.trim() : "";
+  if (action.length > 0) {
+    return input;
+  }
+
+  const query = typeof record.query === "string" ? record.query.trim() : "";
+  if (query.length > 0) {
+    return {
+      ...record,
+      action: "search",
+      query
+    };
+  }
+
+  const url = typeof record.url === "string" ? record.url.trim() : "";
+  if (url.length > 0) {
+    return {
+      ...record,
+      action: "fetch",
+      url
+    };
+  }
+
+  const fallbackQuery = lastUserMessageText(history);
+  if (fallbackQuery.length > 0) {
+    return {
+      ...record,
+      action: "search",
+      query: fallbackQuery
+    };
+  }
+
+  return {
+    ...record,
+    action: "search",
+    query: "latest news"
+  };
+}
+
+function normalizeToolInputForExecution(
+  toolName: string,
+  input: unknown,
+  history: ChatMessage[]
+): unknown {
+  if (toolName !== "web") {
+    return input;
+  }
+  return normalizeWebToolInput(input, history);
+}
+
+function stableJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function toolCallSignature(toolName: string, input: unknown): string {
+  return `${toolName}:${stableJson(input)}`;
+}
+
 function normalizeNativeToolDefinitions(
   availableTools: ProviderNativeToolDefinition[] | undefined,
   availableToolNames: string[]
@@ -247,9 +376,44 @@ export class ProviderManager {
       : [];
     const maxToolCalls = Math.max(1, params.maxToolCalls ?? 50);
     let remainingToolCalls = maxToolCalls;
+    let lastValidationFailureSignature = "";
+    let repeatedValidationFailureCount = 0;
+    const maxRepeatedValidationFailures = 3;
+    let autoWebSearchAttempted = false;
+    let toolRunOccurred = false;
 
     try {
       while (true) {
+        const shouldBufferAssistantEvents =
+          params.runTool != null &&
+          !toolRunOccurred &&
+          shouldAutoRunWebTool(session.history, availableToolNames, autoWebSearchAttempted);
+        const bufferedResponseEvents: Array<Parameters<StreamEventHandler>[0]> = [];
+        const providerEventHandler: StreamEventHandler = shouldBufferAssistantEvents
+          ? (event) => {
+              if (event.type === "response.delta" || event.type === "response.completed") {
+                bufferedResponseEvents.push(event);
+                return;
+              }
+              params.onEvent(event);
+            }
+          : params.onEvent;
+        const flushBufferedResponseEvents = (): void => {
+          if (!shouldBufferAssistantEvents || bufferedResponseEvents.length === 0) {
+            return;
+          }
+          for (const event of bufferedResponseEvents) {
+            params.onEvent(event);
+          }
+          bufferedResponseEvents.length = 0;
+        };
+        const discardBufferedResponseEvents = (): void => {
+          if (!shouldBufferAssistantEvents || bufferedResponseEvents.length === 0) {
+            return;
+          }
+          bufferedResponseEvents.length = 0;
+        };
+
         const activeProfile = this.profileById.get(activeProviderId);
         const activeAdapter = activeProfile ? this.adapterById.get(activeProfile.adapterId) : undefined;
         const activeCapabilities =
@@ -272,7 +436,7 @@ export class ProviderManager {
           inputImages: params.inputImages,
           availableTools: nativeToolDefinitions,
           resolveInputImageRef: params.resolveInputImageRef,
-          onEvent: params.onEvent,
+          onEvent: providerEventHandler,
           signal: params.signal,
           profiles: this.profileById,
           adapters: this.adapterById,
@@ -291,17 +455,24 @@ export class ProviderManager {
           session.metadata.lastActivityAt = nowIso();
 
           let budgetExceeded = false;
+          let stoppedValidationLoop = false;
           for (const nativeToolCall of nativeToolCalls) {
             if (remainingToolCalls <= 0) {
               budgetExceeded = true;
               break;
             }
             remainingToolCalls -= 1;
+            toolRunOccurred = true;
+            const normalizedInput = normalizeToolInputForExecution(
+              nativeToolCall.name,
+              nativeToolCall.input,
+              session.history
+            );
             const toolResult = await params.runTool({
               sessionId: session.sessionId,
               providerId: activeProviderId,
               toolName: nativeToolCall.name,
-              input: nativeToolCall.input,
+              input: normalizedInput,
               onEvent: params.onEvent
             });
             session.history.push(
@@ -316,9 +487,44 @@ export class ProviderManager {
               )
             );
             session.metadata.lastActivityAt = nowIso();
+
+            const signature = toolCallSignature(nativeToolCall.name, normalizedInput);
+            if (!toolResult.ok && toolResult.error?.code === "validation_error") {
+              if (signature === lastValidationFailureSignature) {
+                repeatedValidationFailureCount += 1;
+              } else {
+                lastValidationFailureSignature = signature;
+                repeatedValidationFailureCount = 1;
+              }
+              if (repeatedValidationFailureCount >= maxRepeatedValidationFailures) {
+                const message = `Stopped repeated validation-error tool loop (${nativeToolCall.name})`;
+                params.onEvent({
+                  type: "provider.error",
+                  sessionId: session.sessionId,
+                  providerId: activeProviderId,
+                  timestamp: nowIso(),
+                  payload: {
+                    error: message
+                  }
+                });
+                session.history.push(createAssistantMessage(message));
+                session.metadata.lastActivityAt = nowIso();
+                stoppedValidationLoop = true;
+                break;
+              }
+            } else {
+              lastValidationFailureSignature = "";
+              repeatedValidationFailureCount = 0;
+            }
+          }
+
+          if (stoppedValidationLoop) {
+            discardBufferedResponseEvents();
+            break;
           }
 
           if (budgetExceeded) {
+            discardBufferedResponseEvents();
             const message = `Tool call budget exceeded (${maxToolCalls})`;
             params.onEvent({
               type: "provider.error",
@@ -333,10 +539,12 @@ export class ProviderManager {
             session.metadata.lastActivityAt = nowIso();
             break;
           }
+          discardBufferedResponseEvents();
           continue;
         }
 
         if (assistantBuffer.trim().length === 0) {
+          flushBufferedResponseEvents();
           break;
         }
 
@@ -344,12 +552,114 @@ export class ProviderManager {
           ? parseToolCall(assistantBuffer, availableToolNames)
           : null;
         if (!toolCall || !params.runTool) {
+          if (
+            params.runTool &&
+            !toolRunOccurred &&
+            shouldAutoRunWebTool(session.history, availableToolNames, autoWebSearchAttempted)
+          ) {
+            if (remainingToolCalls <= 0) {
+              discardBufferedResponseEvents();
+              const message = `Tool call budget exceeded (${maxToolCalls})`;
+              params.onEvent({
+                type: "provider.error",
+                sessionId: session.sessionId,
+                providerId: activeProviderId,
+                timestamp: nowIso(),
+                payload: {
+                  error: message
+                }
+              });
+              session.history.push(createAssistantMessage(message));
+              session.metadata.lastActivityAt = nowIso();
+              break;
+            }
+
+            remainingToolCalls -= 1;
+            autoWebSearchAttempted = true;
+            toolRunOccurred = true;
+            const latestUserText = lastUserMessageText(session.history);
+            const normalizedInput = normalizeToolInputForExecution(
+              "web",
+              {
+                action: "search",
+                query: latestUserText
+              },
+              session.history
+            );
+            const callId = `call_auto_web_${maxToolCalls - remainingToolCalls}`;
+            session.history.push(
+              createToolMessage(
+                encodeNativeToolCallsMessage([
+                  {
+                    id: callId,
+                    name: "web",
+                    input: normalizedInput
+                  }
+                ])
+              )
+            );
+            session.metadata.lastActivityAt = nowIso();
+
+            const toolResult = await params.runTool({
+              sessionId: session.sessionId,
+              providerId: activeProviderId,
+              toolName: "web",
+              input: normalizedInput,
+              onEvent: params.onEvent
+            });
+            session.history.push(
+              createToolMessage(
+                encodeToolResultMessage({
+                  name: "web",
+                  callId,
+                  ok: toolResult.ok,
+                  output: toolResult.output,
+                  error: toolResult.error
+                })
+              )
+            );
+            session.metadata.lastActivityAt = nowIso();
+
+            const signature = toolCallSignature("web", normalizedInput);
+            if (!toolResult.ok && toolResult.error?.code === "validation_error") {
+              if (signature === lastValidationFailureSignature) {
+                repeatedValidationFailureCount += 1;
+              } else {
+                lastValidationFailureSignature = signature;
+                repeatedValidationFailureCount = 1;
+              }
+              if (repeatedValidationFailureCount >= maxRepeatedValidationFailures) {
+                const message = "Stopped repeated validation-error tool loop (web)";
+                params.onEvent({
+                  type: "provider.error",
+                  sessionId: session.sessionId,
+                  providerId: activeProviderId,
+                  timestamp: nowIso(),
+                  payload: {
+                    error: message
+                  }
+                });
+                session.history.push(createAssistantMessage(message));
+                session.metadata.lastActivityAt = nowIso();
+                break;
+              }
+            } else {
+              lastValidationFailureSignature = "";
+              repeatedValidationFailureCount = 0;
+            }
+
+            discardBufferedResponseEvents();
+            continue;
+          }
+
+          flushBufferedResponseEvents();
           session.history.push(createAssistantMessage(assistantBuffer));
           session.metadata.lastActivityAt = nowIso();
           break;
         }
 
         if (remainingToolCalls <= 0) {
+          discardBufferedResponseEvents();
           const message = `Tool call budget exceeded (${maxToolCalls})`;
           params.onEvent({
             type: "provider.error",
@@ -366,11 +676,14 @@ export class ProviderManager {
         }
 
         remainingToolCalls -= 1;
+        toolRunOccurred = true;
+        discardBufferedResponseEvents();
+        const normalizedInput = normalizeToolInputForExecution(toolCall.toolName, toolCall.input, session.history);
         const toolResult = await params.runTool({
           sessionId: session.sessionId,
           providerId: activeProviderId,
           toolName: toolCall.toolName,
-          input: toolCall.input,
+          input: normalizedInput,
           onEvent: params.onEvent
         });
 
@@ -385,6 +698,34 @@ export class ProviderManager {
           )
         );
         session.metadata.lastActivityAt = nowIso();
+
+        const signature = toolCallSignature(toolCall.toolName, normalizedInput);
+        if (!toolResult.ok && toolResult.error?.code === "validation_error") {
+          if (signature === lastValidationFailureSignature) {
+            repeatedValidationFailureCount += 1;
+          } else {
+            lastValidationFailureSignature = signature;
+            repeatedValidationFailureCount = 1;
+          }
+          if (repeatedValidationFailureCount >= maxRepeatedValidationFailures) {
+            const message = `Stopped repeated validation-error tool loop (${toolCall.toolName})`;
+            params.onEvent({
+              type: "provider.error",
+              sessionId: session.sessionId,
+              providerId: activeProviderId,
+              timestamp: nowIso(),
+              payload: {
+                error: message
+              }
+            });
+            session.history.push(createAssistantMessage(message));
+            session.metadata.lastActivityAt = nowIso();
+            break;
+          }
+        } else {
+          lastValidationFailureSignature = "";
+          repeatedValidationFailureCount = 0;
+        }
       }
     } finally {
       session.turnInProgress = false;

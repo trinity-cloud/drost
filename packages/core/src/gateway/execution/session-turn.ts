@@ -50,6 +50,7 @@ export async function runSessionTurn(
   const historyBeforeCount = manager.getSessionHistory(params.sessionId).length;
   const session = manager.getSession(params.sessionId);
   const activeProviderId = session?.activeProviderId;
+  const pendingProviderId = session?.pendingProviderId;
   const runtimeContext = runtime.runtimeContext();
   let input = params.input;
 
@@ -90,7 +91,9 @@ export async function runSessionTurn(
 
   runtime.emitRuntimeEvent("session.turn.started", {
     sessionId: params.sessionId,
-    providerId: routeSelection?.primaryProviderId ?? activeProviderId ?? "unknown",
+    providerId: routeSelection?.primaryProviderId ?? pendingProviderId ?? activeProviderId ?? "unknown",
+    activeProviderId,
+    pendingProviderId,
     routeId: routeSelection?.routeId,
     inputChars: input.length,
     inputPreview: sanitizePreview(input),

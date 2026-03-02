@@ -241,9 +241,6 @@ export class TelegramApiClient {
     };
     if (parseMode) {
       payload.parse_mode = parseMode;
-      payload.link_preview_options = {
-        is_disabled: true
-      };
     }
 
     try {
@@ -281,9 +278,6 @@ export class TelegramApiClient {
     };
     if (parseMode) {
       payload.parse_mode = parseMode;
-      payload.link_preview_options = {
-        is_disabled: true
-      };
     }
 
     try {
