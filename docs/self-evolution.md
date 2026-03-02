@@ -5,8 +5,8 @@
 Drost supports mutable repo-workspace evolution:
 
 - framework/runtime code under `packages/`
-- custom tools under `tools/`
-- memory/prompt artifacts under `memory/` and `prompts/`
+- custom runtime tools under `.drost/tools/`
+- runtime memory/prompt artifacts under `.drost/`
 - docs/config and other repo files when needed
 - optional `agent.entry`/`runtime.entry` modules when you want hook-style extensions
 
@@ -16,7 +16,7 @@ This keeps the default shape minimal while allowing advanced extension points.
 
 Today, the practical workflow is:
 
-1. edit `packages/`, `tools/`, `memory/`, `prompts/`, or other repo code
+1. edit `packages/`, `.drost/` runtime artifacts, or other repo code
 2. run validation (`pnpm build`, `pnpm test`)
 3. restart runtime (`/restart` or `drost restart`)
 4. verify behavior in TUI/plain session
@@ -43,6 +43,7 @@ Optional governance can still be layered on top:
 Drost separates concerns:
 
 - Framework kernel: lifecycle/safety/runtime substrate
-- Repo workspace: mutable behavior code, tools, prompts, memory
+- Repo workspace: mutable behavior code and tools
+- Runtime state: `.drost` session/memory/prompt-pack artifacts
 
 This keeps self-evolution powerful while preserving runtime stability.

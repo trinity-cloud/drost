@@ -10,10 +10,8 @@ Drost runs as a practical single codebase in repo-workspace mode:
 
 2. Repository workspace layer
 - `packages/` source code
-- `tools` custom tool files
-- `memory` files
-- `prompts` files
-- persisted sessions/auth data
+- runtime custom tools under `.drost/tools/`
+- runtime state under `.drost/` (sessions/auth/memory/prompt packs)
 
 ## What Executes On `drost start`
 
@@ -36,7 +34,6 @@ Repository workspace contains:
 
 - `drost.config.ts`
 - `packages/*`
-- `tools/`, `memory/`, `prompts/`
 - local auth store (`.drost/auth-profiles.json`)
 
 ## Tool Access Model

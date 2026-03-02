@@ -15,7 +15,7 @@
 
 Most agent frameworks give you a loop that starts when a user talks and dies when it responds. Drost gives you a **persistent runtime** — a long-running process with sessions, tools, memory, multi-provider routing, and the ability to modify its own code.
 
-Your repository is the agent's workspace. Your tools, prompts, and memory live alongside the runtime. The agent doesn't just execute in your codebase — it *inhabits* it.
+Your repository is the agent's workspace. Runtime tools, prompts, and memory live under `.drost/` per deployed agent instance. The agent doesn't just execute in your codebase — it *inhabits* it.
 
 ## Why Drost
 
@@ -23,7 +23,7 @@ Your repository is the agent's workspace. Your tools, prompts, and memory live a
 
 **It uses any model.** Route conversations through OpenAI, Anthropic, xAI, or any OpenAI-compatible endpoint. Switch providers per session. Failover automatically when one goes down.
 
-**It has hands.** Built-in tools for file operations, code search, shell execution, and git — plus a custom tool system where you drop a file in `tools/` and it's available on the next turn.
+**It has hands.** Built-in tools for file operations, code search, shell execution, and git — plus a custom tool system where you drop a file in `.drost/tools/` and it's available on the next turn.
 
 **It evolves.** The agent can modify its own code, prompts, and tools at runtime. Changes are validated through build and test gates before they take effect, with automatic rollback on failure.
 
@@ -97,12 +97,13 @@ Drost treats the repository as a living workspace. The agent can read, write, se
 your-project/
   drost.config.ts        # runtime configuration
   packages/              # framework + your code
-  tools/                 # custom tools (drop a file, it loads)
-  prompts/system.md      # system prompt (edit to shape behavior)
-  memory/                # agent memory and state artifacts
   .drost/
+    tools/               # custom runtime tools (drop a file, it loads)
     sessions/            # persisted conversation history
     auth-profiles.json   # provider credentials
+    memory/              # runtime memory/state artifacts
+    loops/
+      prompt-packs/      # per-loop prompt documents (runtime-owned)
 ```
 
 ## Features
@@ -127,10 +128,10 @@ providers: {
 Every conversation is persisted to JSONL with atomic writes and file locking. Sessions survive restarts, crashes, and provider switches. History budgets keep storage bounded. Session continuity summaries preserve context across long-running interactions.
 
 ### Custom Tools
-Create a TypeScript file in `tools/`, export a tool definition, and it's available on the next turn:
+Create a TypeScript file in `.drost/tools/`, export a tool definition, and it's available on the next turn:
 
 ```ts
-// tools/weather.ts
+// .drost/tools/weather.ts
 import { defineTool } from "@drost/core";
 
 export default defineTool({

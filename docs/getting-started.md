@@ -40,9 +40,11 @@ drost/
     core/
     cli/
   apps/
-  tools/
-  memory/
-  prompts/
+  .drost/
+    tools/
+    memory/
+    loops/
+      prompt-packs/
 ```
 
 Default runtime behavior is permissive: built-in file/code tools are not hard-limited by `mutableRoots`.

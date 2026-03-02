@@ -90,7 +90,7 @@ function resolveToolDir(config: GatewayConfig): string {
   if (config.toolDirectory) {
     return path.resolve(config.toolDirectory);
   }
-  return path.resolve(config.workspaceDir, "tools");
+  return path.resolve(config.workspaceDir, ".drost", "tools");
 }
 
 function usage(): void {

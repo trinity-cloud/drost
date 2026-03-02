@@ -50,7 +50,7 @@ drost tool new <name> [--template <id>]
 
 ```text
 /tool file {"action":"list","path":"."}
-/tool file {"action":"read","path":"prompts/system.md"}
+/tool file {"action":"read","path":".drost/loops/prompt-packs/conversation/AGENTS.md"}
 /tool code.search {"query":"defineConfig","literal":true}
 /tool code.patch {"patch":"...unified diff...","dryRun":true}
 /tool shell {"command":"ls -la"}

@@ -5,9 +5,7 @@ const PROJECT_DIRS = [
   "agent",
   "runtime",
   "runtime/kernel",
-  "workspace/tools",
-  "workspace/memory",
-  "workspace/prompts",
+  "workspace/.drost/tools",
   ".drost"
 ] as const;
 
@@ -90,15 +88,6 @@ function templateConfig(): string {
   }
 };
 `;
-}
-
-function templatePrompt(): string {
-  return [
-    "# System Prompt",
-    "",
-    "You are a Drost agent running in a persistent workspace.",
-    "Keep changes minimal, explicit, and safe."
-  ].join("\n");
 }
 
 function templateTool(): string {
@@ -236,8 +225,7 @@ function scaffoldMissingFiles(projectPath: string): string[] {
       content: templateRuntimeKernelStartLoop()
     },
     { relativePath: path.join("runtime", "kernel", "policy.ts"), content: templateRuntimeKernelPolicy() },
-    { relativePath: path.join("workspace", "prompts", "system.md"), content: templatePrompt() },
-    { relativePath: path.join("workspace", "tools", "hello.ts"), content: templateTool() }
+    { relativePath: path.join("workspace", ".drost", "tools", "hello.ts"), content: templateTool() }
   ];
 
   for (const template of templates) {

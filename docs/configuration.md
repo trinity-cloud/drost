@@ -93,7 +93,7 @@ export default {
 ## Key Fields
 
 - `workspaceDir`: root directory used by runtime tools and persistent state.
-- `toolDirectory`: optional override for custom tools directory.
+- `toolDirectory`: optional override for custom tools directory (default: `<workspaceDir>/.drost/tools`).
 - `authStorePath`: optional override for auth profile store path.
 - `agent.entry`: optional agent module path.
 - `runtime.entry`: optional runtime module path.
