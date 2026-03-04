@@ -31,4 +31,5 @@ def test_prompt_assembly_includes_workspace_files(tmp_path: Path) -> None:
     assert "Memory block" in prompt
     assert "openai-codex" in prompt
     assert "file_read" in prompt
-
+    assert "[Tool Execution Contract]" in prompt
+    assert "Do not claim you searched" in prompt

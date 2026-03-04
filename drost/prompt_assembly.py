@@ -5,6 +5,12 @@ from pathlib import Path
 from drost.config import Settings
 from drost.context_budget import truncate_text_to_budget
 
+TOOL_EXECUTION_CONTRACT = """[Tool Execution Contract]
+- If tools are available and the task requires an external action or retrieval, call tool(s) in this turn.
+- Do not claim you searched, fetched, read, wrote, executed, or verified anything unless you actually called a tool.
+- Do not promise future tool actions ("I'll do X now") and then end the turn without a tool call.
+- When a tool returns an error, report the error clearly and either retry with corrected parameters or ask for the next instruction."""
+
 
 class PromptAssembler:
     def __init__(self, settings: Settings) -> None:
@@ -50,10 +56,10 @@ class PromptAssembler:
         if provider_name:
             hints.append(f"provider={provider_name}")
         if tool_names:
+            sections.append(TOOL_EXECUTION_CONTRACT)
             hints.append(f"tools={', '.join(tool_names)}")
         if hints:
             sections.append("[Run Hints]\n" + "\n".join(hints))
 
         merged = "\n\n".join(section for section in sections if section)
         return truncate_text_to_budget(merged, self._settings.context_budget_system_tokens)
-

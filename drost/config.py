@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ProviderName = Literal["openai-codex", "anthropic", "xai"]
@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     xai_model: str = "grok-3-latest"
     xai_api_key: str = ""
     xai_base_url: str = "https://api.x.ai/v1"
+    exa_api_key: str = Field(default="", validation_alias=AliasChoices("DROST_EXA_API_KEY", "EXA_API_KEY"))
 
     sqlite_path: Path = Field(default_factory=lambda: Path("~/.drost/drost.sqlite3").expanduser())
     sqvector_extension_path: str = ""
@@ -206,6 +207,8 @@ class Settings(BaseSettings):
             self.anthropic_token = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
         if not self.xai_api_key:
             self.xai_api_key = (os.environ.get("XAI_API_KEY") or "").strip()
+        if not self.exa_api_key:
+            self.exa_api_key = (os.environ.get("EXA_API_KEY") or "").strip()
 
         self.sqlite_path = Path(self.sqlite_path).expanduser()
         self.openai_codex_auth_path = Path(self.openai_codex_auth_path).expanduser()
@@ -215,6 +218,7 @@ class Settings(BaseSettings):
         self.log_level = (self.log_level or "INFO").upper()
         self.openai_base_url = (self.openai_base_url or "").strip()
         self.xai_base_url = (self.xai_base_url or "https://api.x.ai/v1").strip()
+        self.exa_api_key = (self.exa_api_key or "").strip()
         self.sqvector_extension_path = (self.sqvector_extension_path or "").strip()
         self.telegram_bot_token = (self.telegram_bot_token or "").strip()
         self.telegram_webhook_url = (self.telegram_webhook_url or "").strip()

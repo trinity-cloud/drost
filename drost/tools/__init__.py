@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 
 from drost.config import Settings
@@ -43,7 +42,6 @@ def build_default_registry(
     registry.register(FileReadTool())
     registry.register(FileWriteTool())
     registry.register(ShellExecuteTool(default_timeout_seconds=settings.agent_tool_timeout_seconds))
-    registry.register(WebSearchTool(api_key=(os.environ.get("EXA_API_KEY") or "").strip()))
+    registry.register(WebSearchTool(api_key=settings.exa_api_key))
     registry.register(WebFetchTool())
     return registry
-

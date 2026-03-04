@@ -114,6 +114,9 @@ Drost also writes per-session JSONL transcripts under:
 - `~/.drost/sessions/<session_key>.jsonl` (user/assistant only)
 - `~/.drost/sessions/<session_key>.full.jsonl` (full turn flow with tool calls/results)
 
+When no active session exists for a chat, Drost auto-creates one using a timestamped
+session id (`s_YYYY-MM-DD_HH-MM-SS`), so transcript filenames include datetime by default.
+
 ## Gateway Endpoints
 
 - `GET /health`

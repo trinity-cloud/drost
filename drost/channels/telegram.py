@@ -14,6 +14,7 @@ from aiogram.types import Update
 from fastapi import FastAPI, Request, Response
 
 from drost.channels.base import BaseChannel
+from drost.channels.telegram_renderer import markdown_to_telegram_html, split_for_telegram
 from drost.storage import SQLiteStore, session_key_for_telegram_chat
 
 logger = logging.getLogger(__name__)
@@ -78,23 +79,13 @@ class TelegramChannel(BaseChannel):
         if not body:
             return
 
-        max_len = 4000
-        if len(body) <= max_len:
-            await self.bot.send_message(chat_id, body, parse_mode=None, reply_to_message_id=reply_to)
-            return
-
-        cursor = 0
-        first = True
-        while cursor < len(body):
-            chunk = body[cursor : cursor + max_len]
-            cursor += len(chunk)
-            await self.bot.send_message(
-                chat_id,
-                chunk,
-                parse_mode=None,
-                reply_to_message_id=reply_to if first else None,
+        chunks = split_for_telegram(body, max_chars=4000)
+        for idx, chunk in enumerate(chunks):
+            await self._send_rendered_message(
+                chat_id=chat_id,
+                text=chunk,
+                reply_to=reply_to if idx == 0 else None,
             )
-            first = False
 
     async def _edit_message(self, chat_id: int, message_id: int, text: str) -> None:
         body = str(text or "").strip()
@@ -111,6 +102,51 @@ class TelegramChannel(BaseChannel):
             # Ignore edit races / "message is not modified" errors.
             logger.debug("Telegram message edit failed", exc_info=True)
 
+    async def _send_rendered_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        reply_to: int | None = None,
+    ) -> None:
+        body = str(text or "")
+        if not body:
+            return
+        rendered = markdown_to_telegram_html(body)
+        try:
+            await self.bot.send_message(
+                chat_id,
+                rendered,
+                parse_mode="HTML",
+                reply_to_message_id=reply_to,
+            )
+            return
+        except Exception:
+            logger.debug("Telegram HTML send rejected; falling back to plain text", exc_info=True)
+        await self.bot.send_message(
+            chat_id,
+            body,
+            parse_mode=None,
+            reply_to_message_id=reply_to,
+        )
+
+    async def _edit_rendered_message(self, *, chat_id: int, message_id: int, text: str) -> None:
+        body = str(text or "").strip()
+        if not body:
+            body = "I don't have a response for that yet."
+        rendered = markdown_to_telegram_html(body)
+        try:
+            await self.bot.edit_message_text(
+                rendered,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            logger.debug("Telegram HTML edit rejected; falling back to plain text", exc_info=True)
+        await self._edit_message(chat_id, message_id, body)
+
     async def _finalize_working_message(
         self,
         *,
@@ -123,22 +159,17 @@ class TelegramChannel(BaseChannel):
         if not body:
             body = "I don't have a response for that yet."
 
-        max_len = 4000
-        if len(body) <= max_len:
-            await self._edit_message(chat_id, message_id, body)
+        chunks = split_for_telegram(body, max_chars=4000)
+        if not chunks:
+            await self._edit_message(chat_id, message_id, "I don't have a response for that yet.")
             return
 
-        first = body[:max_len]
-        await self._edit_message(chat_id, message_id, first)
-        cursor = max_len
-        while cursor < len(body):
-            chunk = body[cursor : cursor + max_len]
-            cursor += len(chunk)
-            await self.bot.send_message(
-                chat_id,
-                chunk,
-                parse_mode=None,
-                reply_to_message_id=reply_to if cursor <= (2 * max_len) else None,
+        await self._edit_rendered_message(chat_id=chat_id, message_id=message_id, text=chunks[0])
+        for idx, chunk in enumerate(chunks[1:], start=1):
+            await self._send_rendered_message(
+                chat_id=chat_id,
+                text=chunk,
+                reply_to=reply_to if idx == 1 else None,
             )
 
     async def _handle_start(self, message: TgMessage) -> None:
@@ -390,6 +421,14 @@ class TelegramChannel(BaseChannel):
 
     async def send(self, target: str | int, message: str, **kwargs: Any) -> Any:
         chat_id = int(target)
+        parse_mode = kwargs.pop("parse_mode", "HTML")
+        normalized = str(getattr(parse_mode, "value", parse_mode) or "").strip().upper()
+        if normalized == "HTML":
+            rendered = markdown_to_telegram_html(str(message or ""))
+            try:
+                return await self.bot.send_message(chat_id, rendered, parse_mode="HTML", **kwargs)
+            except Exception:
+                logger.debug("Telegram HTML send rejected; falling back to plain text", exc_info=True)
         return await self.bot.send_message(chat_id, str(message), parse_mode=None, **kwargs)
 
     def set_message_handler(self, handler: Callable[[dict[str, Any]], Awaitable[str | None]]) -> None:

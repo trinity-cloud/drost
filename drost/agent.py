@@ -156,9 +156,21 @@ class AgentRuntime:
         session_id: str | None,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
-        normalized_sid = (session_id or "").strip()
-        if normalized_sid == "legacy-main":
-            normalized_sid = ""
+        requested_sid = (session_id or "").strip()
+        if requested_sid == "legacy-main":
+            requested_sid = ""
+
+        normalized_sid = requested_sid
+        if not normalized_sid:
+            # Auto-bootstrap a timestamped session for chats without an active session.
+            bootstrap_key = session_key_for_telegram_chat(chat_id, None)
+            bootstrap_lock = self._session_locks[bootstrap_key]
+            async with bootstrap_lock:
+                active_sid = (self._store.get_active_session_id(chat_id) or "").strip()
+                if not active_sid or active_sid == "legacy-main":
+                    active_sid = self._store.create_session(chat_id)
+                normalized_sid = active_sid
+
         session_key = session_key_for_telegram_chat(chat_id, normalized_sid or None)
 
         lock = self._session_locks[session_key]
