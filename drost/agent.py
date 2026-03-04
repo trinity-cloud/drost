@@ -16,7 +16,7 @@ from drost.context_budget import (
 from drost.embeddings import EmbeddingService
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
-from drost.storage import SQLiteStore, session_key_for_telegram_chat
+from drost.storage import SQLiteStore, SessionJSONLStore, session_key_for_telegram_chat
 from drost.tools import build_default_registry
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ class AgentRuntime:
         self._embeddings = embeddings
         self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._prompt_assembler = PromptAssembler(settings)
+        self._session_jsonl = SessionJSONLStore(store_path=settings.workspace_dir / "sessions")
         self._last_run: dict[str, Any] | None = None
 
     @property
@@ -211,6 +212,7 @@ class AgentRuntime:
                     content=str(row.get("content") or ""),
                 )
             )
+        turn_start_index = len(provider_messages)
         provider_messages.append(Message(role=MessageRole.USER, content=query_text))
 
         tool_registry = build_default_registry(
@@ -292,6 +294,24 @@ class AgentRuntime:
         # Persist session transcript.
         self._store.append_message(session_key, "user", query_text)
         self._store.append_message(session_key, "assistant", assistant_text)
+
+        # Persist JSONL transcript files for debugging parity with Morpheus patterns.
+        full_messages = list(provider_messages[turn_start_index:])
+        if not full_messages:
+            full_messages = [Message(role=MessageRole.USER, content=query_text)]
+        last = full_messages[-1]
+        last_content = str(last.content or "").strip() if last.role == MessageRole.ASSISTANT else ""
+        if last.role != MessageRole.ASSISTANT or not last_content:
+            full_messages.append(Message(role=MessageRole.ASSISTANT, content=assistant_text))
+        self._session_jsonl.append_user_assistant(
+            session_key=session_key,
+            user_text=query_text,
+            assistant_text=assistant_text,
+        )
+        self._session_jsonl.append_full_messages(
+            session_key=session_key,
+            messages=full_messages,
+        )
 
         # Persist long-term memory.
         if self._settings.memory_enabled:

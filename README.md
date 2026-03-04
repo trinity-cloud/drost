@@ -108,6 +108,12 @@ When `DROST_TRACE_ENABLED=true` (default), run and tool traces are appended to:
 - `~/.drost/traces/runs.jsonl`
 - `~/.drost/traces/tools.jsonl`
 
+## Session JSONL Transcripts
+
+Drost also writes per-session JSONL transcripts under:
+- `~/.drost/sessions/<session_key>.jsonl` (user/assistant only)
+- `~/.drost/sessions/<session_key>.full.jsonl` (full turn flow with tool calls/results)
+
 ## Gateway Endpoints
 
 - `GET /health`

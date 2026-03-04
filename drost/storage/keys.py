@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 @dataclass
@@ -37,3 +38,9 @@ def session_key_for_telegram_chat(chat_id: int, session_id: str | None) -> str:
     sid = (session_id or "").strip()
     identifier = f"{chat_id}__{sid}" if sid else str(chat_id)
     return build_session_key(agent="main", channel="telegram", identifier=identifier)
+
+
+def session_key_to_filename(session_key: str) -> str:
+    filename = str(session_key or "").replace(":", "_")
+    filename = re.sub(r"[^\w\-.]", "_", filename)
+    return filename
