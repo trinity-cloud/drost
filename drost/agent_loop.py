@@ -145,9 +145,11 @@ class DefaultSingleLoopRunner:
         return "\n".join(self._checklist_lines(state))
 
     def _loop_control_prompt(self, state: _LoopControlState) -> str:
+        available = [*self._tool_registry.names(), *internal_loop_tool_names()]
+        available_text = ", ".join(available) if available else "(none)"
         lines = [
             "[Loop Control Contract]",
-            f"- Tools available: {LOOP_CHECKLIST_PATCH}, {LOOP_FINISH}, {LOOP_BLOCKED}.",
+            f"- Tools available: {available_text}.",
             "- Update checklist any time as the plan evolves with new information.",
             (
                 f"- Call `{LOOP_FINISH}` when you are ready to return the final user-facing answer. "
@@ -729,11 +731,23 @@ class DefaultSingleLoopRunner:
                     )
 
                 reminder = (
-                    "Loop controller: continue the run. If ready to respond to user, call "
-                    f"`{LOOP_FINISH}` with `final_response` (and completion_check when checklist is non-empty). "
-                    f"If blocked, call `{LOOP_BLOCKED}`."
+                    "Error: missing explicit run-stop signal. "
+                    f"Call `{LOOP_FINISH}` with `final_response` "
+                    "(and completion_check when checklist is non-empty), "
+                    f"or call `{LOOP_BLOCKED}` with reason/ask_user."
                 )
-                messages.append(Message(role=MessageRole.USER, content=reminder))
+                messages.append(
+                    Message(
+                        role=MessageRole.TOOL,
+                        tool_results=[
+                            ToolResult(
+                                tool_call_id="loop_controller_missing_stop_signal",
+                                content=reminder,
+                                is_error=True,
+                            )
+                        ],
+                    )
+                )
                 await self._emit_status(status_callback, "Awaiting explicit run stop signal...")
                 continue
 

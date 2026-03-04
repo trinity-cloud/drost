@@ -183,6 +183,50 @@ class ToolThenPlainTextProvider(_BaseFakeProvider):
         yield StreamDelta(content="done")
 
 
+class ToolThenPlainTextThenFinishProvider(_BaseFakeProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.saw_tool_error_reminder = False
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[object] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        stop_sequences: list[str] | None = None,
+    ) -> AsyncIterator[StreamDelta]:
+        _ = system, tools, max_tokens, temperature, stop_sequences
+        if self.calls == 0:
+            self.calls += 1
+            yield StreamDelta(
+                tool_call=ToolCall(
+                    id="call-1",
+                    name="echo",
+                    arguments={"text": "tool output"},
+                )
+            )
+            return
+        if self.calls == 1:
+            self.calls += 1
+            yield StreamDelta(content="still thinking")
+            return
+        self.calls += 1
+        if messages and messages[-1].role == MessageRole.TOOL:
+            for tr in messages[-1].tool_results:
+                if "missing explicit run-stop signal" in str(tr.content or ""):
+                    self.saw_tool_error_reminder = True
+        yield StreamDelta(
+            tool_call=ToolCall(
+                id="call-finish",
+                name=LOOP_FINISH,
+                arguments={"final_response": "done after reminder"},
+            )
+        )
+
+
 class ChecklistFinishMissingCompletionProvider(_BaseFakeProvider):
     def __init__(self) -> None:
         self.calls = 0
@@ -338,6 +382,26 @@ async def test_agent_loop_finish_requires_completion_check_when_checklist_exists
     )
     assert result.stopped_by_limit
     assert "completion_check" in result.final_text
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_injects_missing_finish_as_tool_error_not_user(tmp_path) -> None:
+    settings = Settings(workspace_dir=tmp_path, agent_max_iterations=5)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    provider = ToolThenPlainTextThenFinishProvider()
+    runner = DefaultSingleLoopRunner(
+        provider=provider,
+        tool_registry=registry,
+        settings=settings,
+    )
+
+    result = await runner.run_turn(
+        messages=[Message(role=MessageRole.USER, content="hi")],
+        system_prompt="system",
+    )
+    assert result.final_text == "done after reminder"
+    assert provider.saw_tool_error_reminder
 
 
 @pytest.mark.asyncio
