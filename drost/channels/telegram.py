@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -94,6 +95,51 @@ class TelegramChannel(BaseChannel):
                 reply_to_message_id=reply_to if first else None,
             )
             first = False
+
+    async def _edit_message(self, chat_id: int, message_id: int, text: str) -> None:
+        body = str(text or "").strip()
+        if not body:
+            body = "Working..."
+        try:
+            await self.bot.edit_message_text(
+                body[:4000],
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode=None,
+            )
+        except Exception:
+            # Ignore edit races / "message is not modified" errors.
+            logger.debug("Telegram message edit failed", exc_info=True)
+
+    async def _finalize_working_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_to: int | None = None,
+    ) -> None:
+        body = str(text or "").strip()
+        if not body:
+            body = "I don't have a response for that yet."
+
+        max_len = 4000
+        if len(body) <= max_len:
+            await self._edit_message(chat_id, message_id, body)
+            return
+
+        first = body[:max_len]
+        await self._edit_message(chat_id, message_id, first)
+        cursor = max_len
+        while cursor < len(body):
+            chunk = body[cursor : cursor + max_len]
+            cursor += len(chunk)
+            await self.bot.send_message(
+                chat_id,
+                chunk,
+                parse_mode=None,
+                reply_to_message_id=reply_to if cursor <= (2 * max_len) else None,
+            )
 
     async def _handle_start(self, message: TgMessage) -> None:
         await message.answer(
@@ -241,15 +287,45 @@ class TelegramChannel(BaseChannel):
             "session_id": session_id,
         }
 
+        working = await self.bot.send_message(
+            chat_id,
+            "Working...",
+            parse_mode=None,
+            reply_to_message_id=message.message_id,
+        )
+        working_id = int(working.message_id)
+        status_lock = asyncio.Lock()
+        status_cache = {"text": "Working..."}
+
+        async def _status_callback(status_text: str) -> None:
+            cleaned = str(status_text or "").strip()
+            if not cleaned:
+                return
+            async with status_lock:
+                if cleaned == status_cache["text"]:
+                    return
+                status_cache["text"] = cleaned
+                await self._edit_message(chat_id, working_id, cleaned)
+
+        context["status_callback"] = _status_callback
+
         try:
             reply = await self._message_handler(context)
         except Exception:
             logger.exception("Error handling inbound Telegram message")
-            await message.answer("Internal error while processing message.", parse_mode=None)
+            await self._edit_message(chat_id, working_id, "Internal error while processing message.")
             return
 
         if reply:
-            await self._send_long(chat_id, reply, reply_to=message.message_id)
+            await self._finalize_working_message(
+                chat_id=chat_id,
+                message_id=working_id,
+                text=reply,
+                reply_to=message.message_id,
+            )
+            return
+
+        await self._edit_message(chat_id, working_id, "No response generated.")
 
     def _setup_handlers(self) -> None:
         self.router.message.register(self._handle_start, Command("start"))
@@ -301,10 +377,8 @@ class TelegramChannel(BaseChannel):
             if self.webhook_url:
                 await self.bot.delete_webhook(drop_pending_updates=False)
             if self._polling_active:
-                try:
+                with contextlib.suppress(RuntimeError):
                     await self.dp.stop_polling()
-                except RuntimeError:
-                    pass
             if self._polling_task is not None:
                 if not self._polling_task.done():
                     self._polling_task.cancel()

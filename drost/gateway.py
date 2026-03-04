@@ -68,10 +68,12 @@ class Gateway:
 
         chat_id = int(context.get("chat_id") or 0)
         session_id = context.get("session_id")
+        status_callback = context.get("status_callback")
         return await self.agent.respond(
             chat_id=chat_id,
             text=text,
             session_id=(str(session_id).strip() if session_id is not None else None),
+            status_callback=status_callback if callable(status_callback) else None,
         )
 
     def _mount_lifecycle(self) -> None:
@@ -140,6 +142,11 @@ class Gateway:
                 "results": rows,
                 "count": len(rows),
             }
+
+        @self.app.get("/v1/runs/last")
+        async def runs_last() -> dict[str, Any]:
+            run = self.agent.last_run_metadata()
+            return {"run": run}
 
         @self.app.post("/v1/chat")
         async def chat(payload: ChatRequest) -> dict[str, Any]:

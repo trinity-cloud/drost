@@ -442,6 +442,27 @@ class SQLiteStore:
             self._conn.commit()
             return chunk_id
 
+    def get_memory_chunk(self, chunk_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, session_key, role, content, created_at
+                  FROM memory_chunks
+                 WHERE id = ?
+                 LIMIT 1
+                """,
+                (int(chunk_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row["id"]),
+            "session_key": str(row["session_key"]),
+            "role": str(row["role"]),
+            "content": str(row["content"]),
+            "created_at": str(row["created_at"]),
+        }
+
     def _search_vector_sqlite_vec(self, query_embedding: list[float], limit: int) -> list[dict[str, Any]]:
         if not self._vector_enabled or not query_embedding or self._is_zero_vector(query_embedding):
             return []

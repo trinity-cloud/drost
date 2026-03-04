@@ -1,7 +1,8 @@
-"""Anthropic Claude provider with setup-token support (Claude Code style)."""
+"""Anthropic Claude provider with setup-token support and native tool calling."""
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, AsyncIterator
@@ -9,13 +10,25 @@ from typing import Any, AsyncIterator
 import anthropic
 from anthropic.types import (
     ContentBlockDeltaEvent,
+    ContentBlockStartEvent,
+    ContentBlockStopEvent,
     MessageDeltaEvent,
     MessageStartEvent,
     TextBlock,
     TextDelta,
+    ToolUseBlock,
 )
+from anthropic.types.input_json_delta import InputJsonDelta
 
-from drost.providers.base import BaseProvider, ChatResponse, Message, MessageRole, StreamDelta
+from drost.providers.base import (
+    BaseProvider,
+    ChatResponse,
+    Message,
+    MessageRole,
+    StreamDelta,
+    ToolCall,
+    ToolDefinition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +40,7 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
     for msg in messages:
         if msg.role == MessageRole.SYSTEM:
             continue
+
         if msg.role == MessageRole.USER:
             if isinstance(msg.content, list):
                 blocks: list[dict[str, Any]] = []
@@ -41,11 +55,33 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
             continue
 
         if msg.role == MessageRole.ASSISTANT:
-            out.append({"role": "assistant", "content": str(msg.content or "")})
+            content: list[dict[str, Any]] = []
+            if msg.content:
+                content.append({"type": "text", "text": str(msg.content)})
+            for tc in msg.tool_calls:
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    }
+                )
+            out.append({"role": "assistant", "content": content if content else ""})
             continue
 
         if msg.role == MessageRole.TOOL:
-            # Drost stripped-down runtime does not use tool call loops.
+            blocks: list[dict[str, Any]] = []
+            for tr in msg.tool_results:
+                blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tr.tool_call_id,
+                        "content": tr.content,
+                        "is_error": bool(tr.is_error),
+                    }
+                )
+            out.append({"role": "user", "content": blocks})
             continue
 
     return out
@@ -96,7 +132,6 @@ class AnthropicProvider(BaseProvider):
         if not self._is_setup_token:
             return system
 
-        # Claude Code-style identity for setup tokens.
         blocks: list[dict[str, Any]] = [
             {
                 "type": "text",
@@ -114,18 +149,39 @@ class AnthropicProvider(BaseProvider):
             )
         return blocks
 
+    @staticmethod
+    def _convert_tools(tools: list[ToolDefinition] | None) -> list[dict[str, Any]] | None:
+        if not tools:
+            return None
+        return [t.to_anthropic_format() for t in tools]
+
+    @staticmethod
+    def _parse_response_content(blocks: list[Any]) -> tuple[str | None, list[ToolCall]]:
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in blocks:
+            if isinstance(block, TextBlock):
+                text_parts.append(block.text)
+            elif isinstance(block, ToolUseBlock):
+                tool_calls.append(
+                    ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        arguments=dict(block.input) if isinstance(block.input, dict) else {},
+                    )
+                )
+        return ("".join(text_parts) or None, tool_calls)
+
     async def chat(
         self,
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
     ) -> ChatResponse:
-        _ = tools
-
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _convert_messages(messages),
@@ -135,7 +191,9 @@ class AnthropicProvider(BaseProvider):
         built_system = self._build_system(system)
         if built_system:
             kwargs["system"] = built_system
-
+        converted_tools = self._convert_tools(tools)
+        if converted_tools:
+            kwargs["tools"] = converted_tools
         if temperature is not None:
             kwargs["temperature"] = temperature
         if stop_sequences:
@@ -143,10 +201,7 @@ class AnthropicProvider(BaseProvider):
 
         try:
             response = await self._client.messages.create(**kwargs)
-            content_parts: list[str] = []
-            for block in response.content:
-                if isinstance(block, TextBlock):
-                    content_parts.append(block.text)
+            content_text, tool_calls = self._parse_response_content(response.content)
             usage = None
             if response.usage:
                 usage = {
@@ -155,7 +210,11 @@ class AnthropicProvider(BaseProvider):
                 }
                 usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
             return ChatResponse(
-                message=Message(role=MessageRole.ASSISTANT, content="".join(content_parts) or None),
+                message=Message(
+                    role=MessageRole.ASSISTANT,
+                    content=content_text,
+                    tool_calls=tool_calls,
+                ),
                 finish_reason=str(response.stop_reason or "end_turn"),
                 usage=usage,
             )
@@ -165,6 +224,7 @@ class AnthropicProvider(BaseProvider):
             return await self._chat_from_stream(
                 messages=messages,
                 system=system,
+                tools=tools,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stop_sequences=stop_sequences,
@@ -175,27 +235,39 @@ class AnthropicProvider(BaseProvider):
         *,
         messages: list[Message],
         system: str | None,
+        tools: list[ToolDefinition] | None,
         max_tokens: int | None,
         temperature: float | None,
         stop_sequences: list[str] | None,
     ) -> ChatResponse:
         text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
         usage: dict[str, int] | None = None
+        finish_reason = "stop"
         async for delta in self.chat_stream(
             messages,
             system=system,
+            tools=tools,
             max_tokens=max_tokens,
             temperature=temperature,
             stop_sequences=stop_sequences,
         ):
             if delta.content:
                 text_parts.append(delta.content)
+            if delta.tool_call:
+                tool_calls.append(delta.tool_call)
             if delta.usage:
                 usage = delta.usage
+            if delta.finish_reason:
+                finish_reason = delta.finish_reason
 
         return ChatResponse(
-            message=Message(role=MessageRole.ASSISTANT, content="".join(text_parts) or None),
-            finish_reason="stop",
+            message=Message(
+                role=MessageRole.ASSISTANT,
+                content="".join(text_parts) or None,
+                tool_calls=tool_calls,
+            ),
+            finish_reason=finish_reason,
             usage=usage,
         )
 
@@ -204,13 +276,11 @@ class AnthropicProvider(BaseProvider):
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
     ) -> AsyncIterator[StreamDelta]:
-        _ = tools
-
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _convert_messages(messages),
@@ -220,13 +290,17 @@ class AnthropicProvider(BaseProvider):
         built_system = self._build_system(system)
         if built_system:
             kwargs["system"] = built_system
-
+        converted_tools = self._convert_tools(tools)
+        if converted_tools:
+            kwargs["tools"] = converted_tools
         if temperature is not None:
             kwargs["temperature"] = temperature
-
         if stop_sequences:
             kwargs["stop_sequences"] = stop_sequences
 
+        current_tool_id: str | None = None
+        current_tool_name: str | None = None
+        current_tool_json = ""
         last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
         async with self._client.messages.stream(**kwargs) as stream:
@@ -244,26 +318,77 @@ class AnthropicProvider(BaseProvider):
                     yield StreamDelta(usage=usage)
                     continue
 
+                if isinstance(event, ContentBlockStartEvent):
+                    block = event.content_block
+                    if getattr(block, "type", "") == "tool_use":
+                        current_tool_id = str(getattr(block, "id", "") or "").strip() or None
+                        current_tool_name = str(getattr(block, "name", "") or "").strip() or None
+                        current_tool_json = ""
+                    continue
+
                 if isinstance(event, ContentBlockDeltaEvent):
                     delta = event.delta
                     if isinstance(delta, TextDelta):
                         text = str(delta.text or "")
                         if text:
                             yield StreamDelta(content=text)
+                    elif isinstance(delta, InputJsonDelta):
+                        current_tool_json += str(delta.partial_json or "")
+                    continue
+
+                if isinstance(event, ContentBlockStopEvent):
+                    if current_tool_id and current_tool_name:
+                        arguments: dict[str, Any]
+                        try:
+                            parsed = json.loads(current_tool_json) if current_tool_json else {}
+                        except json.JSONDecodeError:
+                            parsed = {}
+                        arguments = parsed if isinstance(parsed, dict) else {}
+                        yield StreamDelta(
+                            tool_call=ToolCall(
+                                id=current_tool_id,
+                                name=current_tool_name,
+                                arguments=arguments,
+                            )
+                        )
+                    current_tool_id = None
+                    current_tool_name = None
+                    current_tool_json = ""
                     continue
 
                 if isinstance(event, MessageDeltaEvent):
                     usage_obj = getattr(event, "usage", None)
-                    if usage_obj is None:
-                        continue
-                    usage = {
-                        "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or last_usage["input_tokens"]),
-                        "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                    }
-                    usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
-                    if usage != last_usage:
-                        last_usage = usage
-                        yield StreamDelta(usage=usage)
+                    if usage_obj is not None:
+                        usage = {
+                            "input_tokens": int(getattr(usage_obj, "input_tokens", last_usage["input_tokens"]) or 0),
+                            "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
+                        }
+                        usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
+                        if usage != last_usage:
+                            last_usage = usage
+                            yield StreamDelta(usage=usage)
+
+                    stop_reason = str(getattr(getattr(event, "delta", None), "stop_reason", "") or "").strip()
+                    if stop_reason:
+                        yield StreamDelta(finish_reason=stop_reason)
+
+                    if current_tool_id and current_tool_name:
+                        try:
+                            parsed = json.loads(current_tool_json) if current_tool_json else {}
+                        except json.JSONDecodeError:
+                            parsed = {}
+                        arguments = parsed if isinstance(parsed, dict) else {}
+                        yield StreamDelta(
+                            tool_call=ToolCall(
+                                id=current_tool_id,
+                                name=current_tool_name,
+                                arguments=arguments,
+                            )
+                        )
+                        current_tool_id = None
+                        current_tool_name = None
+                        current_tool_json = ""
 
     async def close(self) -> None:
         await self._client.close()
+

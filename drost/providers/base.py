@@ -30,6 +30,20 @@ class ToolResult:
 
 
 @dataclass
+class ToolDefinition:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    def to_anthropic_format(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": self.input_schema,
+        }
+
+
+@dataclass
 class Message:
     role: MessageRole
     content: str | list[dict[str, Any]] | None = None
@@ -70,7 +84,7 @@ class BaseProvider(ABC):
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
@@ -83,7 +97,7 @@ class BaseProvider(ABC):
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,

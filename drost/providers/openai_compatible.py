@@ -9,6 +9,7 @@ Used for:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ from drost.providers.base import (
     MessageRole,
     StreamDelta,
     ToolCall,
+    ToolDefinition,
 )
 from drost.providers.openai_oauth import (
     CODEX_AUTH_PATH,
@@ -119,6 +121,7 @@ class OpenAICompatibleProvider(BaseProvider):
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
                 continue
+
             if msg.role == MessageRole.USER:
                 if isinstance(msg.content, list):
                     content: list[dict[str, Any]] = []
@@ -163,6 +166,76 @@ class OpenAICompatibleProvider(BaseProvider):
 
         return out
 
+    def _convert_tools(self, tools: list[ToolDefinition] | None) -> list[dict[str, Any]] | None:
+        if not tools:
+            return None
+
+        def _make_nullable(schema: Any) -> Any:
+            if not isinstance(schema, dict):
+                return schema
+            schema_type = schema.get("type")
+            if isinstance(schema_type, str):
+                if schema_type != "null":
+                    schema["type"] = [schema_type, "null"]
+            elif isinstance(schema_type, list):
+                if "null" not in schema_type:
+                    schema["type"] = [*schema_type, "null"]
+            return schema
+
+        def _normalize_strict_schema(schema: Any) -> Any:
+            if isinstance(schema, list):
+                for item in schema:
+                    _normalize_strict_schema(item)
+                return schema
+            if not isinstance(schema, dict):
+                return schema
+
+            if schema.get("type") == "object" or "properties" in schema:
+                schema.setdefault("type", "object")
+                schema["additionalProperties"] = False
+                props = schema.get("properties")
+                if isinstance(props, dict):
+                    required = schema.get("required")
+                    required_set = set(required) if isinstance(required, list) else set()
+                    schema["required"] = list(props.keys())
+                    for name, sub in props.items():
+                        if name not in required_set:
+                            _make_nullable(sub)
+
+            for key in ("properties", "$defs", "definitions"):
+                subs = schema.get(key)
+                if isinstance(subs, dict):
+                    for sub in subs.values():
+                        _normalize_strict_schema(sub)
+
+            for key in ("items", "oneOf", "anyOf", "allOf", "if", "then", "else", "not"):
+                if key in schema:
+                    _normalize_strict_schema(schema[key])
+            return schema
+
+        if not self._tools_strict:
+            return [
+                {
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": copy.deepcopy(t.input_schema),
+                    "strict": False,
+                }
+                for t in tools
+            ]
+
+        return [
+            {
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": _normalize_strict_schema(copy.deepcopy(t.input_schema)),
+                "strict": True,
+            }
+            for t in tools
+        ]
+
     @staticmethod
     def _safe_json_object(raw: str) -> dict[str, Any]:
         cleaned = (raw or "").strip()
@@ -185,6 +258,21 @@ class OpenAICompatibleProvider(BaseProvider):
                     text_parts.append(str(getattr(part, "text", "") or ""))
         return "".join(text_parts)
 
+    @classmethod
+    def _extract_tool_calls_from_output(cls, output_items: list[Any] | None) -> list[ToolCall]:
+        calls: list[ToolCall] = []
+        for item in output_items or []:
+            if getattr(item, "type", None) != "function_call":
+                continue
+            call_id = str(getattr(item, "call_id", "") or "").strip()
+            if not call_id:
+                call_id = str(getattr(item, "id", "") or "").strip()
+            name = str(getattr(item, "name", "") or "").strip()
+            raw_args = str(getattr(item, "arguments", "") or "")
+            if call_id and name:
+                calls.append(ToolCall(id=call_id, name=name, arguments=cls._safe_json_object(raw_args)))
+        return calls
+
     def _resolve_instructions(self, system: str | None) -> str | None:
         cleaned = (system or "").strip()
         if cleaned:
@@ -198,44 +286,54 @@ class OpenAICompatibleProvider(BaseProvider):
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
     ) -> ChatResponse:
-        _ = tools
         _ = stop_sequences
 
         input_items = self._convert_messages_to_input(messages)
+        openai_tools = self._convert_tools(tools)
 
-        async def _call(stream: bool) -> Any:
+        if self._is_codex_backend:
+            return await self._chat_from_stream(
+                input_items=input_items,
+                system=system,
+                tools=openai_tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+
+        async def _call() -> Any:
             kwargs: dict[str, Any] = {
                 "model": self._model,
                 "input": cast(Any, input_items),
                 "instructions": self._resolve_instructions(system),
                 "store": False,
-                "stream": stream,
+                "stream": False,
+                "max_output_tokens": max_tokens or self._max_tokens,
             }
-            if not self._is_codex_backend:
-                kwargs["max_output_tokens"] = max_tokens or self._max_tokens
-                if temperature is not None:
-                    kwargs["temperature"] = temperature
+            if openai_tools is not None:
+                kwargs["tools"] = cast(Any, openai_tools)
+            if temperature is not None:
+                kwargs["temperature"] = temperature
             return await self._client.responses.create(**kwargs)
 
-        if self._is_codex_backend:
-            # Codex backend requires stream=true; buffer into a full response.
-            return await self._chat_from_stream(input_items=input_items, system=system, max_tokens=max_tokens)
-
         try:
-            resp = await _call(stream=False)
+            resp = await _call()
         except AuthenticationError:
             if self._use_codex_oauth:
                 await self._refresh_codex()
-                resp = await _call(stream=False)
+                resp = await _call()
             else:
                 raise
 
-        text = self._extract_text_from_output(getattr(resp, "output", None))
+        message = Message(
+            role=MessageRole.ASSISTANT,
+            content=self._extract_text_from_output(getattr(resp, "output", None)) or None,
+            tool_calls=self._extract_tool_calls_from_output(getattr(resp, "output", None)),
+        )
         usage = None
         if getattr(resp, "usage", None):
             usage = {
@@ -243,10 +341,9 @@ class OpenAICompatibleProvider(BaseProvider):
                 "output_tokens": int(getattr(resp.usage, "output_tokens", 0) or 0),
             }
             usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
-
         return ChatResponse(
-            message=Message(role=MessageRole.ASSISTANT, content=text if text else None),
-            finish_reason="stop",
+            message=message,
+            finish_reason="tool_calls" if message.tool_calls else "stop",
             usage=usage,
         )
 
@@ -255,24 +352,34 @@ class OpenAICompatibleProvider(BaseProvider):
         *,
         input_items: list[dict[str, Any]],
         system: str | None,
+        tools: list[dict[str, Any]] | None,
         max_tokens: int | None,
+        temperature: float | None,
     ) -> ChatResponse:
         text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
         usage: dict[str, int] | None = None
         async for delta in self._iter_openai_stream(
             input_items=input_items,
             system=system,
+            tools=tools,
             max_tokens=max_tokens,
-            temperature=None,
+            temperature=temperature,
         ):
             if delta.content:
                 text_parts.append(delta.content)
+            if delta.tool_call:
+                tool_calls.append(delta.tool_call)
             if delta.usage:
                 usage = delta.usage
-        text = "".join(text_parts)
+
         return ChatResponse(
-            message=Message(role=MessageRole.ASSISTANT, content=text if text else None),
-            finish_reason="stop",
+            message=Message(
+                role=MessageRole.ASSISTANT,
+                content=("".join(text_parts) if text_parts else None),
+                tool_calls=tool_calls,
+            ),
+            finish_reason="tool_calls" if tool_calls else "stop",
             usage=usage,
         )
 
@@ -281,6 +388,7 @@ class OpenAICompatibleProvider(BaseProvider):
         *,
         input_items: list[dict[str, Any]],
         system: str | None,
+        tools: list[dict[str, Any]] | None,
         max_tokens: int | None,
         temperature: float | None,
     ) -> AsyncIterator[StreamDelta]:
@@ -295,6 +403,8 @@ class OpenAICompatibleProvider(BaseProvider):
             kwargs["max_output_tokens"] = max_tokens or self._max_tokens
             if temperature is not None:
                 kwargs["temperature"] = temperature
+        if tools is not None:
+            kwargs["tools"] = cast(Any, tools)
 
         stream: AsyncStream[ResponseStreamEvent] | None = None
         try:
@@ -308,19 +418,95 @@ class OpenAICompatibleProvider(BaseProvider):
                     raise
 
             emitted_text = ""
+            emitted_call_ids: set[str] = set()
+            item_id_to_call_id: dict[str, str] = {}
+            pending_by_item_id: dict[str, tuple[str, str]] = {}
+
             async for event in stream:
                 etype = str(getattr(event, "type", "") or "")
+
                 if etype == "response.output_text.delta":
-                    delta = str(getattr(event, "delta", "") or "")
-                    if delta:
-                        emitted_text += delta
-                        yield StreamDelta(content=delta)
+                    delta_text = str(getattr(event, "delta", "") or "")
+                    if delta_text:
+                        emitted_text += delta_text
+                        yield StreamDelta(content=delta_text)
+                    continue
+
+                if etype == "response.output_item.added":
+                    item = getattr(event, "item", None)
+                    if item is not None and getattr(item, "type", "") == "function_call":
+                        item_id = str(getattr(item, "id", "") or "").strip()
+                        call_id = str(getattr(item, "call_id", "") or "").strip()
+                        if item_id and call_id:
+                            item_id_to_call_id[item_id] = call_id
+                            pending = pending_by_item_id.pop(item_id, None)
+                            if pending and call_id not in emitted_call_ids:
+                                name, raw = pending
+                                emitted_call_ids.add(call_id)
+                                yield StreamDelta(
+                                    tool_call=ToolCall(
+                                        id=call_id,
+                                        name=name,
+                                        arguments=self._safe_json_object(raw),
+                                    )
+                                )
+                    continue
+
+                if etype == "response.function_call_arguments.done":
+                    item_id = str(getattr(event, "item_id", "") or "").strip()
+                    name = str(getattr(event, "name", "") or "").strip()
+                    raw = str(getattr(event, "arguments", "") or "").strip()
+                    if item_id and name:
+                        pending_by_item_id[item_id] = (name, raw)
+                        call_id = item_id_to_call_id.get(item_id)
+                        if call_id and call_id not in emitted_call_ids:
+                            pending_by_item_id.pop(item_id, None)
+                            emitted_call_ids.add(call_id)
+                            yield StreamDelta(
+                                tool_call=ToolCall(
+                                    id=call_id,
+                                    name=name,
+                                    arguments=self._safe_json_object(raw),
+                                )
+                            )
+                    continue
+
+                if etype == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if item is not None and getattr(item, "type", "") == "function_call":
+                        item_id = str(getattr(item, "id", "") or "").strip()
+                        call_id = str(getattr(item, "call_id", "") or "").strip()
+                        name = str(getattr(item, "name", "") or "").strip()
+                        raw = str(getattr(item, "arguments", "") or "")
+                        if item_id and call_id:
+                            item_id_to_call_id[item_id] = call_id
+                            pending_by_item_id.pop(item_id, None)
+                        if call_id and name and call_id not in emitted_call_ids:
+                            emitted_call_ids.add(call_id)
+                            yield StreamDelta(
+                                tool_call=ToolCall(
+                                    id=call_id,
+                                    name=name,
+                                    arguments=self._safe_json_object(raw),
+                                )
+                            )
                     continue
 
                 if etype == "response.completed":
                     response = getattr(event, "response", None)
                     if response is None:
                         continue
+
+                    for tc in self._extract_tool_calls_from_output(getattr(response, "output", None)):
+                        if tc.id in emitted_call_ids:
+                            continue
+                        emitted_call_ids.add(tc.id)
+                        yield StreamDelta(tool_call=tc)
+
+                    final_text = self._extract_text_from_output(getattr(response, "output", None))
+                    if final_text and final_text.startswith(emitted_text) and len(final_text) > len(emitted_text):
+                        yield StreamDelta(content=final_text[len(emitted_text) :])
+
                     if getattr(response, "usage", None):
                         usage = {
                             "input_tokens": int(getattr(response.usage, "input_tokens", 0) or 0),
@@ -328,10 +514,6 @@ class OpenAICompatibleProvider(BaseProvider):
                         }
                         usage["total_tokens"] = int(usage["input_tokens"] + usage["output_tokens"])
                         yield StreamDelta(usage=usage)
-
-                    final_text = self._extract_text_from_output(getattr(response, "output", None))
-                    if final_text and final_text.startswith(emitted_text) and len(final_text) > len(emitted_text):
-                        yield StreamDelta(content=final_text[len(emitted_text) :])
         finally:
             if stream is not None:
                 await stream.close()
@@ -341,18 +523,19 @@ class OpenAICompatibleProvider(BaseProvider):
         messages: list[Message],
         *,
         system: str | None = None,
-        tools: list[Any] | None = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
     ) -> AsyncIterator[StreamDelta]:
-        _ = tools
         _ = stop_sequences
 
         input_items = self._convert_messages_to_input(messages)
+        openai_tools = self._convert_tools(tools)
         async for delta in self._iter_openai_stream(
             input_items=input_items,
             system=system,
+            tools=openai_tools,
             max_tokens=max_tokens,
             temperature=temperature,
         ):
@@ -360,3 +543,4 @@ class OpenAICompatibleProvider(BaseProvider):
 
     async def close(self) -> None:
         await self._client.close()
+

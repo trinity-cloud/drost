@@ -63,6 +63,29 @@ class Settings(BaseSettings):
 
     session_history_limit: int = 64
 
+    agent_max_iterations: int = 10
+    agent_max_tool_calls_per_run: int = 24
+    agent_tool_timeout_seconds: float = 30.0
+    agent_run_timeout_seconds: float = 180.0
+
+    context_budget_total_tokens: int = 96_000
+    context_budget_system_tokens: int = 24_000
+    context_budget_history_tokens: int = 24_000
+    context_budget_memory_tokens: int = 24_000
+    context_budget_reserve_tokens: int = 24_000
+
+    history_compaction_enabled: bool = True
+    history_compaction_trigger_ratio: float = 0.70
+    history_compaction_keep_recent_messages: int = 12
+    history_compaction_summary_max_tokens: int = 1_500
+
+    workspace_dir: Path = Field(default_factory=lambda: Path("~/.drost").expanduser())
+    trace_enabled: bool = True
+    trace_dir: Path = Field(default_factory=lambda: Path("~/.drost/traces").expanduser())
+    prompt_workspace_files: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
+    )
+
     @field_validator("telegram_allowed_user_ids", mode="before")
     @classmethod
     def parse_telegram_allowed_user_ids(cls, value: str | list[int] | None) -> list[int]:
@@ -89,6 +112,23 @@ class Settings(BaseSettings):
             except Exception:
                 continue
         return out
+
+    @field_validator("prompt_workspace_files", mode="before")
+    @classmethod
+    def parse_prompt_workspace_files(cls, value: str | list[str] | None) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            out: list[str] = []
+            for item in value:
+                cleaned = str(item or "").strip()
+                if cleaned:
+                    out.append(cleaned)
+            return out
+        cleaned = str(value).strip()
+        if not cleaned:
+            return []
+        return [token.strip() for token in cleaned.split(",") if token.strip()]
 
     @field_validator("gateway_port")
     @classmethod
@@ -126,6 +166,38 @@ class Settings(BaseSettings):
             raise ValueError("memory_embedding_dimensions must be >= 8")
         return value
 
+    @field_validator(
+        "agent_max_iterations",
+        "agent_max_tool_calls_per_run",
+        "context_budget_total_tokens",
+        "context_budget_system_tokens",
+        "context_budget_history_tokens",
+        "context_budget_memory_tokens",
+        "context_budget_reserve_tokens",
+        "history_compaction_keep_recent_messages",
+        "history_compaction_summary_max_tokens",
+    )
+    @classmethod
+    def validate_positive_ints(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError("value must be >= 1")
+        return int(value)
+
+    @field_validator("agent_tool_timeout_seconds", "agent_run_timeout_seconds")
+    @classmethod
+    def validate_positive_floats(cls, value: float) -> float:
+        if float(value) <= 0:
+            raise ValueError("value must be > 0")
+        return float(value)
+
+    @field_validator("history_compaction_trigger_ratio")
+    @classmethod
+    def validate_compaction_ratio(cls, value: float) -> float:
+        ratio = float(value)
+        if ratio <= 0.0 or ratio >= 1.0:
+            raise ValueError("history_compaction_trigger_ratio must be in (0, 1)")
+        return ratio
+
     @model_validator(mode="after")
     def apply_provider_env_fallbacks(self) -> "Settings":
         if not self.openai_api_key:
@@ -137,6 +209,8 @@ class Settings(BaseSettings):
 
         self.sqlite_path = Path(self.sqlite_path).expanduser()
         self.openai_codex_auth_path = Path(self.openai_codex_auth_path).expanduser()
+        self.workspace_dir = Path(self.workspace_dir).expanduser()
+        self.trace_dir = Path(self.trace_dir).expanduser()
 
         self.log_level = (self.log_level or "INFO").upper()
         self.openai_base_url = (self.openai_base_url or "").strip()
@@ -145,6 +219,13 @@ class Settings(BaseSettings):
         self.telegram_bot_token = (self.telegram_bot_token or "").strip()
         self.telegram_webhook_url = (self.telegram_webhook_url or "").strip()
         self.telegram_webhook_secret = (self.telegram_webhook_secret or "").strip()
+        self.prompt_workspace_files = [str(name).strip() for name in self.prompt_workspace_files if str(name).strip()]
+        if not self.prompt_workspace_files:
+            self.prompt_workspace_files = ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
+
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        if self.trace_enabled:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
 
         return self
 

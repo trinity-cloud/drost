@@ -8,6 +8,8 @@ It includes:
 - Session management
 - Persistent memory on SQLite
 - sqlite-vec acceleration (`sqvector`-style vector search) with fallback
+- Iterative tool-calling agent loop (`LLM -> tools -> LLM`)
+- Live Telegram progress updates by editing one in-flight "working" message
 - 3 model providers:
   - OpenAI Codex OAuth / OpenAI Responses API
   - Anthropic Claude (API key or Claude Code setup-token)
@@ -100,6 +102,12 @@ Vector mode:
   - `DROST_SQVECTOR_EXTENSION_PATH`
 - Falls back to brute-force cosine search if extension is unavailable
 
+## Traces
+
+When `DROST_TRACE_ENABLED=true` (default), run and tool traces are appended to:
+- `~/.drost/traces/runs.jsonl`
+- `~/.drost/traces/tools.jsonl`
+
 ## Gateway Endpoints
 
 - `GET /health`
@@ -108,4 +116,5 @@ Vector mode:
 - `GET /v1/sessions/{chat_id}`
 - `GET /v1/memory/status`
 - `GET /v1/memory/search?query=...&limit=...`
+- `GET /v1/runs/last`
 - `POST /v1/chat`
