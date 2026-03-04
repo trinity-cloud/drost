@@ -144,7 +144,7 @@ class DefaultSingleLoopRunner:
     def _checklist_snapshot(self, state: _LoopControlState) -> str:
         return "\n".join(self._checklist_lines(state))
 
-    def _loop_control_prompt(self, state: _LoopControlState) -> str:
+    def _loop_control_prompt(self, state: _LoopControlState, notice: str | None = None) -> str:
         available = [*self._tool_registry.names(), *internal_loop_tool_names()]
         available_text = ", ".join(available) if available else "(none)"
         lines = [
@@ -161,10 +161,19 @@ class DefaultSingleLoopRunner:
             "[Current Checklist]",
             *self._checklist_lines(state),
         ]
+        trimmed_notice = str(notice or "").strip()
+        if trimmed_notice:
+            lines.extend(["", "[Controller Notice]", trimmed_notice])
         return "\n".join(lines)
 
-    def _iteration_system_prompt(self, base_prompt: str, state: _LoopControlState) -> str:
-        contract = self._loop_control_prompt(state)
+    def _iteration_system_prompt(
+        self,
+        base_prompt: str,
+        state: _LoopControlState,
+        *,
+        notice: str | None = None,
+    ) -> str:
+        contract = self._loop_control_prompt(state, notice=notice)
         if not str(base_prompt or "").strip():
             return contract
         return f"{base_prompt}\n\n{contract}"
@@ -579,6 +588,7 @@ class DefaultSingleLoopRunner:
         all_tool_definitions = self._all_tool_definitions()
         loop_state = _LoopControlState()
         external_tool_calls = 0
+        controller_notice = ""
 
         await self._emit_status(status_callback, "Thinking...")
 
@@ -590,10 +600,31 @@ class DefaultSingleLoopRunner:
             assistant_text_parts: list[str] = []
             tool_calls = []
             iter_last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+            provider_messages = messages
+            if (
+                controller_notice
+                and self._provider.requires_user_followup_turn
+                and messages
+                and messages[-1].role == MessageRole.ASSISTANT
+            ):
+                provider_messages = [
+                    *messages,
+                    Message(
+                        role=MessageRole.USER,
+                        content=(
+                            "Controller: Continue the current run and follow the loop contract "
+                            "in the system prompt. This is not a new user request."
+                        ),
+                    ),
+                ]
             try:
                 async for delta in self._provider.chat_stream(
-                    messages=messages,
-                    system=self._iteration_system_prompt(system_prompt, loop_state),
+                    messages=provider_messages,
+                    system=self._iteration_system_prompt(
+                        system_prompt,
+                        loop_state,
+                        notice=controller_notice,
+                    ),
                     tools=all_tool_definitions,
                 ):
                     if delta.usage:
@@ -736,18 +767,7 @@ class DefaultSingleLoopRunner:
                     "(and completion_check when checklist is non-empty), "
                     f"or call `{LOOP_BLOCKED}` with reason/ask_user."
                 )
-                messages.append(
-                    Message(
-                        role=MessageRole.TOOL,
-                        tool_results=[
-                            ToolResult(
-                                tool_call_id="loop_controller_missing_stop_signal",
-                                content=reminder,
-                                is_error=True,
-                            )
-                        ],
-                    )
-                )
+                controller_notice = reminder
                 await self._emit_status(status_callback, "Awaiting explicit run stop signal...")
                 continue
 
@@ -755,6 +775,7 @@ class DefaultSingleLoopRunner:
                 status_callback,
                 "Using tools: " + ", ".join(tc.name for tc in tool_calls),
             )
+            controller_notice = ""
             tool_results: list[ToolResult] = []
             has_non_internal_tools = any(
                 not self._is_internal_tool_name(tc.name) for tc in tool_calls

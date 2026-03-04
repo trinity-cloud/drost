@@ -186,7 +186,53 @@ class ToolThenPlainTextProvider(_BaseFakeProvider):
 class ToolThenPlainTextThenFinishProvider(_BaseFakeProvider):
     def __init__(self) -> None:
         self.calls = 0
-        self.saw_tool_error_reminder = False
+        self.saw_controller_notice = False
+
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[object] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        stop_sequences: list[str] | None = None,
+    ) -> AsyncIterator[StreamDelta]:
+        _ = tools, max_tokens, temperature, stop_sequences
+        if self.calls == 0:
+            self.calls += 1
+            yield StreamDelta(
+                tool_call=ToolCall(
+                    id="call-1",
+                    name="echo",
+                    arguments={"text": "tool output"},
+                )
+            )
+            return
+        if self.calls == 1:
+            self.calls += 1
+            yield StreamDelta(content="still thinking")
+            return
+        self.calls += 1
+        if "missing explicit run-stop signal" in str(system or ""):
+            self.saw_controller_notice = True
+        yield StreamDelta(
+            tool_call=ToolCall(
+                id="call-finish",
+                name=LOOP_FINISH,
+                arguments={"final_response": "done after reminder"},
+            )
+        )
+
+
+class ToolThenPlainTextThenFinishRequiresUserTurnProvider(_BaseFakeProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.saw_controller_user_ping = False
+
+    @property
+    def requires_user_followup_turn(self) -> bool:
+        return True
 
     async def chat_stream(
         self,
@@ -214,15 +260,15 @@ class ToolThenPlainTextThenFinishProvider(_BaseFakeProvider):
             yield StreamDelta(content="still thinking")
             return
         self.calls += 1
-        if messages and messages[-1].role == MessageRole.TOOL:
-            for tr in messages[-1].tool_results:
-                if "missing explicit run-stop signal" in str(tr.content or ""):
-                    self.saw_tool_error_reminder = True
+        if messages and messages[-1].role == MessageRole.USER:
+            user_content = str(messages[-1].content or "")
+            if "Controller: Continue the current run" in user_content:
+                self.saw_controller_user_ping = True
         yield StreamDelta(
             tool_call=ToolCall(
                 id="call-finish",
                 name=LOOP_FINISH,
-                arguments={"final_response": "done after reminder"},
+                arguments={"final_response": "done after controller user ping"},
             )
         )
 
@@ -385,7 +431,7 @@ async def test_agent_loop_finish_requires_completion_check_when_checklist_exists
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_injects_missing_finish_as_tool_error_not_user(tmp_path) -> None:
+async def test_agent_loop_injects_missing_finish_notice_into_system_prompt(tmp_path) -> None:
     settings = Settings(workspace_dir=tmp_path, agent_max_iterations=5)
     registry = ToolRegistry()
     registry.register(EchoTool())
@@ -401,7 +447,27 @@ async def test_agent_loop_injects_missing_finish_as_tool_error_not_user(tmp_path
         system_prompt="system",
     )
     assert result.final_text == "done after reminder"
-    assert provider.saw_tool_error_reminder
+    assert provider.saw_controller_notice
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_adds_ephemeral_user_ping_for_providers_requiring_user_followup(tmp_path) -> None:
+    settings = Settings(workspace_dir=tmp_path, agent_max_iterations=5)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    provider = ToolThenPlainTextThenFinishRequiresUserTurnProvider()
+    runner = DefaultSingleLoopRunner(
+        provider=provider,
+        tool_registry=registry,
+        settings=settings,
+    )
+
+    result = await runner.run_turn(
+        messages=[Message(role=MessageRole.USER, content="hi")],
+        system_prompt="system",
+    )
+    assert result.final_text == "done after controller user ping"
+    assert provider.saw_controller_user_ping
 
 
 @pytest.mark.asyncio

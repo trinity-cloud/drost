@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import anthropic
 from anthropic.types import (
@@ -127,6 +128,11 @@ class AnthropicProvider(BaseProvider):
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def requires_user_followup_turn(self) -> bool:
+        # Some Claude models reject assistant-prefill continuations and require a trailing user turn.
+        return True
 
     def _build_system(self, system: str | None) -> Any:
         if not self._is_setup_token:
@@ -391,4 +397,3 @@ class AnthropicProvider(BaseProvider):
 
     async def close(self) -> None:
         await self._client.close()
-
