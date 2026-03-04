@@ -4,9 +4,10 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-from drost.agent_loop import DefaultSingleLoopRunner
+from drost.agent_loop import DefaultSingleLoopRunner, internal_loop_tool_names
 from drost.config import Settings
 from drost.context_budget import (
     should_compact_history,
@@ -16,7 +17,7 @@ from drost.context_budget import (
 from drost.embeddings import EmbeddingService
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
-from drost.storage import SQLiteStore, SessionJSONLStore, session_key_for_telegram_chat
+from drost.storage import SessionJSONLStore, SQLiteStore, session_key_for_telegram_chat
 from drost.tools import build_default_registry
 
 logger = logging.getLogger(__name__)
@@ -234,7 +235,7 @@ class AgentRuntime:
             current_chat_id=lambda: chat_id,
             current_session_key=lambda: session_key,
         )
-        tool_names = tool_registry.names()
+        tool_names = list(dict.fromkeys([*tool_registry.names(), *internal_loop_tool_names()]))
         memory_block = self._build_memory_block(memories)
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,
