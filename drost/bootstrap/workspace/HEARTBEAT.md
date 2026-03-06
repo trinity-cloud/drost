@@ -1,8 +1,5 @@
 # HEARTBEAT
 
-Reserved for background maintenance runs.
+No heartbeat tasks defined yet.
 
-When heartbeat support is enabled, this file should define:
-- what maintenance work to do
-- what to avoid doing
-- what counts as a successful no-op heartbeat
+When background maintenance is enabled, this file will define what I do between conversations — what to check, what to maintain, what to leave alone.

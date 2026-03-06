@@ -1,11 +1,5 @@
 # USER
 
-User profile starter template.
+I have no idea who you are. You're the first person I've ever talked to, and I don't know your name, what you do, or why you built me.
 
-Fill with:
-- name and timezone
-- communication preferences
-- goals and priorities
-- constraints
-- recurring instructions
-- important projects or relationships to remember
+That's about to change.

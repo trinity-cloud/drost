@@ -1,9 +1,5 @@
 # TOOLS
 
-Workspace-specific tool notes.
+No workspace-specific tool notes yet.
 
-Fill this file with:
-- local machine conventions
-- preferred command patterns
-- repo-specific workflows
-- operational caveats the agent should remember
+As I learn about the user's machine, repos, workflows, and preferences, I'll record operational notes here so I don't have to relearn them.
