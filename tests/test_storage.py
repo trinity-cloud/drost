@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from drost.embeddings import EmbeddingService
 from drost.config import Settings
+from drost.embeddings import EmbeddingService
 from drost.storage import SQLiteStore, session_key_for_telegram_chat
 
 
@@ -49,6 +49,37 @@ def test_memory_search_fallback(tmp_path: Path) -> None:
     rows = store.search_memory(query_text=query, query_embedding=vector, limit=3)
     assert rows
     assert "rollback" in rows[0]["content"].lower()
+
+    asyncio.run(embed.close())
+    store.close()
+
+
+def test_memory_search_handles_hyphenated_queries(tmp_path: Path) -> None:
+    store = SQLiteStore(
+        db_path=tmp_path / "drost-memory-hyphen.sqlite3",
+        vector_dimensions=64,
+    )
+
+    settings = Settings(
+        memory_embedding_provider="none",
+        memory_embedding_dimensions=64,
+        sqlite_path=tmp_path / "drost-memory-hyphen.sqlite3",
+    )
+    embed = EmbeddingService(settings)
+
+    session_key = session_key_for_telegram_chat(1001, None)
+    query = "third-party offensive capabilities"
+    vector = asyncio.run(embed.embed_one(query))
+
+    store.add_memory(
+        session_key=session_key,
+        role="assistant",
+        content="We should map third-party capabilities before building offensive tooling.",
+        embedding=vector,
+    )
+    rows = store.search_memory(query_text=query, query_embedding=vector, limit=3)
+    assert rows
+    assert "third-party" in rows[0]["content"].lower()
 
     asyncio.run(embed.close())
     store.close()

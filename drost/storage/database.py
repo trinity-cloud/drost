@@ -4,7 +4,8 @@ import logging
 import sqlite3
 import struct
 import threading
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,7 @@ class SQLiteStore:
 
     @staticmethod
     def _utc_now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
     def _init_schema(self) -> None:
         self._conn.executescript(
@@ -134,10 +135,8 @@ class SQLiteStore:
             self._vector_error = str(exc)
             logger.warning("sqlite-vec unavailable, using fallback vector search: %s", exc)
         finally:
-            try:
+            with suppress(Exception):
                 self._conn.enable_load_extension(False)
-            except Exception:
-                pass
 
     def memory_status(self) -> dict[str, Any]:
         return {
@@ -150,11 +149,14 @@ class SQLiteStore:
 
     @staticmethod
     def _normalize_fts_query(query: str) -> str:
-        # Simple FTS5-safe tokenization.
+        # Convert arbitrary user text into a literal-safe FTS5 query.
+        # Hyphenated terms like "third-party" must be split, otherwise FTS5
+        # can interpret them as query syntax and raise errors such as
+        # "no such column: party".
         tokens: list[str] = []
         current: list[str] = []
         for ch in (query or ""):
-            if ch.isalnum() or ch in {"_", "-"}:
+            if ch.isalnum() or ch == "_":
                 current.append(ch)
                 continue
             if current:
@@ -162,7 +164,9 @@ class SQLiteStore:
                 current = []
         if current:
             tokens.append("".join(current))
-        return " ".join(tokens[:12])
+        if not tokens:
+            return ""
+        return " AND ".join(f'"{token}"' for token in tokens[:12])
 
     @staticmethod
     def _is_zero_vector(vec: list[float]) -> bool:
@@ -175,7 +179,7 @@ class SQLiteStore:
         dot = 0.0
         na = 0.0
         nb = 0.0
-        for x, y in zip(a, b):
+        for x, y in zip(a, b, strict=False):
             dot += x * y
             na += x * x
             nb += y * y
@@ -287,7 +291,7 @@ class SQLiteStore:
 
     def create_session(self, chat_id: int, title: str = "") -> str:
         with self._lock:
-            base = datetime.now(timezone.utc).strftime("s_%Y-%m-%d_%H-%M-%S")
+            base = datetime.now(UTC).strftime("s_%Y-%m-%d_%H-%M-%S")
             candidate = base
             suffix = 1
             while True:
