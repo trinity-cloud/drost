@@ -18,11 +18,14 @@ def test_workspace_bootstrap_seeds_default_prompt_files(tmp_path: Path) -> None:
     settings = _build_settings(tmp_path)
     workspace = settings.workspace_dir
 
-    for name in ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]:
+    for name in ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "MEMORY.md", "BOOTSTRAP.md"]:
         file_path = workspace / name
         assert file_path.exists()
         text = file_path.read_text(encoding="utf-8")
         assert text.strip()
+
+    assert (workspace / "memory" / "daily").exists()
+    assert (workspace / "memory" / "entities").exists()
 
 
 def test_workspace_bootstrap_does_not_overwrite_existing_files(tmp_path: Path) -> None:
@@ -36,6 +39,10 @@ def test_workspace_bootstrap_does_not_overwrite_existing_files(tmp_path: Path) -
     assert soul.read_text(encoding="utf-8") == "custom soul content\n"
 
     # Other missing seed files should still be created.
+    assert (workspace / "AGENTS.md").exists()
     assert (workspace / "IDENTITY.md").exists()
     assert (workspace / "USER.md").exists()
+    assert (workspace / "TOOLS.md").exists()
+    assert (workspace / "HEARTBEAT.md").exists()
     assert (workspace / "MEMORY.md").exists()
+    assert not (workspace / "BOOTSTRAP.md").exists()

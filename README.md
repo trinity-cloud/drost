@@ -107,10 +107,18 @@ Vector mode:
 On startup, Drost ensures `~/.drost` exists (or `DROST_WORKSPACE_DIR` when set).
 
 It seeds missing workspace prompt files from in-repo templates on first boot:
+- `AGENTS.md`
+- `BOOTSTRAP.md` for brand-new workspaces only
 - `SOUL.md`
 - `IDENTITY.md`
 - `USER.md`
+- `TOOLS.md`
+- `HEARTBEAT.md`
 - `MEMORY.md`
+
+It also creates:
+- `memory/daily/`
+- `memory/entities/`
 
 Seed templates are maintained in:
 - `drost/bootstrap/workspace/`

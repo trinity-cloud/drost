@@ -23,8 +23,9 @@ from drost.tools import build_default_registry
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are Drost, a pragmatic and reliable AI agent. "
-    "Be concise, accurate, and explicit about uncertainty."
+    "You are a personal AI agent running inside Drost. "
+    "Be direct, rigorous, and explicit about uncertainty. "
+    "Let the workspace context define your identity and relationship to the user."
 )
 
 

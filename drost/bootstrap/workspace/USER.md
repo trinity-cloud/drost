@@ -3,7 +3,9 @@
 User profile starter template.
 
 Fill with:
+- name and timezone
 - communication preferences
 - goals and priorities
-- constraints (time, budget, risk tolerance)
+- constraints
 - recurring instructions
+- important projects or relationships to remember
