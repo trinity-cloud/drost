@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import binascii
 import json
 import os
 import threading
 import uuid
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +32,7 @@ class SessionJSONLStore:
 
     @staticmethod
     def _utc_now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
     @staticmethod
     def _safe_message_id() -> str:
@@ -46,10 +48,8 @@ class SessionJSONLStore:
         return self._session_path(session_key), self._full_path(session_key)
 
     def _enforce_mode(self, path: Path) -> None:
-        try:
+        with suppress(OSError):
             os.chmod(path, SESSION_FILE_MODE)
-        except OSError:
-            pass
 
     def _get_last_seq(self, path: Path) -> int:
         key = str(path)
@@ -108,6 +108,42 @@ class SessionJSONLStore:
             "is_error": bool(tool_result.is_error),
         }
 
+    @staticmethod
+    def _estimate_base64_size(data: str) -> int | None:
+        cleaned = str(data or "").strip()
+        if not cleaned:
+            return 0
+        try:
+            return len(binascii.a2b_base64(cleaned))
+        except Exception:
+            return None
+
+    @classmethod
+    def _serialize_content(cls, content: Any) -> Any:
+        if isinstance(content, list):
+            out: list[Any] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    out.append(item)
+                    continue
+                if str(item.get("type") or "").strip().lower() == "image":
+                    serialized = {
+                        "type": "image",
+                        "mime_type": str(item.get("mime_type") or "image/jpeg"),
+                        "data_omitted": True,
+                    }
+                    size_bytes = cls._estimate_base64_size(str(item.get("data") or ""))
+                    if size_bytes is not None:
+                        serialized["size_bytes"] = int(size_bytes)
+                    path = str(item.get("path") or "").strip()
+                    if path:
+                        serialized["path"] = path
+                    out.append(serialized)
+                    continue
+                out.append(dict(item))
+            return out
+        return content
+
     def _append_message(self, *, path: Path, message: dict[str, Any]) -> None:
         entry = {
             "timestamp": self._utc_now(),
@@ -152,7 +188,7 @@ class SessionJSONLStore:
                     "seq": int(seq),
                 }
                 if msg.content is not None:
-                    payload["content"] = msg.content
+                    payload["content"] = self._serialize_content(msg.content)
                 if msg.tool_calls:
                     payload["tool_calls"] = [self._serialize_tool_call(tc) for tc in msg.tool_calls]
                 if msg.tool_results:
@@ -160,4 +196,3 @@ class SessionJSONLStore:
                 if msg.name:
                     payload["name"] = str(msg.name)
                 self._append_message(path=path, message=payload)
-

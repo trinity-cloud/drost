@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
+import mimetypes
+import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -30,6 +34,8 @@ class TelegramChannel(BaseChannel):
         webhook_path: str,
         webhook_secret: str | None,
         allowed_users: list[int] | None = None,
+        attachments_dir: Path | None = None,
+        max_inline_image_bytes: int = 5 * 1024 * 1024,
     ) -> None:
         self.token = token
         self.store = store
@@ -37,6 +43,8 @@ class TelegramChannel(BaseChannel):
         self.webhook_path = (webhook_path or "/webhook/telegram").strip() or "/webhook/telegram"
         self.webhook_secret = (webhook_secret or "").strip() or None
         self.allowed_users = set(allowed_users or [])
+        self.attachments_dir = Path(attachments_dir).expanduser() if attachments_dir is not None else None
+        self.max_inline_image_bytes = max(256_000, int(max_inline_image_bytes))
 
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
@@ -277,12 +285,152 @@ class TelegramChannel(BaseChannel):
         await message.answer(f"Session reset complete. Deleted {deleted} message(s).", parse_mode=None)
 
     async def _handle_text(self, message: TgMessage) -> None:
+        if not self._is_authorized(message):
+            return
         if not message.text:
             return
+
+        await self._route_context(
+            message,
+            text=message.text,
+            media=None,
+        )
+
+    @staticmethod
+    def _compose_media_text(*, caption: str, attachment_hint: str | None) -> str:
+        cleaned_caption = str(caption or "").strip()
+        cleaned_hint = str(attachment_hint or "").strip()
+        if cleaned_caption and cleaned_hint:
+            return f"{cleaned_caption}\n\n{cleaned_hint}"
+        if cleaned_caption:
+            return cleaned_caption
+        if cleaned_hint:
+            return f"<media:image>\n\n{cleaned_hint}"
+        return "<media:image>\n\nI received an image. What should I do with it?"
+
+    def _attachment_path(self, *, message_id: int, unique_id: str, suffix: str) -> Path | None:
+        if self.attachments_dir is None:
+            return None
+        dest_dir = self.attachments_dir / "telegram"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{int(time.time())}-{message_id}-{unique_id}{suffix}"
+        return dest_dir / filename
+
+    async def _build_photo_payload(self, message: TgMessage) -> tuple[str, list[dict[str, Any]]]:
+        caption = str(message.caption or "").strip()
+        if not message.photo:
+            return caption, []
+        photo = message.photo[-1]
+        for candidate in reversed(message.photo):
+            size = getattr(candidate, "file_size", None)
+            if isinstance(size, int) and size <= self.max_inline_image_bytes:
+                photo = candidate
+                break
+        file = await self.bot.get_file(photo.file_id)
+        suffix = Path(file.file_path or "").suffix or ".jpg"
+        dest = self._attachment_path(
+            message_id=int(message.message_id),
+            unique_id=str(getattr(photo, "file_unique_id", "") or photo.file_id),
+            suffix=suffix,
+        )
+        if dest is None or not file.file_path:
+            return caption, []
+        await self.bot.download_file(file.file_path, destination=dest)
+        data = dest.read_bytes()
+        mime_type, _ = mimetypes.guess_type(str(dest))
+        mime_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
+        attachment_hint = f"[Image attached: {dest}]"
+        if len(data) > self.max_inline_image_bytes:
+            return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), []
+        return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), [
+            {
+                "type": "image",
+                "mime_type": mime_type,
+                "data": base64.b64encode(data).decode("utf-8"),
+                "path": str(dest),
+            }
+        ]
+
+    async def _build_document_payload(self, message: TgMessage) -> tuple[str, list[dict[str, Any]]]:
+        caption = str(message.caption or "").strip()
+        doc = message.document
+        if doc is None:
+            return caption, []
+        mime_type = str(getattr(doc, "mime_type", "") or "").strip()
+        if not mime_type and getattr(doc, "file_name", None):
+            guessed, _ = mimetypes.guess_type(str(doc.file_name))
+            if guessed:
+                mime_type = guessed
+        if not mime_type.startswith("image/"):
+            return "", []
+        file = await self.bot.get_file(doc.file_id)
+        suffix = Path(str(getattr(doc, "file_name", "") or file.file_path or "")).suffix
+        if not suffix:
+            ext = mime_type.split("/", 1)[1].strip().lower()
+            suffix = f".{ext}" if ext else ".bin"
+        dest = self._attachment_path(
+            message_id=int(message.message_id),
+            unique_id=str(getattr(doc, "file_unique_id", "") or doc.file_id),
+            suffix=suffix,
+        )
+        if dest is None or not file.file_path:
+            return caption, []
+        await self.bot.download_file(file.file_path, destination=dest)
+        data = dest.read_bytes()
+        attachment_hint = f"[Image attached: {dest}]"
+        if len(data) > self.max_inline_image_bytes:
+            return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), []
+        return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), [
+            {
+                "type": "image",
+                "mime_type": mime_type or "image/jpeg",
+                "data": base64.b64encode(data).decode("utf-8"),
+                "path": str(dest),
+            }
+        ]
+
+    async def _handle_photo(self, message: TgMessage) -> None:
+        if not self._is_authorized(message):
+            return
+        if self._message_handler is None:
+            await message.answer("No runtime message handler configured.", parse_mode=None)
+            return
+        try:
+            text, media = await self._build_photo_payload(message)
+        except Exception:
+            logger.exception("Failed to process inbound Telegram photo")
+            await message.answer("Failed to process image.", parse_mode=None)
+            return
+        await self._route_context(message, text=text, media=media)
+
+    async def _handle_document(self, message: TgMessage) -> None:
+        if not self._is_authorized(message):
+            return
+        if self._message_handler is None:
+            await message.answer("No runtime message handler configured.", parse_mode=None)
+            return
+        try:
+            text, media = await self._build_document_payload(message)
+        except Exception:
+            logger.exception("Failed to process inbound Telegram document")
+            await message.answer("Failed to process file.", parse_mode=None)
+            return
+        if not media:
+            await message.answer("Only image documents are supported right now.", parse_mode=None)
+            return
+        await self._route_context(message, text=text, media=media)
+
+    async def _route_context(
+        self,
+        message: TgMessage,
+        *,
+        text: str,
+        media: list[dict[str, Any]] | None,
+    ) -> None:
         if not self._is_authorized(message):
             return
 
-        parsed = self._parse_command(message.text)
+        parsed = self._parse_command(text)
         if parsed:
             command, args = parsed
             if command == "new":
@@ -313,10 +461,12 @@ class TelegramChannel(BaseChannel):
             "user_id": int(message.from_user.id if message.from_user else 0),
             "username": message.from_user.username if message.from_user else None,
             "first_name": message.from_user.first_name if message.from_user else None,
-            "text": message.text,
+            "text": text,
             "message_id": int(message.message_id),
             "session_id": session_id,
         }
+        if media:
+            context["media"] = media
 
         working = await self.bot.send_message(
             chat_id,
@@ -362,6 +512,8 @@ class TelegramChannel(BaseChannel):
         self.router.message.register(self._handle_start, Command("start"))
         self.router.message.register(self._handle_help, Command("help"))
         self.router.message.register(self._handle_commands, Command("commands"))
+        self.router.message.register(self._handle_document, F.document)
+        self.router.message.register(self._handle_photo, F.photo)
         self.router.message.register(self._handle_text, F.text)
 
     async def _handle_webhook(self, request: Request) -> Response:

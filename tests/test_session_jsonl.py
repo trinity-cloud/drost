@@ -61,3 +61,30 @@ def test_session_jsonl_writes_both_files(tmp_path: Path) -> None:
     assert full_rows[2]["message"]["tool_results"][0]["tool_call_id"] == "call1"
     assert full_rows[3]["message"]["content"] == "final answer"
 
+
+def test_session_jsonl_sanitizes_inline_image_content(tmp_path: Path) -> None:
+    store = SessionJSONLStore(store_path=tmp_path)
+    session_key = "main:telegram:123__s_2026-03-04_10-00-01"
+
+    store.append_full_messages(
+        session_key=session_key,
+        messages=[
+            Message(
+                role=MessageRole.USER,
+                content=[
+                    {"type": "text", "text": "Look at this"},
+                    {"type": "image", "mime_type": "image/png", "data": "YWJj", "path": "/tmp/image.png"},
+                ],
+            )
+        ],
+    )
+
+    _, full_path = store.paths_for_session(session_key)
+    rows = _read_jsonl(full_path)
+    content = rows[0]["message"]["content"]
+    assert content[0] == {"type": "text", "text": "Look at this"}
+    assert content[1]["type"] == "image"
+    assert content[1]["mime_type"] == "image/png"
+    assert content[1]["data_omitted"] is True
+    assert content[1]["size_bytes"] == 3
+    assert content[1]["path"] == "/tmp/image.png"

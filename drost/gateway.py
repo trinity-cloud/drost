@@ -22,7 +22,8 @@ class ProviderSelectRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     chat_id: int
-    text: str
+    text: str = ""
+    media: list[dict[str, Any]] | None = None
     session_id: str | None = None
 
 
@@ -54,6 +55,8 @@ class Gateway:
             webhook_path=settings.telegram_webhook_path,
             webhook_secret=settings.telegram_webhook_secret or None,
             allowed_users=settings.telegram_allowed_user_ids,
+            attachments_dir=settings.attachments_dir,
+            max_inline_image_bytes=settings.vision_max_inline_image_bytes,
         )
         self.telegram.set_message_handler(self._handle_telegram_message)
 
@@ -73,6 +76,7 @@ class Gateway:
             chat_id=chat_id,
             text=text,
             session_id=(str(session_id).strip() if session_id is not None else None),
+            media=context.get("media") if isinstance(context.get("media"), list) else None,
             status_callback=status_callback if callable(status_callback) else None,
         )
 
@@ -153,6 +157,7 @@ class Gateway:
             response = await self.agent.respond(
                 chat_id=int(payload.chat_id),
                 text=str(payload.text or ""),
+                media=payload.media,
                 session_id=payload.session_id,
             )
             return {"reply": response, "provider": self.agent.active_provider}

@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from datetime import datetime, timedelta, timezone
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, cast
+from typing import Any, cast
 
 from openai import AsyncOpenAI, AsyncStream, AuthenticationError
 from openai.types.responses import ResponseStreamEvent
@@ -75,11 +76,9 @@ class OpenAICompatibleProvider(BaseProvider):
         if project:
             client_kwargs["project"] = project
 
-        api_key: str | Callable[[], Awaitable[str]] | None
-        if self._static_token is not None:
-            api_key = self._static_token
-        else:
-            api_key = self._codex_access_token
+        api_key: str | Callable[[], Awaitable[str]] | None = (
+            self._static_token if self._static_token is not None else self._codex_access_token
+        )
 
         self._client = AsyncOpenAI(api_key=api_key, **client_kwargs)
 
@@ -94,7 +93,7 @@ class OpenAICompatibleProvider(BaseProvider):
     async def _codex_access_token(self) -> str:
         async with self._oauth_lock:
             tokens = load_codex_tokens(self._codex_auth_path)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             needs_refresh = tokens.expires_at is None or tokens.expires_at <= (now + DEFAULT_REFRESH_WINDOW)
             if needs_refresh:
                 refreshed = await refresh_codex_tokens(
@@ -132,6 +131,17 @@ class OpenAICompatibleProvider(BaseProvider):
                         ptype = part.get("type")
                         if ptype == "text":
                             content.append({"type": "input_text", "text": str(part.get("text") or "")})
+                        elif ptype == "image":
+                            data = str(part.get("data") or "").strip()
+                            mime_type = str(part.get("mime_type") or "image/jpeg").strip()
+                            if data:
+                                content.append(
+                                    {
+                                        "type": "input_image",
+                                        "detail": "auto",
+                                        "image_url": f"data:{mime_type};base64,{data}",
+                                    }
+                                )
                         else:
                             content.append({"type": "input_text", "text": str(part)})
                     out.append({"type": "message", "role": "user", "content": content})
@@ -177,9 +187,8 @@ class OpenAICompatibleProvider(BaseProvider):
             if isinstance(schema_type, str):
                 if schema_type != "null":
                     schema["type"] = [schema_type, "null"]
-            elif isinstance(schema_type, list):
-                if "null" not in schema_type:
-                    schema["type"] = [*schema_type, "null"]
+            elif isinstance(schema_type, list) and "null" not in schema_type:
+                schema["type"] = [*schema_type, "null"]
             return schema
 
         def _normalize_strict_schema(schema: Any) -> Any:
@@ -543,4 +552,3 @@ class OpenAICompatibleProvider(BaseProvider):
 
     async def close(self) -> None:
         await self._client.close()
-

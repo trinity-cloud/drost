@@ -82,8 +82,10 @@ class Settings(BaseSettings):
     history_compaction_summary_max_tokens: int = 1_500
 
     workspace_dir: Path = Field(default_factory=lambda: Path("~/.drost").expanduser())
+    attachments_dir: Path = Field(default_factory=lambda: Path("~/.drost/attachments").expanduser())
     trace_enabled: bool = True
     trace_dir: Path = Field(default_factory=lambda: Path("~/.drost/traces").expanduser())
+    vision_max_inline_image_bytes: int = 5 * 1024 * 1024
     prompt_workspace_files: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
     )
@@ -214,6 +216,7 @@ class Settings(BaseSettings):
         self.sqlite_path = Path(self.sqlite_path).expanduser()
         self.openai_codex_auth_path = Path(self.openai_codex_auth_path).expanduser()
         self.workspace_dir = Path(self.workspace_dir).expanduser()
+        self.attachments_dir = Path(self.attachments_dir).expanduser()
         self.trace_dir = Path(self.trace_dir).expanduser()
 
         self.log_level = (self.log_level or "INFO").upper()

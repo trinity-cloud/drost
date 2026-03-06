@@ -17,7 +17,7 @@ class FakeOpenAIStream:
         self._index = 0
         self.closed = False
 
-    def __aiter__(self) -> "FakeOpenAIStream":
+    def __aiter__(self) -> FakeOpenAIStream:
         return self
 
     async def __anext__(self) -> Any:
@@ -53,7 +53,7 @@ class FakeAnthropicStream:
         self._events = events
         self._index = 0
 
-    def __aiter__(self) -> "FakeAnthropicStream":
+    def __aiter__(self) -> FakeAnthropicStream:
         return self
 
     async def __anext__(self) -> Any:
@@ -172,6 +172,62 @@ def test_openai_tool_schema_strict_normalization() -> None:
     assert "null" in params["properties"]["optional_field"]["type"]
 
 
+def test_openai_multimodal_message_conversion() -> None:
+    provider = OpenAICompatibleProvider(
+        provider_name="xai",
+        model="grok-3-latest",
+        token="test-token",
+        base_url="https://api.x.ai/v1",
+    )
+    converted = provider._convert_messages_to_input(
+        [
+            Message(
+                role=MessageRole.USER,
+                content=[
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image", "mime_type": "image/png", "data": "YWJj", "path": "/tmp/img.png"},
+                ],
+            )
+        ]
+    )
+    assert converted == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "What is in this image?"},
+                {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,YWJj"},
+            ],
+        }
+    ]
+
+
+def test_anthropic_multimodal_message_conversion() -> None:
+    converted = anthropic_module._convert_messages(
+        [
+            Message(
+                role=MessageRole.USER,
+                content=[
+                    {"type": "text", "text": "Describe this image"},
+                    {"type": "image", "mime_type": "image/jpeg", "data": "YWJj"},
+                ],
+            )
+        ]
+    )
+    assert converted == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": "YWJj"},
+                },
+            ],
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_anthropic_stream_parses_tool_use_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = AnthropicProvider(model="claude-sonnet-4-20250514", token="sk-ant-test")
@@ -267,4 +323,3 @@ def test_anthropic_message_conversion_includes_tool_blocks() -> None:
     assert converted[0]["content"][1]["type"] == "tool_use"
     assert converted[1]["role"] == "user"
     assert converted[1]["content"][0]["type"] == "tool_result"
-

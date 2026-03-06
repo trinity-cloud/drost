@@ -48,6 +48,20 @@ def _convert_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 for part in msg.content:
                     if isinstance(part, dict) and part.get("type") == "text":
                         blocks.append({"type": "text", "text": str(part.get("text") or "")})
+                    elif isinstance(part, dict) and part.get("type") == "image":
+                        data = str(part.get("data") or "").strip()
+                        mime_type = str(part.get("mime_type") or "image/jpeg").strip()
+                        if data:
+                            blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": mime_type,
+                                        "data": data,
+                                    },
+                                }
+                            )
                     else:
                         blocks.append({"type": "text", "text": str(part)})
                 out.append({"role": "user", "content": blocks})

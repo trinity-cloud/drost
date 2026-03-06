@@ -156,6 +156,7 @@ class AgentRuntime:
         chat_id: int,
         text: str,
         session_id: str | None,
+        media: list[dict[str, Any]] | None = None,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         requested_sid = (session_id or "").strip()
@@ -181,8 +182,51 @@ class AgentRuntime:
                 chat_id=chat_id,
                 session_key=session_key,
                 text=text,
+                media=media,
                 status_callback=status_callback,
             )
+
+    @staticmethod
+    def _normalize_media(media: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        if not media:
+            return []
+        out: list[dict[str, Any]] = []
+        for item in media:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip().lower() != "image":
+                continue
+            data = str(item.get("data") or "").strip()
+            if not data:
+                continue
+            normalized = {
+                "type": "image",
+                "mime_type": str(item.get("mime_type") or "image/jpeg").strip() or "image/jpeg",
+                "data": data,
+            }
+            path = str(item.get("path") or "").strip()
+            if path:
+                normalized["path"] = path
+            out.append(normalized)
+        return out
+
+    @staticmethod
+    def _build_user_message_content(query_text: str, media: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        if not media:
+            return query_text
+        text = query_text.strip() or "<media:image>\n\nI received an image. What should I do with it?"
+        parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for item in media:
+            part = {
+                "type": "image",
+                "mime_type": str(item.get("mime_type") or "image/jpeg"),
+                "data": str(item.get("data") or ""),
+            }
+            path = str(item.get("path") or "").strip()
+            if path:
+                part["path"] = path
+            parts.append(part)
+        return parts
 
     async def _respond_locked(
         self,
@@ -190,18 +234,22 @@ class AgentRuntime:
         chat_id: int,
         session_key: str,
         text: str,
+        media: list[dict[str, Any]] | None = None,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         started = time.monotonic()
+        normalized_media = self._normalize_media(media)
         query_text = (text or "").strip()
-        if not query_text:
+        if not query_text and normalized_media:
+            query_text = "<media:image>\n\nI received an image. What should I do with it?"
+        if not query_text and not normalized_media:
             return "Please send a message."
 
         provider = self._providers.get()
 
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []
-        if self._settings.memory_enabled:
+        if self._settings.memory_enabled and query_text:
             query_embedding = await self._embeddings.embed_one(query_text)
             memories = self._store.search_memory(
                 query_text=query_text,
@@ -227,7 +275,12 @@ class AgentRuntime:
                 )
             )
         turn_start_index = len(provider_messages)
-        provider_messages.append(Message(role=MessageRole.USER, content=query_text))
+        provider_messages.append(
+            Message(
+                role=MessageRole.USER,
+                content=self._build_user_message_content(query_text, normalized_media),
+            )
+        )
 
         tool_registry = build_default_registry(
             settings=self._settings,
