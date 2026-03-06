@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 
 from drost.channels.telegram import TelegramChannel
+from drost.gateway import Gateway
 
 
 class _DummyStore:
@@ -113,3 +115,71 @@ async def test_finalize_falls_back_to_plain_text_on_html_error(monkeypatch: pyte
     assert bot.edited[0]["parse_mode"] == "HTML"
     assert bot.edited[1]["parse_mode"] is None
     assert bot.edited[1]["text"] == "Hello **world**"
+
+
+@pytest.mark.asyncio
+async def test_media_group_bundles_into_single_routed_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = _FakeBot(token="test-token")
+    channel = _build_channel(monkeypatch, bot)
+    channel.MEDIA_GROUP_DEBOUNCE_SECONDS = 0.01
+
+    routed: list[dict[str, object]] = []
+
+    async def _fake_route(message: object, *, text: str, media: list[dict[str, object]] | None) -> None:
+        routed.append({"message": message, "text": text, "media": media})
+
+    monkeypatch.setattr(channel, "_route_context", _fake_route)
+
+    message1 = SimpleNamespace(chat=SimpleNamespace(id=123), media_group_id="grp1", message_id=10)
+    message2 = SimpleNamespace(chat=SimpleNamespace(id=123), media_group_id="grp1", message_id=11)
+
+    queued1 = await channel._enqueue_media_group_message(
+        message1,
+        caption="Album caption",
+        attachment_hint="[Image attached: /tmp/one.jpg]",
+        media=[{"type": "image", "mime_type": "image/jpeg", "data": "aaa", "path": "/tmp/one.jpg"}],
+    )
+    queued2 = await channel._enqueue_media_group_message(
+        message2,
+        caption="",
+        attachment_hint="[Image attached: /tmp/two.jpg]",
+        media=[{"type": "image", "mime_type": "image/jpeg", "data": "bbb", "path": "/tmp/two.jpg"}],
+    )
+
+    assert queued1 is True
+    assert queued2 is True
+
+    await asyncio.sleep(0.05)
+
+    assert len(routed) == 1
+    assert routed[0]["text"] == "Album caption\n\n[Image attached: /tmp/one.jpg]\n[Image attached: /tmp/two.jpg]"
+    media = routed[0]["media"]
+    assert isinstance(media, list)
+    assert len(media) == 2
+
+
+class _FakeAgent:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def respond(self, **kwargs: object) -> str:
+        self.calls.append(dict(kwargs))
+        return "ok"
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_media_only_telegram_turn() -> None:
+    gateway = Gateway.__new__(Gateway)
+    gateway.agent = _FakeAgent()
+
+    context = {
+        "chat_id": 123,
+        "text": "",
+        "media": [{"type": "image", "mime_type": "image/jpeg", "data": "aaa"}],
+        "session_id": None,
+    }
+    reply = await Gateway._handle_telegram_message(gateway, context)
+
+    assert reply == "ok"
+    assert len(gateway.agent.calls) == 1
+    assert gateway.agent.calls[0]["media"] == context["media"]

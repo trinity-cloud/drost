@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,18 @@ from drost.storage import SQLiteStore, session_key_for_telegram_chat
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class PendingMediaGroup:
+    anchor_message: TgMessage
+    caption: str = ""
+    attachment_hints: list[str] = field(default_factory=list)
+    media: list[dict[str, Any]] = field(default_factory=list)
+    flush_task: asyncio.Task[None] | None = None
+
+
 class TelegramChannel(BaseChannel):
+    MEDIA_GROUP_DEBOUNCE_SECONDS = 0.8
+
     def __init__(
         self,
         *,
@@ -54,6 +66,8 @@ class TelegramChannel(BaseChannel):
         self._message_handler: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None
         self._polling_task: asyncio.Task[None] | None = None
         self._polling_active = False
+        self._pending_media_groups: dict[tuple[int, str], PendingMediaGroup] = {}
+        self._media_groups_lock = asyncio.Lock()
 
         self._setup_handlers()
 
@@ -297,15 +311,15 @@ class TelegramChannel(BaseChannel):
         )
 
     @staticmethod
-    def _compose_media_text(*, caption: str, attachment_hint: str | None) -> str:
+    def _compose_media_text(*, caption: str, attachment_hints: list[str]) -> str:
         cleaned_caption = str(caption or "").strip()
-        cleaned_hint = str(attachment_hint or "").strip()
-        if cleaned_caption and cleaned_hint:
-            return f"{cleaned_caption}\n\n{cleaned_hint}"
+        hints = list(dict.fromkeys([str(h or "").strip() for h in attachment_hints if str(h or "").strip()]))
+        if cleaned_caption and hints:
+            return f"{cleaned_caption}\n\n" + "\n".join(hints)
         if cleaned_caption:
             return cleaned_caption
-        if cleaned_hint:
-            return f"<media:image>\n\n{cleaned_hint}"
+        if hints:
+            return "<media:image>\n\n" + "\n".join(hints)
         return "<media:image>\n\nI received an image. What should I do with it?"
 
     def _attachment_path(self, *, message_id: int, unique_id: str, suffix: str) -> Path | None:
@@ -316,10 +330,10 @@ class TelegramChannel(BaseChannel):
         filename = f"{int(time.time())}-{message_id}-{unique_id}{suffix}"
         return dest_dir / filename
 
-    async def _build_photo_payload(self, message: TgMessage) -> tuple[str, list[dict[str, Any]]]:
+    async def _build_photo_payload(self, message: TgMessage) -> tuple[str, str, list[dict[str, Any]]]:
         caption = str(message.caption or "").strip()
         if not message.photo:
-            return caption, []
+            return caption, "", []
         photo = message.photo[-1]
         for candidate in reversed(message.photo):
             size = getattr(candidate, "file_size", None)
@@ -334,15 +348,15 @@ class TelegramChannel(BaseChannel):
             suffix=suffix,
         )
         if dest is None or not file.file_path:
-            return caption, []
+            return caption, "", []
         await self.bot.download_file(file.file_path, destination=dest)
         data = dest.read_bytes()
         mime_type, _ = mimetypes.guess_type(str(dest))
         mime_type = mime_type if mime_type and mime_type.startswith("image/") else "image/jpeg"
         attachment_hint = f"[Image attached: {dest}]"
         if len(data) > self.max_inline_image_bytes:
-            return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), []
-        return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), [
+            return caption, attachment_hint, []
+        return caption, attachment_hint, [
             {
                 "type": "image",
                 "mime_type": mime_type,
@@ -351,18 +365,18 @@ class TelegramChannel(BaseChannel):
             }
         ]
 
-    async def _build_document_payload(self, message: TgMessage) -> tuple[str, list[dict[str, Any]]]:
+    async def _build_document_payload(self, message: TgMessage) -> tuple[str, str, list[dict[str, Any]]]:
         caption = str(message.caption or "").strip()
         doc = message.document
         if doc is None:
-            return caption, []
+            return caption, "", []
         mime_type = str(getattr(doc, "mime_type", "") or "").strip()
         if not mime_type and getattr(doc, "file_name", None):
             guessed, _ = mimetypes.guess_type(str(doc.file_name))
             if guessed:
                 mime_type = guessed
         if not mime_type.startswith("image/"):
-            return "", []
+            return "", "", []
         file = await self.bot.get_file(doc.file_id)
         suffix = Path(str(getattr(doc, "file_name", "") or file.file_path or "")).suffix
         if not suffix:
@@ -374,13 +388,13 @@ class TelegramChannel(BaseChannel):
             suffix=suffix,
         )
         if dest is None or not file.file_path:
-            return caption, []
+            return caption, "", []
         await self.bot.download_file(file.file_path, destination=dest)
         data = dest.read_bytes()
         attachment_hint = f"[Image attached: {dest}]"
         if len(data) > self.max_inline_image_bytes:
-            return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), []
-        return self._compose_media_text(caption=caption, attachment_hint=attachment_hint), [
+            return caption, attachment_hint, []
+        return caption, attachment_hint, [
             {
                 "type": "image",
                 "mime_type": mime_type or "image/jpeg",
@@ -389,6 +403,76 @@ class TelegramChannel(BaseChannel):
             }
         ]
 
+    async def _enqueue_media_group_message(
+        self,
+        message: TgMessage,
+        *,
+        caption: str,
+        attachment_hint: str,
+        media: list[dict[str, Any]],
+    ) -> bool:
+        media_group_id = str(getattr(message, "media_group_id", "") or "").strip()
+        if not media_group_id:
+            return False
+        key = (int(message.chat.id), media_group_id)
+        async with self._media_groups_lock:
+            pending = self._pending_media_groups.get(key)
+            if pending is None:
+                pending = PendingMediaGroup(
+                    anchor_message=message,
+                    caption=caption,
+                    attachment_hints=[attachment_hint] if attachment_hint else [],
+                    media=list(media),
+                )
+                self._pending_media_groups[key] = pending
+            else:
+                if caption and not pending.caption:
+                    pending.caption = caption
+                if attachment_hint:
+                    pending.attachment_hints.append(attachment_hint)
+                if media:
+                    pending.media.extend(media)
+                if pending.flush_task is not None:
+                    pending.flush_task.cancel()
+            pending.flush_task = asyncio.create_task(self._flush_media_group_after_delay(key))
+        return True
+
+    async def _flush_media_group_after_delay(self, key: tuple[int, str]) -> None:
+        try:
+            if self.MEDIA_GROUP_DEBOUNCE_SECONDS > 0:
+                await asyncio.sleep(self.MEDIA_GROUP_DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+        async with self._media_groups_lock:
+            pending = self._pending_media_groups.pop(key, None)
+        if pending is None:
+            return
+        text = self._compose_media_text(
+            caption=pending.caption,
+            attachment_hints=pending.attachment_hints,
+        )
+        try:
+            await self._route_context(
+                pending.anchor_message,
+                text=text,
+                media=pending.media,
+            )
+        except Exception:
+            logger.exception("Failed to route Telegram media group")
+
+    async def _cancel_pending_media_groups(self) -> None:
+        async with self._media_groups_lock:
+            pending = list(self._pending_media_groups.values())
+            self._pending_media_groups.clear()
+        for entry in pending:
+            if entry.flush_task is not None:
+                entry.flush_task.cancel()
+        for entry in pending:
+            if entry.flush_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await entry.flush_task
+
     async def _handle_photo(self, message: TgMessage) -> None:
         if not self._is_authorized(message):
             return
@@ -396,11 +480,23 @@ class TelegramChannel(BaseChannel):
             await message.answer("No runtime message handler configured.", parse_mode=None)
             return
         try:
-            text, media = await self._build_photo_payload(message)
+            caption, attachment_hint, media = await self._build_photo_payload(message)
         except Exception:
             logger.exception("Failed to process inbound Telegram photo")
             await message.answer("Failed to process image.", parse_mode=None)
             return
+        queued = await self._enqueue_media_group_message(
+            message,
+            caption=caption,
+            attachment_hint=attachment_hint,
+            media=media,
+        )
+        if queued:
+            return
+        text = self._compose_media_text(
+            caption=caption,
+            attachment_hints=[attachment_hint] if attachment_hint else [],
+        )
         await self._route_context(message, text=text, media=media)
 
     async def _handle_document(self, message: TgMessage) -> None:
@@ -410,7 +506,7 @@ class TelegramChannel(BaseChannel):
             await message.answer("No runtime message handler configured.", parse_mode=None)
             return
         try:
-            text, media = await self._build_document_payload(message)
+            caption, attachment_hint, media = await self._build_document_payload(message)
         except Exception:
             logger.exception("Failed to process inbound Telegram document")
             await message.answer("Failed to process file.", parse_mode=None)
@@ -418,6 +514,18 @@ class TelegramChannel(BaseChannel):
         if not media:
             await message.answer("Only image documents are supported right now.", parse_mode=None)
             return
+        queued = await self._enqueue_media_group_message(
+            message,
+            caption=caption,
+            attachment_hint=attachment_hint,
+            media=media,
+        )
+        if queued:
+            return
+        text = self._compose_media_text(
+            caption=caption,
+            attachment_hints=[attachment_hint] if attachment_hint else [],
+        )
         await self._route_context(message, text=text, media=media)
 
     async def _route_context(
@@ -430,7 +538,7 @@ class TelegramChannel(BaseChannel):
         if not self._is_authorized(message):
             return
 
-        parsed = self._parse_command(text)
+        parsed = self._parse_command(text) if not media else None
         if parsed:
             command, args = parsed
             if command == "new":
@@ -557,6 +665,7 @@ class TelegramChannel(BaseChannel):
 
     async def stop(self) -> None:
         try:
+            await self._cancel_pending_media_groups()
             if self.webhook_url:
                 await self.bot.delete_webhook(drop_pending_updates=False)
             if self._polling_active:

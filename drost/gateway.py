@@ -66,7 +66,8 @@ class Gateway:
 
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()
-        if not text:
+        media = context.get("media") if isinstance(context.get("media"), list) else None
+        if not text and not media:
             return None
 
         chat_id = int(context.get("chat_id") or 0)
@@ -76,7 +77,7 @@ class Gateway:
             chat_id=chat_id,
             text=text,
             session_id=(str(session_id).strip() if session_id is not None else None),
-            media=context.get("media") if isinstance(context.get("media"), list) else None,
+            media=media,
             status_callback=status_callback if callable(status_callback) else None,
         )
 
