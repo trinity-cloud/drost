@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Annotated
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from drost.workspace_bootstrap import seed_workspace_files
 
 ProviderName = Literal["openai-codex", "anthropic", "xai"]
 
@@ -200,7 +201,7 @@ class Settings(BaseSettings):
         return ratio
 
     @model_validator(mode="after")
-    def apply_provider_env_fallbacks(self) -> "Settings":
+    def apply_provider_env_fallbacks(self) -> Settings:
         if not self.openai_api_key:
             self.openai_api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
         if not self.anthropic_token:
@@ -228,6 +229,10 @@ class Settings(BaseSettings):
             self.prompt_workspace_files = ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
 
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        seed_workspace_files(
+            workspace_dir=self.workspace_dir,
+            prompt_workspace_files=self.prompt_workspace_files,
+        )
         if self.trace_enabled:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
 

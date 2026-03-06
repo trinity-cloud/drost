@@ -102,6 +102,21 @@ Vector mode:
   - `DROST_SQVECTOR_EXTENSION_PATH`
 - Falls back to brute-force cosine search if extension is unavailable
 
+## Workspace Bootstrap
+
+On startup, Drost ensures `~/.drost` exists (or `DROST_WORKSPACE_DIR` when set).
+
+It seeds missing workspace prompt files from in-repo templates on first boot:
+- `SOUL.md`
+- `IDENTITY.md`
+- `USER.md`
+- `MEMORY.md`
+
+Seed templates are maintained in:
+- `drost/bootstrap/workspace/`
+
+Existing files are never overwritten.
+
 ## Traces
 
 When `DROST_TRACE_ENABLED=true` (default), run and tool traces are appended to:

@@ -49,6 +49,7 @@ drost-gateway = "drost.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["drost"]
+include = ["drost/bootstrap/workspace/*.md"]
 
 [tool.ruff]
 target-version = "py311"
