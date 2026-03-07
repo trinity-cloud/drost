@@ -17,7 +17,12 @@ from drost.context_budget import (
 from drost.embeddings import EmbeddingService
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
-from drost.storage import SessionJSONLStore, SQLiteStore, session_key_for_telegram_chat
+from drost.storage import (
+    SessionJSONLStore,
+    SQLiteStore,
+    WorkspaceMemoryIndexer,
+    session_key_for_telegram_chat,
+)
 from drost.tools import build_default_registry
 
 logger = logging.getLogger(__name__)
@@ -45,6 +50,11 @@ class AgentRuntime:
         self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._prompt_assembler = PromptAssembler(settings)
         self._session_jsonl = SessionJSONLStore(store_path=settings.workspace_dir / "sessions")
+        self._workspace_memory_indexer = WorkspaceMemoryIndexer(
+            workspace_dir=settings.workspace_dir,
+            store=store,
+            embeddings=embeddings,
+        )
         self._last_run: dict[str, Any] | None = None
 
     @property
@@ -61,6 +71,9 @@ class AgentRuntime:
         if self._last_run is None:
             return None
         return dict(self._last_run)
+
+    async def sync_memory_index(self) -> dict[str, int]:
+        return await self._workspace_memory_indexer.sync()
 
     @staticmethod
     def _message_role(value: str) -> MessageRole:
@@ -79,11 +92,16 @@ class AgentRuntime:
 
         lines = ["Relevant long-term memory excerpts:"]
         for item in memories:
-            role = str(item.get("role") or "")
+            label = (
+                str(item.get("title") or "").strip()
+                or str(item.get("path") or "").strip()
+                or str(item.get("session_key") or "").strip()
+                or str(item.get("role") or "").strip()
+            )
             snippet = str(item.get("snippet") or item.get("content") or "").strip()
             if not snippet:
                 continue
-            lines.append(f"- ({role}) {snippet}")
+            lines.append(f"- ({label}) {snippet}")
 
         if len(lines) == 1:
             return ""
@@ -250,7 +268,8 @@ class AgentRuntime:
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []
         if self._settings.memory_enabled and query_text:
-            query_embedding = await self._embeddings.embed_one(query_text)
+            await self._workspace_memory_indexer.sync()
+            query_embedding = await self._embeddings.embed_query(query_text)
             memories = self._store.search_memory(
                 query_text=query_text,
                 query_embedding=query_embedding,
@@ -286,6 +305,7 @@ class AgentRuntime:
             settings=self._settings,
             store=self._store,
             embeddings=self._embeddings,
+            workspace_memory_indexer=self._workspace_memory_indexer,
             current_chat_id=lambda: chat_id,
             current_session_key=lambda: session_key,
         )
@@ -382,13 +402,14 @@ class AgentRuntime:
 
         # Persist long-term memory.
         if self._settings.memory_enabled:
+            user_embedding = await self._embeddings.embed_document(query_text)
             self._store.add_memory(
                 session_key=session_key,
                 role="user",
                 content=query_text,
-                embedding=query_embedding,
+                embedding=user_embedding,
             )
-            assistant_embedding = await self._embeddings.embed_one(assistant_text)
+            assistant_embedding = await self._embeddings.embed_document(assistant_text)
             self._store.add_memory(
                 session_key=session_key,
                 role="assistant",

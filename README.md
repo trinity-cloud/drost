@@ -96,11 +96,35 @@ If webhook URL is not set, Drost runs Telegram polling.
 Memory is persisted in:
 - `DROST_SQLITE_PATH` (default `~/.drost/drost.sqlite3`)
 
+Embeddings default to Google Gemini:
+- `GEMINI_API_KEY`
+- `DROST_MEMORY_EMBEDDING_PROVIDER=gemini`
+- `DROST_MEMORY_EMBEDDING_MODEL=gemini-embedding-001`
+- `DROST_MEMORY_EMBEDDING_DIMENSIONS=3072`
+
+Background transcript-to-memory extraction defaults to:
+- `DROST_MEMORY_MAINTENANCE_ENABLED=true`
+- `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
+- `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
+
 Vector mode:
 - Attempts to load `sqlite-vec` automatically
 - Optional explicit extension path:
   - `DROST_SQVECTOR_EXTENSION_PATH`
 - Falls back to brute-force cosine search if extension is unavailable
+
+When embedding dimensions change, Drost rebuilds the derived vector lane automatically.
+Incompatible old embedding blobs are cleared so keyword search stays valid and new turns repopulate semantic memory with the new dimension.
+
+Memory maintenance:
+- runs once shortly after startup
+- then runs in the background on the configured interval
+- reads session JSONL transcripts incrementally from `~/.drost/sessions`
+- writes durable memory into:
+  - `~/.drost/memory/daily/*.md`
+  - `~/.drost/memory/entities/*/*/items.md`
+- stores cursor state in:
+  - `~/.drost/state/memory-maintenance.json`
 
 ## Workspace Bootstrap
 
@@ -147,6 +171,8 @@ session id (`s_YYYY-MM-DD_HH-MM-SS`), so transcript filenames include datetime b
 - `POST /v1/providers/select`
 - `GET /v1/sessions/{chat_id}`
 - `GET /v1/memory/status`
+- `GET /v1/memory/maintenance/status`
+- `POST /v1/memory/maintenance/run-once`
 - `GET /v1/memory/search?query=...&limit=...`
 - `GET /v1/runs/last`
 - `POST /v1/chat`

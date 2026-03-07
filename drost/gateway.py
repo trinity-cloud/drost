@@ -10,6 +10,7 @@ from drost.agent import AgentRuntime
 from drost.channels import TelegramChannel
 from drost.config import Settings
 from drost.embeddings import EmbeddingService
+from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
 from drost.storage import SQLiteStore
 
@@ -43,6 +44,15 @@ class Gateway:
             providers=self.providers,
             store=self.store,
             embeddings=self.embeddings,
+        )
+        self.memory_maintenance = MemoryMaintenanceRunner(
+            workspace_dir=settings.workspace_dir,
+            sessions_dir=settings.workspace_dir / "sessions",
+            provider_getter=self.providers.get,
+            sync_memory_index=self.agent.sync_memory_index,
+            enabled=settings.memory_enabled and settings.memory_maintenance_enabled,
+            interval_seconds=settings.memory_maintenance_interval_seconds,
+            max_events_per_run=settings.memory_maintenance_max_events_per_run,
         )
 
         if not settings.telegram_bot_token:
@@ -84,6 +94,9 @@ class Gateway:
     def _mount_lifecycle(self) -> None:
         @self.app.on_event("startup")
         async def startup() -> None:
+            if self.settings.memory_enabled:
+                await self.agent.sync_memory_index()
+            await self.memory_maintenance.start()
             await self.telegram.start(self.app)
             logger.info(
                 "Drost gateway started (provider=%s db=%s)",
@@ -94,6 +107,7 @@ class Gateway:
         @self.app.on_event("shutdown")
         async def shutdown() -> None:
             await self.telegram.stop()
+            await self.memory_maintenance.stop()
             await self.agent.close()
             self.store.close()
             logger.info("Drost gateway stopped")
@@ -131,12 +145,22 @@ class Gateway:
         async def memory_status() -> dict[str, Any]:
             return self.store.memory_status()
 
+        @self.app.get("/v1/memory/maintenance/status")
+        async def memory_maintenance_status() -> dict[str, Any]:
+            return self.memory_maintenance.status()
+
+        @self.app.post("/v1/memory/maintenance/run-once")
+        async def memory_maintenance_run_once() -> dict[str, Any]:
+            result = await self.memory_maintenance.run_once(reason="manual")
+            return {"ok": True, "result": result}
+
         @self.app.get("/v1/memory/search")
         async def memory_search(query: str, limit: int = 6) -> dict[str, Any]:
             trimmed = (query or "").strip()
             if not trimmed:
                 raise HTTPException(status_code=400, detail="query is required")
-            embedding = await self.embeddings.embed_one(trimmed)
+            await self.agent.sync_memory_index()
+            embedding = await self.embeddings.embed_query(trimmed)
             rows = self.store.search_memory(
                 query_text=trimmed,
                 query_embedding=embedding,

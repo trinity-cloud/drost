@@ -12,3 +12,13 @@ def test_exa_api_key_alias_from_env_file(tmp_path: Path) -> None:
     settings = Settings(_env_file=str(env_file), workspace_dir=tmp_path)
     assert settings.exa_api_key == "test-exa-key"
 
+
+def test_gemini_api_key_alias_from_env_file(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_API_KEY=test-gemini-key\n", encoding="utf-8")
+
+    settings = Settings(_env_file=str(env_file), workspace_dir=tmp_path)
+    assert settings.gemini_api_key == "test-gemini-key"
+    assert settings.memory_embedding_provider == "gemini"
+    assert settings.memory_embedding_model == "gemini-embedding-001"
+    assert settings.memory_embedding_dimensions == 3072

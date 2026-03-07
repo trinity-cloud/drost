@@ -26,6 +26,7 @@ def test_workspace_bootstrap_seeds_default_prompt_files(tmp_path: Path) -> None:
 
     assert (workspace / "memory" / "daily").exists()
     assert (workspace / "memory" / "entities").exists()
+    assert (workspace / "state").exists()
 
 
 def test_workspace_bootstrap_does_not_overwrite_existing_files(tmp_path: Path) -> None:

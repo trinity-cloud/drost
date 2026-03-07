@@ -1,0 +1,495 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from drost.memory_files import MemoryFiles
+from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_INITIAL_TAIL_LINES = 200
+DEFAULT_TOOL_RESULT_CHAR_LIMIT = 4_000
+DEFAULT_ENTITY_TYPES = (
+    "people",
+    "projects",
+    "organizations",
+    "places",
+    "devices",
+    "accounts",
+    "preferences",
+    "routines",
+    "goals",
+    "artifacts",
+)
+
+_JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?|\n?```$", re.MULTILINE)
+
+
+@dataclass(slots=True)
+class PendingEvent:
+    file_name: str
+    line: int
+    payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class PendingBatch:
+    events: list[PendingEvent]
+    scan_end: dict[str, int]
+    total_entries: dict[str, int]
+
+
+class MemoryMaintenanceRunner:
+    def __init__(
+        self,
+        *,
+        workspace_dir: str | Path,
+        sessions_dir: str | Path,
+        provider_getter: Callable[[], BaseProvider],
+        sync_memory_index: Callable[[], Awaitable[dict[str, int]]],
+        enabled: bool,
+        interval_seconds: int = 1800,
+        max_events_per_run: int = 200,
+    ) -> None:
+        self._workspace_dir = Path(workspace_dir).expanduser()
+        self._sessions_dir = Path(sessions_dir).expanduser()
+        self._provider_getter = provider_getter
+        self._sync_memory_index = sync_memory_index
+        self._enabled = bool(enabled)
+        self._interval_seconds = max(1, int(interval_seconds))
+        self._max_events_per_run = max(1, int(max_events_per_run))
+        self._memory_files = MemoryFiles(self._workspace_dir)
+
+        self._task: asyncio.Task[None] | None = None
+        self._run_lock = asyncio.Lock()
+        self._running = False
+        self._last_status: dict[str, Any] = {
+            "enabled": self._enabled,
+            "running": False,
+            "interval_seconds": self._interval_seconds,
+            "max_events_per_run": self._max_events_per_run,
+            "last_run_at": "",
+            "last_success_at": "",
+            "last_error": "",
+            "last_result": {},
+        }
+
+    async def start(self) -> None:
+        if not self._enabled or self._running:
+            return
+        self._running = True
+        self._last_status["running"] = True
+        self._task = asyncio.create_task(self._loop())
+        asyncio.create_task(self.run_once(reason="startup"))
+        logger.info(
+            "Memory maintenance runner started (interval=%ss max_events=%s)",
+            self._interval_seconds,
+            self._max_events_per_run,
+        )
+
+    async def stop(self) -> None:
+        self._running = False
+        self._last_status["running"] = False
+        if self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+        logger.info("Memory maintenance runner stopped")
+
+    async def _loop(self) -> None:
+        while self._running:
+            try:
+                await asyncio.sleep(self._interval_seconds)
+                await self.run_once(reason="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Memory maintenance loop error")
+
+    def status(self) -> dict[str, Any]:
+        return dict(self._last_status)
+
+    async def run_once(self, *, reason: str = "manual") -> dict[str, Any]:
+        async with self._run_lock:
+            started_at = self._utc_now()
+            self._last_status["last_run_at"] = started_at
+
+            state = self._load_state()
+            batch = self._collect_pending_batch(state)
+            if not batch.events:
+                advanced = self._advance_state(state, batch=batch, processed=batch.events)
+                if advanced:
+                    self._save_state(state)
+                result = {
+                    "reason": reason,
+                    "new_events": 0,
+                    "daily_notes_written": 0,
+                    "facts_written": 0,
+                    "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
+                }
+                self._last_status["last_result"] = result
+                self._last_status["last_error"] = ""
+                self._last_status["last_success_at"] = started_at
+                return result
+
+            provider = self._provider_getter()
+            response = await self._extract(provider=provider, events=[event.payload for event in batch.events])
+            payload = self._parse_payload(response)
+            if payload is None:
+                error = "memory extraction JSON parse failed"
+                logger.warning("%s", error)
+                self._last_status["last_error"] = error
+                self._last_status["last_result"] = {"reason": reason, "new_events": len(batch.events), "error": error}
+                state["last_error"] = error
+                state["last_run_at"] = started_at
+                self._save_state(state)
+                return dict(self._last_status["last_result"])
+
+            daily_written, touched_daily = self._write_daily_notes(payload.get("daily_notes"))
+            facts_written, touched_facts = self._write_facts(payload.get("facts"))
+            touched_paths = {str(path) for path in [*touched_daily, *touched_facts]}
+
+            self._advance_state(state, batch=batch, processed=batch.events)
+            state["last_run_at"] = started_at
+            state["last_success_at"] = started_at
+            state["last_error"] = ""
+            self._save_state(state)
+
+            sync_result = await self._sync_memory_index()
+            result = {
+                "reason": reason,
+                "provider": provider.name,
+                "new_events": len(batch.events),
+                "daily_notes_written": daily_written,
+                "facts_written": facts_written,
+                "touched_paths": sorted(touched_paths),
+                "sync_result": sync_result,
+            }
+            self._last_status["last_result"] = result
+            self._last_status["last_error"] = ""
+            self._last_status["last_success_at"] = started_at
+            return result
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(UTC).isoformat()
+
+    def _state_path(self) -> Path:
+        return self._workspace_dir / "state" / "memory-maintenance.json"
+
+    def _load_state(self) -> dict[str, Any]:
+        path = self._state_path()
+        if not path.exists():
+            return {"version": 1, "files": {}, "last_run_at": "", "last_success_at": "", "last_error": ""}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"version": 1, "files": {}, "last_run_at": "", "last_success_at": "", "last_error": ""}
+
+    def _save_state(self, state: dict[str, Any]) -> None:
+        path = self._state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _collect_pending_batch(self, state: dict[str, Any]) -> PendingBatch:
+        files_state: dict[str, Any] = state.setdefault("files", {})
+        events: list[PendingEvent] = []
+        scan_end: dict[str, int] = {}
+        total_entries: dict[str, int] = {}
+
+        session_files = sorted(self._sessions_dir.glob("*.jsonl"))
+        for path in session_files:
+            file_name = path.name
+            try:
+                raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                continue
+
+            last_line = int((files_state.get(file_name) or {}).get("last_line", 0))
+            if last_line > len(raw_lines):
+                last_line = max(0, len(raw_lines) - DEFAULT_INITIAL_TAIL_LINES)
+            elif last_line == 0 and len(raw_lines) > DEFAULT_INITIAL_TAIL_LINES:
+                last_line = len(raw_lines) - DEFAULT_INITIAL_TAIL_LINES
+
+            scan_end[file_name] = len(raw_lines)
+            total_entries[file_name] = 0
+            if file_name.endswith(".full.jsonl"):
+                parsed = self._parse_full_lines(file_name=file_name, raw_lines=raw_lines, start_line=last_line + 1)
+            else:
+                parsed = self._parse_main_lines(file_name=file_name, raw_lines=raw_lines, start_line=last_line + 1)
+
+            for event in parsed:
+                total_entries[file_name] += 1
+                events.append(event)
+
+        if len(events) > self._max_events_per_run:
+            events = events[: self._max_events_per_run]
+        return PendingBatch(events=events, scan_end=scan_end, total_entries=total_entries)
+
+    def _parse_main_lines(self, *, file_name: str, raw_lines: list[str], start_line: int) -> list[PendingEvent]:
+        out: list[PendingEvent] = []
+        for idx in range(max(1, int(start_line)), len(raw_lines) + 1):
+            raw = raw_lines[idx - 1].strip()
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            message = parsed.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = self._flatten_content(message.get("content"))
+            if not content:
+                continue
+            payload = {
+                "source_file": file_name,
+                "line": idx,
+                "timestamp": str(parsed.get("timestamp") or ""),
+                "event_type": "chat_message",
+                "role": str(message.get("role") or ""),
+                "content": content,
+            }
+            out.append(PendingEvent(file_name=file_name, line=idx, payload=payload))
+        return out
+
+    def _parse_full_lines(self, *, file_name: str, raw_lines: list[str], start_line: int) -> list[PendingEvent]:
+        out: list[PendingEvent] = []
+        for idx in range(max(1, int(start_line)), len(raw_lines) + 1):
+            raw = raw_lines[idx - 1].strip()
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            message = parsed.get("message")
+            if not isinstance(message, dict):
+                continue
+
+            tool_calls = message.get("tool_calls")
+            tool_results = message.get("tool_results")
+            if not tool_calls and not tool_results:
+                continue
+
+            payload: dict[str, Any] = {
+                "source_file": file_name,
+                "line": idx,
+                "timestamp": str(parsed.get("timestamp") or ""),
+                "event_type": "tool_trace",
+                "role": str(message.get("role") or ""),
+            }
+            content = self._flatten_content(message.get("content"))
+            if content:
+                payload["content"] = content
+            if isinstance(tool_calls, list):
+                payload["tool_calls"] = [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "name": str(item.get("name") or ""),
+                        "arguments": dict(item.get("arguments") or {}),
+                    }
+                    for item in tool_calls
+                    if isinstance(item, dict)
+                ]
+            if isinstance(tool_results, list):
+                payload["tool_results"] = [
+                    {
+                        "tool_call_id": str(item.get("tool_call_id") or ""),
+                        "is_error": bool(item.get("is_error")),
+                        "content": self._trim_tool_result(str(item.get("content") or "")),
+                    }
+                    for item in tool_results
+                    if isinstance(item, dict)
+                ]
+            out.append(PendingEvent(file_name=file_name, line=idx, payload=payload))
+        return out
+
+    @staticmethod
+    def _flatten_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                if not isinstance(item, dict):
+                    text = str(item).strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                item_type = str(item.get("type") or "").strip().lower()
+                if item_type == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                if item_type == "image":
+                    path = str(item.get("path") or "").strip()
+                    mime = str(item.get("mime_type") or "image/jpeg").strip()
+                    label = f"[image mime={mime}"
+                    if path:
+                        label += f" path={path}"
+                    label += "]"
+                    parts.append(label)
+                    continue
+                text = str(item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+            return "\n".join(parts).strip()
+        return str(content or "").strip()
+
+    @staticmethod
+    def _trim_tool_result(content: str) -> str:
+        cleaned = str(content or "").strip()
+        if len(cleaned) <= DEFAULT_TOOL_RESULT_CHAR_LIMIT:
+            return cleaned
+        return cleaned[:DEFAULT_TOOL_RESULT_CHAR_LIMIT].rstrip() + "\n[TRUNCATED]"
+
+    async def _extract(self, *, provider: BaseProvider, events: list[dict[str, Any]]) -> ChatResponse:
+        system = (
+            "You are Drost memory extraction. Output ONLY valid JSON. No markdown.\n\n"
+            "Goal: convert fresh transcript events into durable memory.\n"
+            "Return an object with exactly two keys:\n"
+            '  \"daily_notes\": list of {\"date\": \"YYYY-MM-DD\", \"bullets\": [\"...\"]}\n'
+            '  \"facts\": list of {\"entity_type\": \"...\", \"entity_id\": \"...\", \"kind\": \"...\", '
+            '"fact\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
+            '"supersedes\": \"optional\"}\n\n'
+            "Rules:\n"
+            "- Extract only useful durable information.\n"
+            "- Daily notes should capture meaningful recent context, decisions, and work.\n"
+            "- Facts should be atomic and plain-language.\n"
+            "- Do not include secrets, tokens, passwords, or API keys.\n"
+            "- Prefer these entity types when possible: "
+            + ", ".join(DEFAULT_ENTITY_TYPES)
+            + ".\n"
+            "- If nothing worth storing exists, return empty lists.\n"
+        )
+        user = json.dumps(
+            {
+                "workspace": str(self._workspace_dir),
+                "events": events,
+            },
+            ensure_ascii=False,
+        )
+        return await provider.chat(
+            messages=[Message(role=MessageRole.USER, content=user)],
+            system=system,
+            max_tokens=2500,
+            temperature=0,
+        )
+
+    @staticmethod
+    def _parse_payload(response: ChatResponse) -> dict[str, Any] | None:
+        raw = str(response.message.content or "").strip()
+        if not raw:
+            return None
+        raw = _JSON_FENCE_RE.sub("", raw).strip()
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("daily_notes", [])
+        payload.setdefault("facts", [])
+        return payload
+
+    def _write_daily_notes(self, daily_notes: Any) -> tuple[int, set[Path]]:
+        if not isinstance(daily_notes, list):
+            return 0, set()
+        count = 0
+        touched: set[Path] = set()
+        for item in daily_notes:
+            if not isinstance(item, dict):
+                continue
+            bullets = item.get("bullets")
+            if not isinstance(bullets, list):
+                continue
+            path = self._memory_files.append_daily_bullets(
+                [str(b).strip() for b in bullets if str(b).strip()],
+                day=str(item.get("date") or "").strip() or None,
+            )
+            cleaned = [str(b).strip() for b in bullets if str(b).strip()]
+            if cleaned:
+                count += len(cleaned)
+                touched.add(path)
+        return count, touched
+
+    def _write_facts(self, facts: Any) -> tuple[int, set[Path]]:
+        if not isinstance(facts, list):
+            return 0, set()
+        count = 0
+        touched: set[Path] = set()
+        for item in facts:
+            if not isinstance(item, dict):
+                continue
+            entity_type = str(item.get("entity_type") or "").strip()
+            entity_id = str(item.get("entity_id") or "").strip()
+            fact_text = str(item.get("fact") or "").strip()
+            if not entity_type or not entity_id or not fact_text:
+                continue
+            try:
+                confidence = float(item["confidence"]) if item.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+            result = self._memory_files.append_entity_fact(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                fact=fact_text,
+                kind=str(item.get("kind") or "fact").strip() or "fact",
+                fact_date=str(item.get("date") or "").strip() or None,
+                confidence=confidence,
+                source=str(item.get("source") or "").strip() or None,
+                supersedes=str(item.get("supersedes") or "").strip() or None,
+            )
+            if result.created:
+                count += 1
+                touched.add(result.path)
+        return count, touched
+
+    def _advance_state(self, state: dict[str, Any], *, batch: PendingBatch, processed: list[PendingEvent]) -> bool:
+        files_state: dict[str, Any] = state.setdefault("files", {})
+        processed_counts: dict[str, int] = defaultdict(int)
+        last_processed_line: dict[str, int] = {}
+        for event in processed:
+            processed_counts[event.file_name] += 1
+            last_processed_line[event.file_name] = max(last_processed_line.get(event.file_name, 0), event.line)
+
+        changed = False
+        for file_name, scan_end in batch.scan_end.items():
+            total_entries = int(batch.total_entries.get(file_name, 0))
+            processed_count = int(processed_counts.get(file_name, 0))
+            current = int((files_state.get(file_name) or {}).get("last_line", 0))
+
+            if total_entries == 0:
+                new_value = scan_end
+            elif processed_count == 0:
+                continue
+            elif processed_count >= total_entries:
+                new_value = scan_end
+            else:
+                new_value = int(last_processed_line.get(file_name, current))
+
+            if new_value > current:
+                files_state[file_name] = {"last_line": new_value}
+                changed = True
+        return changed

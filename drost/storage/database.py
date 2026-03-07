@@ -22,7 +22,7 @@ class SQLiteStore:
         *,
         db_path: Path,
         vector_extension_path: str = "",
-        vector_dimensions: int = 384,
+        vector_dimensions: int = 3072,
     ) -> None:
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +41,13 @@ class SQLiteStore:
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._init_schema()
-            self._init_vector_support()
+            self._load_vector_extension()
+            rebuild_vector_table = self._reconcile_vector_schema()
+            self._ensure_vector_table()
+            if rebuild_vector_table:
+                self._backfill_vector_table_from_chunks()
+            self._meta_set_int("memory_vector_dimensions", self._vector_dimensions)
+            self._conn.commit()
 
     @staticmethod
     def _utc_now() -> str:
@@ -93,13 +99,174 @@ class SQLiteStore:
             CREATE INDEX IF NOT EXISTS idx_memory_chunks_session_id
               ON memory_chunks(session_key, id DESC);
 
+            CREATE TABLE IF NOT EXISTS runtime_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_indexed_files (
+              path TEXT PRIMARY KEY,
+              source_kind TEXT NOT NULL,
+              file_hash TEXT NOT NULL,
+              title TEXT NOT NULL DEFAULT '',
+              updated_at TEXT NOT NULL,
+              chunk_count INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
               USING fts5(content, chunk_id UNINDEXED);
             """
         )
+        self._ensure_memory_chunk_columns()
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_chunks_source_path ON memory_chunks(source_kind, path)"
+        )
         self._conn.commit()
 
-    def _init_vector_support(self) -> None:
+    def _ensure_memory_chunk_columns(self) -> None:
+        columns = {
+            str(row["name"]): str(row["type"] or "")
+            for row in self._conn.execute("PRAGMA table_info(memory_chunks)").fetchall()
+        }
+        required = {
+            "source_kind": "TEXT NOT NULL DEFAULT 'transcript_message'",
+            "path": "TEXT NOT NULL DEFAULT ''",
+            "line_start": "INTEGER NOT NULL DEFAULT 1",
+            "line_end": "INTEGER NOT NULL DEFAULT 1",
+            "title": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "TEXT NOT NULL DEFAULT ''",
+            "derived_from": "TEXT NOT NULL DEFAULT ''",
+            "content_hash": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, ddl in required.items():
+            if name in columns:
+                continue
+            self._conn.execute(f"ALTER TABLE memory_chunks ADD COLUMN {name} {ddl}")
+
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1",
+            (str(name),),
+        ).fetchone()
+        return row is not None
+
+    def _meta_get_int(self, key: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT value FROM runtime_meta WHERE key = ? LIMIT 1",
+            (str(key),),
+        ).fetchone()
+        if row is None:
+            return None
+        raw = str(row["value"] or "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    def _meta_set_int(self, key: str, value: int) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO runtime_meta(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(key), str(int(value))),
+        )
+
+    def _sample_embedding_dimensions(self) -> int | None:
+        row = self._conn.execute(
+            "SELECT length(embedding) AS n FROM memory_chunks WHERE embedding IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        raw = row["n"]
+        if raw is None:
+            return None
+        try:
+            byte_count = int(raw)
+        except Exception:
+            return None
+        if byte_count <= 0 or byte_count % 4 != 0:
+            return None
+        return byte_count // 4
+
+    def _reconcile_vector_schema(self) -> bool:
+        if self._vector_error:
+            self._meta_set_int("memory_vector_dimensions", self._vector_dimensions)
+            self._conn.commit()
+            return False
+
+        stored_dims = self._meta_get_int("memory_vector_dimensions")
+        sampled_dims = self._sample_embedding_dimensions()
+        had_vector_table = self._table_exists("memory_vec")
+        rebuild_vector_table = False
+
+        if sampled_dims is not None and sampled_dims != self._vector_dimensions:
+            logger.warning(
+                "Stored memory embeddings use %s dimensions but runtime expects %s; clearing incompatible vectors",
+                sampled_dims,
+                self._vector_dimensions,
+            )
+            self._conn.execute("DROP TABLE IF EXISTS memory_vec")
+            self._conn.execute("UPDATE memory_chunks SET embedding = NULL WHERE embedding IS NOT NULL")
+            self._meta_set_int("memory_vector_dimensions", self._vector_dimensions)
+            self._conn.commit()
+            return False
+
+        if stored_dims == self._vector_dimensions:
+            if not had_vector_table and sampled_dims == self._vector_dimensions:
+                rebuild_vector_table = True
+            return rebuild_vector_table
+
+        if stored_dims is None:
+            if had_vector_table or sampled_dims is not None:
+                logger.warning(
+                    "Legacy memory vector state detected; reconciling embeddings from %s to %s dimensions",
+                    sampled_dims or "unknown",
+                    self._vector_dimensions,
+                )
+        else:
+            logger.warning(
+                "Memory vector dimensions changed from %s to %s; rebuilding vector lane",
+                stored_dims,
+                self._vector_dimensions,
+            )
+
+        self._conn.execute("DROP TABLE IF EXISTS memory_vec")
+        if sampled_dims is not None and sampled_dims != self._vector_dimensions:
+            self._conn.execute("UPDATE memory_chunks SET embedding = NULL WHERE embedding IS NOT NULL")
+        else:
+            rebuild_vector_table = sampled_dims == self._vector_dimensions and sampled_dims is not None
+        self._meta_set_int("memory_vector_dimensions", self._vector_dimensions)
+        self._conn.commit()
+        return rebuild_vector_table
+
+    def _backfill_vector_table_from_chunks(self) -> None:
+        if not self._vector_enabled:
+            return
+        expected_bytes = self._vector_dimensions * 4
+        rows = self._conn.execute(
+            """
+            SELECT id, embedding
+              FROM memory_chunks
+             WHERE embedding IS NOT NULL
+               AND length(embedding) = ?
+          ORDER BY id ASC
+            """,
+            (expected_bytes,),
+        ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO memory_vec(id, embedding) VALUES (?, ?)",
+                (int(row["id"]), row["embedding"]),
+            )
+        self._conn.commit()
+
+    def _load_vector_extension(self) -> None:
         if self._vector_dimensions < 8:
             self._vector_enabled = False
             self._vector_error = "invalid embedding dimension"
@@ -118,7 +285,24 @@ class SQLiteStore:
                     return
                 sqlite_vec.load(self._conn)
                 self._sqlite_vec = sqlite_vec
+            self._vector_error = ""
+        except Exception as exc:
+            self._vector_enabled = False
+            self._vector_error = str(exc)
+            logger.warning("sqlite-vec unavailable, using fallback vector search: %s", exc)
+        finally:
+            with suppress(Exception):
+                self._conn.enable_load_extension(False)
 
+    def _ensure_vector_table(self) -> None:
+        if self._vector_dimensions < 8:
+            self._vector_enabled = False
+            self._vector_error = "invalid embedding dimension"
+            return
+        if self._vector_error:
+            self._vector_enabled = False
+            return
+        try:
             self._conn.execute(
                 f"""
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
@@ -134,17 +318,32 @@ class SQLiteStore:
             self._vector_enabled = False
             self._vector_error = str(exc)
             logger.warning("sqlite-vec unavailable, using fallback vector search: %s", exc)
-        finally:
-            with suppress(Exception):
-                self._conn.enable_load_extension(False)
 
     def memory_status(self) -> dict[str, Any]:
+        with self._lock:
+            counts = {
+                str(row["source_kind"] or "unknown"): int(row["n"] or 0)
+                for row in self._conn.execute(
+                    """
+                    SELECT source_kind, COUNT(*) AS n
+                      FROM memory_chunks
+                  GROUP BY source_kind
+                    """
+                ).fetchall()
+            }
+            indexed_files = int(
+                (
+                    self._conn.execute("SELECT COUNT(*) AS n FROM memory_indexed_files").fetchone() or {"n": 0}
+                )["n"]
+            )
         return {
             "vector_enabled": bool(self._vector_enabled),
             "vector_error": self._vector_error,
             "vector_dimensions": self._vector_dimensions,
             "vector_extension_path": self._vector_extension_path,
             "db_path": str(self.db_path),
+            "source_counts": counts,
+            "indexed_files": indexed_files,
         }
 
     @staticmethod
@@ -415,42 +614,116 @@ class SQLiteStore:
 
     # --- Memory helpers --------------------------------------------------
 
+    def _insert_memory_chunk(
+        self,
+        *,
+        session_key: str,
+        role: str,
+        content: str,
+        embedding: list[float],
+        source_kind: str,
+        path: str = "",
+        line_start: int = 1,
+        line_end: int | None = None,
+        title: str = "",
+        derived_from: str = "",
+        content_hash: str = "",
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> int:
+        cleaned_session = str(session_key or "").strip()
+        if cleaned_session:
+            self._ensure_session_row(cleaned_session)
+        now = self._utc_now()
+        created = str(created_at or now)
+        updated = str(updated_at or created)
+        blob = self._serialize_embedding(embedding) if embedding else None
+        cursor = self._conn.execute(
+            """
+            INSERT INTO memory_chunks(
+              session_key, role, content, embedding, created_at,
+              source_kind, path, line_start, line_end, title, updated_at, derived_from, content_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cleaned_session,
+                str(role or ""),
+                str(content or ""),
+                blob,
+                created,
+                str(source_kind or "transcript_message"),
+                str(path or ""),
+                max(1, int(line_start)),
+                max(1, int(line_end if line_end is not None else line_start)),
+                str(title or ""),
+                updated,
+                str(derived_from or ""),
+                str(content_hash or ""),
+            ),
+        )
+        chunk_id = int(cursor.lastrowid)
+        self._conn.execute(
+            "INSERT INTO memory_fts(rowid, content, chunk_id) VALUES (?, ?, ?)",
+            (chunk_id, str(content or ""), chunk_id),
+        )
+
+        if self._vector_enabled and embedding:
+            try:
+                vec_blob = self._serialize_embedding(embedding)
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memory_vec(id, embedding) VALUES (?, ?)",
+                    (chunk_id, vec_blob),
+                )
+            except Exception as exc:
+                self._vector_enabled = False
+                self._vector_error = str(exc)
+                logger.warning("Disabling sqlite-vec writes after insert failure: %s", exc)
+
+        return chunk_id
+
     def add_memory(self, *, session_key: str, role: str, content: str, embedding: list[float]) -> int:
         with self._lock:
-            blob = self._serialize_embedding(embedding) if embedding else None
-            cursor = self._conn.execute(
-                """
-                INSERT INTO memory_chunks(session_key, role, content, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (session_key, role, content, blob, self._utc_now()),
+            chunk_id = self._insert_memory_chunk(
+                session_key=session_key,
+                role=role,
+                content=content,
+                embedding=embedding,
+                source_kind="transcript_message",
             )
-            chunk_id = int(cursor.lastrowid)
-            self._conn.execute(
-                "INSERT INTO memory_fts(rowid, content, chunk_id) VALUES (?, ?, ?)",
-                (chunk_id, content, chunk_id),
-            )
-
-            if self._vector_enabled and embedding:
-                try:
-                    vec_blob = self._serialize_embedding(embedding)
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO memory_vec(id, embedding) VALUES (?, ?)",
-                        (chunk_id, vec_blob),
-                    )
-                except Exception as exc:
-                    self._vector_enabled = False
-                    self._vector_error = str(exc)
-                    logger.warning("Disabling sqlite-vec writes after insert failure: %s", exc)
-
             self._conn.commit()
             return chunk_id
+
+    @staticmethod
+    def _row_to_memory_result(row: sqlite3.Row | dict[str, Any], *, score: float | None = None) -> dict[str, Any]:
+        raw = row if isinstance(row, dict) else dict(row)
+        out = {
+            "id": int(raw.get("id") or 0),
+            "session_key": str(raw.get("session_key") or ""),
+            "role": str(raw.get("role") or ""),
+            "content": str(raw.get("content") or ""),
+            "created_at": str(raw.get("created_at") or ""),
+            "source_kind": str(raw.get("source_kind") or "transcript_message"),
+            "path": str(raw.get("path") or ""),
+            "line_start": int(raw.get("line_start") or 1),
+            "line_end": int(raw.get("line_end") or raw.get("line_start") or 1),
+            "title": str(raw.get("title") or ""),
+            "updated_at": str(raw.get("updated_at") or ""),
+            "derived_from": str(raw.get("derived_from") or ""),
+            "content_hash": str(raw.get("content_hash") or ""),
+        }
+        if score is not None:
+            out["score"] = float(score)
+        elif raw.get("score") is not None:
+            out["score"] = float(raw.get("score") or 0.0)
+        return out
 
     def get_memory_chunk(self, chunk_id: int) -> dict[str, Any] | None:
         with self._lock:
             row = self._conn.execute(
                 """
-                SELECT id, session_key, role, content, created_at
+                SELECT id, session_key, role, content, created_at,
+                       source_kind, path, line_start, line_end, title, updated_at, derived_from, content_hash
                   FROM memory_chunks
                  WHERE id = ?
                  LIMIT 1
@@ -459,13 +732,100 @@ class SQLiteStore:
             ).fetchone()
         if row is None:
             return None
-        return {
-            "id": int(row["id"]),
-            "session_key": str(row["session_key"]),
-            "role": str(row["role"]),
-            "content": str(row["content"]),
-            "created_at": str(row["created_at"]),
-        }
+        return self._row_to_memory_result(row)
+
+    def get_indexed_file(self, path: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT path, source_kind, file_hash, title, updated_at, chunk_count
+                  FROM memory_indexed_files
+                 WHERE path = ?
+                 LIMIT 1
+                """,
+                (str(path or ""),),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def list_indexed_files(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT path, source_kind, file_hash, title, updated_at, chunk_count
+                  FROM memory_indexed_files
+              ORDER BY path ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove_indexed_file(self, path: str) -> None:
+        cleaned_path = str(path or "").strip()
+        if not cleaned_path:
+            return
+        with self._lock:
+            ids = [
+                int(row["id"])
+                for row in self._conn.execute(
+                    "SELECT id FROM memory_chunks WHERE path = ?",
+                    (cleaned_path,),
+                ).fetchall()
+            ]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                self._conn.execute(f"DELETE FROM memory_fts WHERE rowid IN ({placeholders})", ids)
+                if self._vector_enabled:
+                    self._conn.execute(f"DELETE FROM memory_vec WHERE id IN ({placeholders})", ids)
+                self._conn.execute(f"DELETE FROM memory_chunks WHERE id IN ({placeholders})", ids)
+            self._conn.execute("DELETE FROM memory_indexed_files WHERE path = ?", (cleaned_path,))
+            self._conn.commit()
+
+    def replace_indexed_file(
+        self,
+        *,
+        path: str,
+        source_kind: str,
+        title: str,
+        file_hash: str,
+        updated_at: str,
+        chunks: list[dict[str, Any]],
+    ) -> None:
+        cleaned_path = str(path or "").strip()
+        if not cleaned_path:
+            raise ValueError("path is required")
+        with self._lock:
+            self.remove_indexed_file(cleaned_path)
+            for chunk in chunks:
+                self._insert_memory_chunk(
+                    session_key="",
+                    role="memory",
+                    content=str(chunk.get("content") or ""),
+                    embedding=list(chunk.get("embedding") or []),
+                    source_kind=source_kind,
+                    path=cleaned_path,
+                    line_start=int(chunk.get("line_start") or 1),
+                    line_end=int(chunk.get("line_end") or chunk.get("line_start") or 1),
+                    title=str(chunk.get("title") or title or ""),
+                    derived_from=str(chunk.get("derived_from") or ""),
+                    content_hash=file_hash,
+                    created_at=str(chunk.get("created_at") or updated_at),
+                    updated_at=updated_at,
+                )
+            self._conn.execute(
+                """
+                INSERT INTO memory_indexed_files(path, source_kind, file_hash, title, updated_at, chunk_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                  source_kind=excluded.source_kind,
+                  file_hash=excluded.file_hash,
+                  title=excluded.title,
+                  updated_at=excluded.updated_at,
+                  chunk_count=excluded.chunk_count
+                """,
+                (cleaned_path, source_kind, file_hash, title, updated_at, len(chunks)),
+            )
+            self._conn.commit()
 
     def _search_vector_sqlite_vec(self, query_embedding: list[float], limit: int) -> list[dict[str, Any]]:
         if not self._vector_enabled or not query_embedding or self._is_zero_vector(query_embedding):
@@ -480,6 +840,14 @@ class SQLiteStore:
                        m.role,
                        m.content,
                        m.created_at,
+                       m.source_kind,
+                       m.path,
+                       m.line_start,
+                       m.line_end,
+                       m.title,
+                       m.updated_at,
+                       m.derived_from,
+                       m.content_hash,
                        vec_distance_cosine(v.embedding, ?) AS dist
                   FROM memory_vec v
                   JOIN memory_chunks m ON m.id = v.id
@@ -497,16 +865,7 @@ class SQLiteStore:
         out: list[dict[str, Any]] = []
         for row in rows:
             dist = float(row["dist"] if row["dist"] is not None else 1.0)
-            out.append(
-                {
-                    "id": int(row["id"]),
-                    "session_key": str(row["session_key"]),
-                    "role": str(row["role"]),
-                    "content": str(row["content"]),
-                    "created_at": str(row["created_at"]),
-                    "score": max(0.0, 1.0 - dist),
-                }
-            )
+            out.append(self._row_to_memory_result(row, score=max(0.0, 1.0 - dist)))
         return out
 
     def _search_vector_fallback(self, query_embedding: list[float], limit: int) -> list[dict[str, Any]]:
@@ -515,7 +874,9 @@ class SQLiteStore:
 
         rows = self._conn.execute(
             """
-            SELECT id, session_key, role, content, created_at, embedding
+            SELECT id, session_key, role, content, created_at,
+                   source_kind, path, line_start, line_end, title, updated_at, derived_from, content_hash,
+                   embedding
               FROM memory_chunks
              WHERE embedding IS NOT NULL
           ORDER BY id DESC
@@ -533,11 +894,7 @@ class SQLiteStore:
                 (
                     score,
                     {
-                        "id": int(row["id"]),
-                        "session_key": str(row["session_key"]),
-                        "role": str(row["role"]),
-                        "content": str(row["content"]),
-                        "created_at": str(row["created_at"]),
+                        **self._row_to_memory_result(row),
                         "score": score,
                     },
                 )
@@ -558,6 +915,14 @@ class SQLiteStore:
                    m.role,
                    m.content,
                    m.created_at,
+                   m.source_kind,
+                   m.path,
+                   m.line_start,
+                   m.line_end,
+                   m.title,
+                   m.updated_at,
+                   m.derived_from,
+                   m.content_hash,
                    bm25(memory_fts) AS rank
               FROM memory_fts
               JOIN memory_chunks m ON m.id = memory_fts.rowid
@@ -573,16 +938,7 @@ class SQLiteStore:
             rank = float(row["rank"] if row["rank"] is not None else 1000.0)
             # Lower rank is better for BM25; map to bounded score.
             score = 1.0 / (1.0 + max(0.0, rank))
-            out.append(
-                {
-                    "id": int(row["id"]),
-                    "session_key": str(row["session_key"]),
-                    "role": str(row["role"]),
-                    "content": str(row["content"]),
-                    "created_at": str(row["created_at"]),
-                    "score": score,
-                }
-            )
+            out.append(self._row_to_memory_result(row, score=score))
         return out
 
     def search_memory(

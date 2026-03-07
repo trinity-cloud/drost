@@ -12,6 +12,8 @@ from drost.config import Settings
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{2,}")
+_GEMINI_DOCUMENT_TASK = "RETRIEVAL_DOCUMENT"
+_GEMINI_QUERY_TASK = "RETRIEVAL_QUERY"
 
 
 class EmbeddingService:
@@ -22,17 +24,31 @@ class EmbeddingService:
         self._model = settings.memory_embedding_model
         self._dimensions = int(settings.memory_embedding_dimensions)
 
-        self._client: AsyncOpenAI | None = None
-        if self._provider == "openai" and settings.openai_api_key:
+        self._client: Any | None = None
+        self._client_type = "none"
+        if self._provider == "gemini":
+            if settings.gemini_api_key:
+                try:
+                    from google import genai
+                except Exception as exc:
+                    logger.warning("Gemini SDK unavailable, falling back to deterministic embeddings: %s", exc)
+                else:
+                    self._client = genai.Client(api_key=settings.gemini_api_key)
+                    self._client_type = "gemini"
+            else:
+                logger.info("Gemini embedding provider configured without GEMINI_API_KEY; using deterministic fallback")
+        elif self._provider == "openai" and settings.openai_api_key:
             self._client = AsyncOpenAI(
                 api_key=settings.openai_api_key,
                 base_url=(settings.openai_base_url or None),
             )
+            self._client_type = "openai"
         elif self._provider == "xai" and settings.xai_api_key:
             self._client = AsyncOpenAI(
                 api_key=settings.xai_api_key,
                 base_url=settings.xai_base_url,
             )
+            self._client_type = "xai"
 
     @property
     def dimensions(self) -> int:
@@ -59,9 +75,21 @@ class EmbeddingService:
         return vec + [0.0] * (dims - len(vec))
 
     async def embed_one(self, text: str) -> list[float]:
+        return await self.embed_document(text)
+
+    async def embed_query(self, text: str) -> list[float]:
+        return await self._embed(text, task_type=_GEMINI_QUERY_TASK)
+
+    async def embed_document(self, text: str, *, title: str | None = None) -> list[float]:
+        return await self._embed(text, task_type=_GEMINI_DOCUMENT_TASK, title=title)
+
+    async def _embed(self, text: str, *, task_type: str, title: str | None = None) -> list[float]:
         cleaned = (text or "").strip()
         if not cleaned:
             return [0.0] * self._dimensions
+
+        if self._client is not None and self._client_type == "gemini":
+            return await self._embed_gemini(cleaned, task_type=task_type, title=title)
 
         if self._client is not None:
             payload: dict[str, Any] = {"model": self._model, "input": [cleaned]}
@@ -90,6 +118,49 @@ class EmbeddingService:
 
         return self._deterministic_embedding(cleaned)
 
+    async def _embed_gemini(self, text: str, *, task_type: str, title: str | None = None) -> list[float]:
+        if self._client is None:
+            return self._deterministic_embedding(text)
+        try:
+            from google.genai import types
+        except Exception as exc:
+            logger.warning("Gemini types unavailable, falling back to deterministic embeddings: %s", exc)
+            return self._deterministic_embedding(text)
+
+        config = types.EmbedContentConfig(
+            taskType=task_type,
+            title=(title or None) if task_type == _GEMINI_DOCUMENT_TASK else None,
+            autoTruncate=True,
+        )
+        try:
+            resp = await self._client.aio.models.embed_content(
+                model=self._model,
+                contents=text,
+                config=config,
+            )
+        except Exception as exc:
+            logger.warning("Gemini embedding API failed, falling back to deterministic embedding: %s", exc)
+            return self._deterministic_embedding(text)
+
+        embeddings = list(getattr(resp, "embeddings", []) or [])
+        if not embeddings:
+            return self._deterministic_embedding(text)
+
+        first = embeddings[0]
+        vector = list(getattr(first, "values", []) or [])
+        if not vector:
+            return self._deterministic_embedding(text)
+
+        stats = getattr(first, "statistics", None)
+        if getattr(stats, "truncated", False):
+            logger.info(
+                "Gemini embedding input truncated task_type=%s token_count=%s",
+                task_type,
+                getattr(stats, "token_count", None),
+            )
+
+        return self._normalize(self._resize([float(v) for v in vector]))
+
     def _deterministic_embedding(self, text: str) -> list[float]:
         dims = self._dimensions
         if dims <= 0:
@@ -115,5 +186,9 @@ class EmbeddingService:
         return self._normalize(vec)
 
     async def close(self) -> None:
+        if self._client is not None and self._client_type == "gemini":
+            await self._client.aio.aclose()
+            self._client.close()
+            return
         if self._client is not None:
             await self._client.close()

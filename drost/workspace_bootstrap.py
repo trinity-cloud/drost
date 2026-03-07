@@ -17,6 +17,7 @@ BOOTSTRAP_FILE = "BOOTSTRAP.md"
 MEMORY_DIRS = (
     "memory/daily",
     "memory/entities",
+    "state",
 )
 
 

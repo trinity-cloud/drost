@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 
 from drost.config import Settings
@@ -83,3 +84,29 @@ def test_memory_search_handles_hyphenated_queries(tmp_path: Path) -> None:
 
     asyncio.run(embed.close())
     store.close()
+
+
+def test_memory_store_reconciles_embedding_dimension_changes(tmp_path: Path) -> None:
+    db_path = tmp_path / "drost-memory-migrate.sqlite3"
+    session_key = session_key_for_telegram_chat(2002, None)
+
+    initial = SQLiteStore(db_path=db_path, vector_dimensions=64)
+    initial.add_memory(
+        session_key=session_key,
+        role="assistant",
+        content="Initial memory vector state.",
+        embedding=[0.125] * 64,
+    )
+    initial.close()
+
+    migrated = SQLiteStore(db_path=db_path, vector_dimensions=128)
+    assert migrated.memory_status()["vector_dimensions"] == 128
+    migrated.close()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("SELECT embedding FROM memory_chunks LIMIT 1").fetchone()
+        assert row is not None
+        assert row[0] is None
+    finally:
+        conn.close()

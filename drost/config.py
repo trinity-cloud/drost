@@ -53,15 +53,19 @@ class Settings(BaseSettings):
     xai_api_key: str = ""
     xai_base_url: str = "https://api.x.ai/v1"
     exa_api_key: str = Field(default="", validation_alias=AliasChoices("DROST_EXA_API_KEY", "EXA_API_KEY"))
+    gemini_api_key: str = Field(default="", validation_alias=AliasChoices("DROST_GEMINI_API_KEY", "GEMINI_API_KEY"))
 
     sqlite_path: Path = Field(default_factory=lambda: Path("~/.drost/drost.sqlite3").expanduser())
     sqvector_extension_path: str = ""
 
     memory_enabled: bool = True
     memory_top_k: int = 6
-    memory_embedding_model: str = "text-embedding-3-small"
-    memory_embedding_provider: Literal["openai", "xai", "none"] = "openai"
-    memory_embedding_dimensions: int = 384
+    memory_embedding_model: str = "gemini-embedding-001"
+    memory_embedding_provider: Literal["gemini", "openai", "xai", "none"] = "gemini"
+    memory_embedding_dimensions: int = 3072
+    memory_maintenance_enabled: bool = True
+    memory_maintenance_interval_seconds: int = 1800
+    memory_maintenance_max_events_per_run: int = 200
 
     session_history_limit: int = 64
 
@@ -173,6 +177,8 @@ class Settings(BaseSettings):
     @field_validator(
         "agent_max_iterations",
         "agent_max_tool_calls_per_run",
+        "memory_maintenance_interval_seconds",
+        "memory_maintenance_max_events_per_run",
         "context_budget_total_tokens",
         "context_budget_system_tokens",
         "context_budget_history_tokens",
@@ -212,6 +218,8 @@ class Settings(BaseSettings):
             self.xai_api_key = (os.environ.get("XAI_API_KEY") or "").strip()
         if not self.exa_api_key:
             self.exa_api_key = (os.environ.get("EXA_API_KEY") or "").strip()
+        if not self.gemini_api_key:
+            self.gemini_api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
 
         self.sqlite_path = Path(self.sqlite_path).expanduser()
         self.openai_codex_auth_path = Path(self.openai_codex_auth_path).expanduser()
@@ -223,6 +231,7 @@ class Settings(BaseSettings):
         self.openai_base_url = (self.openai_base_url or "").strip()
         self.xai_base_url = (self.xai_base_url or "https://api.x.ai/v1").strip()
         self.exa_api_key = (self.exa_api_key or "").strip()
+        self.gemini_api_key = (self.gemini_api_key or "").strip()
         self.sqvector_extension_path = (self.sqvector_extension_path or "").strip()
         self.telegram_bot_token = (self.telegram_bot_token or "").strip()
         self.telegram_webhook_url = (self.telegram_webhook_url or "").strip()
@@ -238,6 +247,13 @@ class Settings(BaseSettings):
         )
         if self.trace_enabled:
             self.trace_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.memory_embedding_provider == "gemini":
+            self.memory_embedding_model = (self.memory_embedding_model or "gemini-embedding-001").strip()
+            if self.memory_embedding_model != "gemini-embedding-001":
+                raise ValueError("memory_embedding_model must be 'gemini-embedding-001' when provider is gemini")
+            if int(self.memory_embedding_dimensions) != 3072:
+                raise ValueError("Gemini embeddings must use the full 3072-dimensional output")
 
         return self
 

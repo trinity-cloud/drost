@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 from drost.config import Settings
 from drost.embeddings import EmbeddingService
-from drost.storage import SQLiteStore
+from drost.storage import SQLiteStore, WorkspaceMemoryIndexer
 from drost.tools.file_read import FileReadTool
 from drost.tools.file_write import FileWriteTool
 from drost.tools.memory_get import MemoryGetTool
@@ -26,12 +26,20 @@ def build_default_registry(
     settings: Settings,
     store: SQLiteStore,
     embeddings: EmbeddingService,
+    workspace_memory_indexer: WorkspaceMemoryIndexer,
     current_chat_id: Callable[[], int],
     current_session_key: Callable[[], str],
 ) -> ToolRegistry:
     registry = ToolRegistry()
-    registry.register(MemorySearchTool(store=store, embeddings=embeddings, default_limit=settings.memory_top_k))
-    registry.register(MemoryGetTool(store=store))
+    registry.register(
+        MemorySearchTool(
+            store=store,
+            embeddings=embeddings,
+            workspace_memory_indexer=workspace_memory_indexer,
+            default_limit=settings.memory_top_k,
+        )
+    )
+    registry.register(MemoryGetTool(store=store, workspace_dir=settings.workspace_dir))
     registry.register(
         SessionStatusTool(
             store=store,
