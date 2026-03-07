@@ -97,6 +97,12 @@ class MemoryFiles:
             raise ValueError("entity_type and entity_id must be non-empty")
         return self.entities_dir / slug_type / slug_id
 
+    def entity_items_path(self, entity_type: str, entity_id: str) -> Path:
+        return self.entity_dir(entity_type, entity_id) / "items.md"
+
+    def entity_summary_path(self, entity_type: str, entity_id: str) -> Path:
+        return self.entity_dir(entity_type, entity_id) / "summary.md"
+
     def append_entity_fact(
         self,
         *,

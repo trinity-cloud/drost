@@ -49,6 +49,12 @@ class PendingBatch:
     total_entries: dict[str, int]
 
 
+@dataclass(slots=True, frozen=True)
+class EntityRef:
+    entity_type: str
+    entity_id: str
+
+
 class MemoryMaintenanceRunner:
     def __init__(
         self,
@@ -60,6 +66,7 @@ class MemoryMaintenanceRunner:
         enabled: bool,
         interval_seconds: int = 1800,
         max_events_per_run: int = 200,
+        entity_synthesis_enabled: bool = True,
     ) -> None:
         self._workspace_dir = Path(workspace_dir).expanduser()
         self._sessions_dir = Path(sessions_dir).expanduser()
@@ -68,6 +75,7 @@ class MemoryMaintenanceRunner:
         self._enabled = bool(enabled)
         self._interval_seconds = max(1, int(interval_seconds))
         self._max_events_per_run = max(1, int(max_events_per_run))
+        self._entity_synthesis_enabled = bool(entity_synthesis_enabled)
         self._memory_files = MemoryFiles(self._workspace_dir)
 
         self._task: asyncio.Task[None] | None = None
@@ -78,6 +86,7 @@ class MemoryMaintenanceRunner:
             "running": False,
             "interval_seconds": self._interval_seconds,
             "max_events_per_run": self._max_events_per_run,
+            "entity_synthesis_enabled": self._entity_synthesis_enabled,
             "last_run_at": "",
             "last_success_at": "",
             "last_error": "",
@@ -137,6 +146,7 @@ class MemoryMaintenanceRunner:
                     "new_events": 0,
                     "daily_notes_written": 0,
                     "facts_written": 0,
+                    "summaries_written": 0,
                     "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
                 }
                 self._last_status["last_result"] = result
@@ -158,8 +168,13 @@ class MemoryMaintenanceRunner:
                 return dict(self._last_status["last_result"])
 
             daily_written, touched_daily = self._write_daily_notes(payload.get("daily_notes"))
-            facts_written, touched_facts = self._write_facts(payload.get("facts"))
-            touched_paths = {str(path) for path in [*touched_daily, *touched_facts]}
+            facts_written, touched_facts, touched_entities = self._write_facts(payload.get("facts"))
+            summaries_written, touched_summaries = await self._synthesize_entities(
+                provider=provider,
+                entities=touched_entities,
+                state=state,
+            )
+            touched_paths = {str(path) for path in [*touched_daily, *touched_facts, *touched_summaries]}
 
             self._advance_state(state, batch=batch, processed=batch.events)
             state["last_run_at"] = started_at
@@ -174,6 +189,7 @@ class MemoryMaintenanceRunner:
                 "new_events": len(batch.events),
                 "daily_notes_written": daily_written,
                 "facts_written": facts_written,
+                "summaries_written": summaries_written,
                 "touched_paths": sorted(touched_paths),
                 "sync_result": sync_result,
             }
@@ -434,11 +450,12 @@ class MemoryMaintenanceRunner:
                 touched.add(path)
         return count, touched
 
-    def _write_facts(self, facts: Any) -> tuple[int, set[Path]]:
+    def _write_facts(self, facts: Any) -> tuple[int, set[Path], set[EntityRef]]:
         if not isinstance(facts, list):
-            return 0, set()
+            return 0, set(), set()
         count = 0
         touched: set[Path] = set()
+        entities: set[EntityRef] = set()
         for item in facts:
             if not isinstance(item, dict):
                 continue
@@ -464,7 +481,101 @@ class MemoryMaintenanceRunner:
             if result.created:
                 count += 1
                 touched.add(result.path)
-        return count, touched
+                entities.add(EntityRef(entity_type=result.entity_type, entity_id=result.entity_id))
+        return count, touched, entities
+
+    async def _synthesize_entities(
+        self,
+        *,
+        provider: BaseProvider,
+        entities: set[EntityRef],
+        state: dict[str, Any],
+    ) -> tuple[int, set[Path]]:
+        if not self._entity_synthesis_enabled or not entities:
+            return 0, set()
+
+        synthesis_state = state.setdefault("synthesis", {})
+        entity_state = synthesis_state.setdefault("entities", {})
+        written = 0
+        touched: set[Path] = set()
+
+        for entity in sorted(entities, key=lambda item: (item.entity_type, item.entity_id)):
+            items_path = self._memory_files.entity_items_path(entity.entity_type, entity.entity_id)
+            if not items_path.exists():
+                continue
+            try:
+                items_text = items_path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if not items_text.strip():
+                continue
+
+            summary_path = self._memory_files.entity_summary_path(entity.entity_type, entity.entity_id)
+            prior_summary = ""
+            if summary_path.exists():
+                prior_summary = summary_path.read_text(encoding="utf-8", errors="replace")
+
+            content = await self._generate_entity_summary(
+                provider=provider,
+                entity_type=entity.entity_type,
+                entity_id=entity.entity_id,
+                items_text=items_text,
+                prior_summary=prior_summary,
+            )
+            if not content:
+                continue
+
+            path = self._memory_files.write_entity_summary(
+                entity_type=entity.entity_type,
+                entity_id=entity.entity_id,
+                summary=content,
+            )
+            touched.add(path)
+            written += 1
+            entity_state[f"{entity.entity_type}/{entity.entity_id}"] = {
+                "last_summary_at": self._utc_now(),
+                "items_mtime": datetime.fromtimestamp(items_path.stat().st_mtime, tz=UTC).isoformat(),
+            }
+        return written, touched
+
+    async def _generate_entity_summary(
+        self,
+        *,
+        provider: BaseProvider,
+        entity_type: str,
+        entity_id: str,
+        items_text: str,
+        prior_summary: str,
+    ) -> str:
+        system = (
+            "You are Drost entity memory synthesis. Output ONLY markdown for summary.md.\n"
+            "Keep it concise, current, and high-signal.\n"
+            "Do not use code fences.\n"
+            "Do not dump the raw fact list back verbatim.\n"
+        )
+        user = json.dumps(
+            {
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "prior_summary": prior_summary,
+                "items_md": items_text[-12000:],
+            },
+            ensure_ascii=False,
+        )
+        try:
+            response = await provider.chat(
+                messages=[Message(role=MessageRole.USER, content=user)],
+                system=system,
+                max_tokens=1200,
+                temperature=0,
+            )
+        except Exception:
+            logger.warning("Entity summary synthesis failed for %s/%s", entity_type, entity_id, exc_info=True)
+            return ""
+        content = str(response.message.content or "").strip()
+        if not content:
+            return ""
+        return _JSON_FENCE_RE.sub("", content).strip()
 
     def _advance_state(self, state: dict[str, Any], *, batch: PendingBatch, processed: list[PendingEvent]) -> bool:
         files_state: dict[str, Any] = state.setdefault("files", {})

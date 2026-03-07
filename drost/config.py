@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     memory_maintenance_enabled: bool = True
     memory_maintenance_interval_seconds: int = 1800
     memory_maintenance_max_events_per_run: int = 200
+    memory_entity_synthesis_enabled: bool = True
 
     session_history_limit: int = 64
 

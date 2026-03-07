@@ -106,6 +106,7 @@ Background transcript-to-memory extraction defaults to:
 - `DROST_MEMORY_MAINTENANCE_ENABLED=true`
 - `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
 - `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
+- `DROST_MEMORY_ENTITY_SYNTHESIS_ENABLED=true`
 
 Vector mode:
 - Attempts to load `sqlite-vec` automatically
@@ -123,6 +124,8 @@ Memory maintenance:
 - writes durable memory into:
   - `~/.drost/memory/daily/*.md`
   - `~/.drost/memory/entities/*/*/items.md`
+- synthesizes touched entities into:
+  - `~/.drost/memory/entities/*/*/summary.md`
 - stores cursor state in:
   - `~/.drost/state/memory-maintenance.json`
 

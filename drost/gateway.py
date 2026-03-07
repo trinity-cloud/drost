@@ -53,6 +53,7 @@ class Gateway:
             enabled=settings.memory_enabled and settings.memory_maintenance_enabled,
             interval_seconds=settings.memory_maintenance_interval_seconds,
             max_events_per_run=settings.memory_maintenance_max_events_per_run,
+            entity_synthesis_enabled=settings.memory_entity_synthesis_enabled,
         )
 
         if not settings.telegram_bot_token:

@@ -20,9 +20,14 @@ from drost.storage import SessionJSONLStore, SQLiteStore, session_key_for_telegr
 
 
 class ExtractionProvider(BaseProvider):
-    def __init__(self, *, content: str) -> None:
-        self._content = content
+    def __init__(self, *, content: str | list[str]) -> None:
+        if isinstance(content, list):
+            self._responses = list(content)
+        else:
+            self._responses = [content]
         self.last_messages: list[Message] = []
+        self.message_calls: list[list[Message]] = []
+        self.system_prompts: list[str] = []
 
     @property
     def name(self) -> str:
@@ -42,10 +47,13 @@ class ExtractionProvider(BaseProvider):
         temperature: float | None = None,
         stop_sequences: list[str] | None = None,
     ) -> ChatResponse:
-        _ = system, tools, max_tokens, temperature, stop_sequences
+        _ = tools, max_tokens, temperature, stop_sequences
         self.last_messages = list(messages)
+        self.message_calls.append(list(messages))
+        self.system_prompts.append(str(system or ""))
+        content = self._responses.pop(0) if self._responses else ""
         return ChatResponse(
-            message=Message(role=MessageRole.ASSISTANT, content=self._content),
+            message=Message(role=MessageRole.ASSISTANT, content=content),
             finish_reason="stop",
         )
 
@@ -92,27 +100,30 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
     )
 
     provider = ExtractionProvider(
-        content=json.dumps(
-            {
-                "daily_notes": [
-                    {
-                        "date": "2026-03-07",
-                        "bullets": ["Confirmed Drost memory should compound into Markdown files."],
-                    }
-                ],
-                "facts": [
-                    {
-                        "entity_type": "projects",
-                        "entity_id": "drost",
-                        "kind": "decision",
-                        "fact": "Drost should use Markdown files as durable memory.",
-                        "date": "2026-03-07",
-                        "confidence": 0.96,
-                        "source": "sessions/test.jsonl:1",
-                    }
-                ],
-            }
-        )
+        content=[
+            json.dumps(
+                {
+                    "daily_notes": [
+                        {
+                            "date": "2026-03-07",
+                            "bullets": ["Confirmed Drost memory should compound into Markdown files."],
+                        }
+                    ],
+                    "facts": [
+                        {
+                            "entity_type": "projects",
+                            "entity_id": "drost",
+                            "kind": "decision",
+                            "fact": "Drost should use Markdown files as durable memory.",
+                            "date": "2026-03-07",
+                            "confidence": 0.96,
+                            "source": "sessions/test.jsonl:1",
+                        }
+                    ],
+                }
+            ),
+            "# Drost\n\nDrost stores durable memory in Markdown files and reindexes them into SQLite.",
+        ]
     )
 
     store = SQLiteStore(db_path=tmp_path / "drost.sqlite3", vector_dimensions=64)
@@ -136,18 +147,23 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
 
     daily_path = workspace / "memory" / "daily" / "2026-03-07.md"
     fact_path = workspace / "memory" / "entities" / "projects" / "drost" / "items.md"
+    summary_path = workspace / "memory" / "entities" / "projects" / "drost" / "summary.md"
     state_path = workspace / "state" / "memory-maintenance.json"
 
     assert result["daily_notes_written"] == 1
     assert result["facts_written"] == 1
+    assert result["summaries_written"] == 1
     assert sync_calls == ["sync"]
     assert daily_path.exists()
     assert fact_path.exists()
+    assert summary_path.exists()
     assert "Markdown files as durable memory" in fact_path.read_text(encoding="utf-8")
+    assert "Drost stores durable memory in Markdown files" in summary_path.read_text(encoding="utf-8")
     assert json.loads(state_path.read_text(encoding="utf-8"))["files"]
-    payload = json.loads(str(provider.last_messages[0].content or ""))
+    payload = json.loads(str(provider.message_calls[0][0].content or ""))
     assert payload["events"]
     assert any(event["event_type"] == "tool_trace" for event in payload["events"])
+    assert "entity memory synthesis" in provider.system_prompts[1].lower()
     store.close()
 
 
