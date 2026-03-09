@@ -22,6 +22,10 @@ MEMORY_RECALL_GUIDANCE = """[Memory Recall]
 - Use memory_search to locate likely hits, then memory_get to inspect the exact source when needed.
 - If memory is thin or uncertain, say so plainly."""
 
+RUNTIME_TOPOLOGY_GUIDANCE = """[Runtime Topology]
+- The runtime facts below are authoritative for this turn.
+- Do not call tools just to rediscover repo root, workspace root, launch mode, or health URL unless you have reason to think they changed."""
+
 BOOTSTRAP_RUNTIME_CONTRACT = """[Bootstrap Contract]
 - This workspace is still in bootstrap mode.
 - Your near-term job is to establish a concrete agent identity and a concrete user profile.
@@ -63,6 +67,7 @@ class PromptAssembler:
 
         sections.append(self._build_workspace_runtime_section())
         sections.extend(self._build_workspace_sections(workspace))
+        sections.append(RUNTIME_TOPOLOGY_GUIDANCE)
 
         if continuity_summary.strip():
             sections.append(f"[Session Continuity]\n{continuity_summary.strip()}")
@@ -101,7 +106,11 @@ class PromptAssembler:
         return "\n".join(
             [
                 "[Workspace Runtime]",
-                f"workspace={self._settings.workspace_dir}",
+                f"repo_root={self._settings.repo_root}",
+                f"workspace_root={self._settings.workspace_dir}",
+                f"gateway_health_url={self._settings.gateway_health_url}",
+                f"launch_mode={self._settings.runtime_launch_mode}",
+                f"start_command={self._settings.runtime_start_command}",
                 f"timezone={zone}",
                 f"current_time={now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
             ]

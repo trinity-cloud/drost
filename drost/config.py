@@ -29,7 +29,11 @@ class Settings(BaseSettings):
     app_name: str = "drost"
     gateway_host: str = "0.0.0.0"
     gateway_port: int = 8766
+    gateway_health_url: str = ""
     log_level: str = "INFO"
+    repo_root: Path = Field(default_factory=lambda: Path.cwd())
+    runtime_launch_mode: str = "uv-run"
+    runtime_start_command: str = "uv run drost"
 
     telegram_bot_token: str = ""
     telegram_allowed_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
@@ -239,11 +243,13 @@ class Settings(BaseSettings):
 
         self.sqlite_path = Path(self.sqlite_path).expanduser()
         self.openai_codex_auth_path = Path(self.openai_codex_auth_path).expanduser()
+        self.repo_root = Path(self.repo_root).expanduser().resolve()
         self.workspace_dir = Path(self.workspace_dir).expanduser()
         self.attachments_dir = Path(self.attachments_dir).expanduser()
         self.trace_dir = Path(self.trace_dir).expanduser()
 
         self.log_level = (self.log_level or "INFO").upper()
+        self.gateway_health_url = (self.gateway_health_url or "").strip()
         self.openai_base_url = (self.openai_base_url or "").strip()
         self.xai_base_url = (self.xai_base_url or "https://api.x.ai/v1").strip()
         self.exa_api_key = (self.exa_api_key or "").strip()
@@ -252,9 +258,16 @@ class Settings(BaseSettings):
         self.telegram_bot_token = (self.telegram_bot_token or "").strip()
         self.telegram_webhook_url = (self.telegram_webhook_url or "").strip()
         self.telegram_webhook_secret = (self.telegram_webhook_secret or "").strip()
+        self.runtime_launch_mode = (self.runtime_launch_mode or "uv-run").strip() or "uv-run"
+        self.runtime_start_command = (self.runtime_start_command or "uv run drost").strip() or "uv run drost"
         self.prompt_workspace_files = [str(name).strip() for name in self.prompt_workspace_files if str(name).strip()]
         if not self.prompt_workspace_files:
             self.prompt_workspace_files = ["SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"]
+        if not self.gateway_health_url:
+            health_host = (self.gateway_host or "127.0.0.1").strip()
+            if health_host in {"0.0.0.0", "::", ""}:
+                health_host = "127.0.0.1"
+            self.gateway_health_url = f"http://{health_host}:{int(self.gateway_port)}/health"
 
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         seed_workspace_files(

@@ -42,6 +42,7 @@ def build_default_registry(
     registry.register(MemoryGetTool(store=store, workspace_dir=settings.workspace_dir))
     registry.register(
         SessionStatusTool(
+            settings=settings,
             store=store,
             current_chat_id=current_chat_id,
             current_session_key=current_session_key,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from drost.config import Settings
 from drost.storage import SQLiteStore, session_key_for_telegram_chat
 from drost.tools.base import BaseTool
 
@@ -10,10 +11,12 @@ class SessionStatusTool(BaseTool):
     def __init__(
         self,
         *,
+        settings: Settings,
         store: SQLiteStore,
         current_chat_id: Callable[[], int],
         current_session_key: Callable[[], str],
     ) -> None:
+        self._settings = settings
         self._store = store
         self._current_chat_id = current_chat_id
         self._current_session_key = current_session_key
@@ -24,7 +27,7 @@ class SessionStatusTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Inspect active session and recent sessions for a Telegram chat."
+        return "Inspect active session, runtime topology, and recent sessions for a Telegram chat."
 
     @property
     def parameters(self) -> dict[str, object]:
@@ -55,6 +58,11 @@ class SessionStatusTool(BaseTool):
             f"active_session_id={active}",
             f"active_session_key={active_key}",
             f"active_message_count={count}",
+            f"repo_root={self._settings.repo_root}",
+            f"workspace_root={self._settings.workspace_dir}",
+            f"gateway_health_url={self._settings.gateway_health_url}",
+            f"launch_mode={self._settings.runtime_launch_mode}",
+            f"start_command={self._settings.runtime_start_command}",
             "recent_sessions:",
         ]
         for idx, row in enumerate(sessions[:10], start=1):
@@ -64,4 +72,3 @@ class SessionStatusTool(BaseTool):
                 f"messages={int(row.get('message_count') or 0)}"
             )
         return "\n".join(lines)
-

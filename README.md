@@ -104,6 +104,20 @@ At runtime, a typical turn looks like this:
 5. Persist transcript + traces
 6. Let maintenance compound durable memory in the background
 
+## Runtime Topology
+
+Drost injects explicit runtime topology into the agent prompt on every turn.
+
+That includes:
+
+- repo root
+- workspace root
+- gateway health URL
+- launch mode
+- start command
+
+The goal is to stop wasting tool calls on rediscovering obvious runtime facts like `pwd`, repo location, or local health endpoints.
+
 ## Quick Start
 
 ### 1. Install
@@ -145,6 +159,10 @@ uv run drost
 
 The gateway starts on `http://0.0.0.0:8766` by default.
 
+For local health validation, Drost derives:
+
+- `http://127.0.0.1:8766/health`
+
 ## Where Things Live
 
 This is important because Drost has two different roots.
@@ -157,6 +175,10 @@ This is where code and runtime config live.
 - `README.md`
 - `drost/`
 - `tests/`
+
+Current local development default:
+
+- `/Users/migel/drost`
 
 ### Agent workspace
 

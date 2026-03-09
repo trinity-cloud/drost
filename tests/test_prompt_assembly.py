@@ -16,9 +16,11 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
 
     settings = Settings(
         workspace_dir=tmp_path,
+        repo_root=tmp_path / "repo",
         prompt_workspace_files=["SOUL.md", "USER.md", "EXTRA.md"],
         context_budget_system_tokens=8_000,
     )
+    (tmp_path / "repo").mkdir(exist_ok=True)
     (tmp_path / "EXTRA.md").write_text("Extra workspace file", encoding="utf-8")
     assembler = PromptAssembler(settings)
     prompt = assembler.assemble(
@@ -44,6 +46,12 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "[Tool Call Style]" in prompt
     assert "[Memory Recall]" in prompt
     assert "[Workspace Runtime]" in prompt
+    assert f"repo_root={settings.repo_root}" in prompt
+    assert f"workspace_root={settings.workspace_dir}" in prompt
+    assert f"gateway_health_url={settings.gateway_health_url}" in prompt
+    assert f"launch_mode={settings.runtime_launch_mode}" in prompt
+    assert f"start_command={settings.runtime_start_command}" in prompt
+    assert "[Runtime Topology]" in prompt
 
 
 def test_prompt_assembly_includes_bootstrap_when_active(tmp_path: Path) -> None:
