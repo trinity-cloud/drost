@@ -2,7 +2,7 @@
 repo_root = "/Users/your-user/drost"
 workspace_dir = "/Users/your-user/.drost"
 state_dir = "/Users/your-user/.drost/deployer"
-start_command = "uv run drost"
+start_command = "uv run drost-gateway"
 health_url = "http://127.0.0.1:8766/health"
 startup_grace_seconds = 2.0
 health_timeout_seconds = 20.0

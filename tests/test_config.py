@@ -44,5 +44,5 @@ def test_repo_root_resolves_and_runtime_defaults_are_set(tmp_path: Path) -> None
     )
 
     assert settings.repo_root == repo_root.resolve()
-    assert settings.runtime_launch_mode == "uv-run"
+    assert settings.runtime_launch_mode == "deployer-default"
     assert settings.runtime_start_command == "uv run drost"

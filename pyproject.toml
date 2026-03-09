@@ -46,7 +46,7 @@ dev = [
 
 [project.scripts]
 drost = "drost.main:main"
-drost-gateway = "drost.main:main"
+drost-gateway = "drost.gateway_main:main"
 drost-deployer = "drost.deployer.main:main"
 
 [tool.hatch.build.targets.wheel]

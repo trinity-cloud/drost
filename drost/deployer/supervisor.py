@@ -44,6 +44,11 @@ class DeployerSupervisor:
         command = shlex.split(self._store.config.start_command)
         stdout_path = self._store.logs_dir / "child.stdout.log"
         stderr_path = self._store.logs_dir / "child.stderr.log"
+        env = dict(os.environ)
+        env.setdefault("DROST_RUNTIME_LAUNCH_MODE", "deployer-child")
+        env.setdefault("DROST_RUNTIME_START_COMMAND", "uv run drost")
+        env.setdefault("DROST_REPO_ROOT", str(self._store.config.repo_root))
+        env.setdefault("DROST_GATEWAY_HEALTH_URL", self._store.config.health_url)
 
         with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open(
             "a", encoding="utf-8"
@@ -56,6 +61,7 @@ class DeployerSupervisor:
                 stdin=subprocess.DEVNULL,
                 text=True,
                 start_new_session=True,
+                env=env,
             )
         return process, self._git_head()
 

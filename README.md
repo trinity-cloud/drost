@@ -159,6 +159,12 @@ DROST_AGENT_MAX_ITERATIONS=100
 uv run drost
 ```
 
+This is the default supervised mode:
+
+- `drost` starts the deployer
+- the deployer starts `drost-gateway`
+- deploy and restart actions flow through the deployer queue
+
 The gateway starts on `http://0.0.0.0:8766` by default.
 
 For local health validation, Drost derives:
@@ -167,11 +173,24 @@ For local health validation, Drost derives:
 
 ## Deployer
 
-Drost now ships an external deployer entry point:
+Drost now ships these entry points:
 
 ```bash
+uv run drost
+uv run drost-gateway
 uv run drost-deployer --help
 ```
+
+Use them like this:
+
+- `uv run drost`
+  - default operator mode
+  - starts the deployer control plane
+- `uv run drost-gateway`
+  - direct raw gateway mode
+  - for debugging and emergency bypass only
+- `uv run drost-deployer`
+  - explicit control-plane CLI
 
 Current scope:
 
@@ -211,7 +230,7 @@ uv run drost-deployer config
 1. Start Drost under the deployer:
 
 ```bash
-uv run drost-deployer run
+uv run drost
 ```
 
 2. In another shell, inspect status:
@@ -275,7 +294,7 @@ uv run drost-deployer rollback --to-ref <commit-or-ref>
 
 Minimal manual acceptance path:
 
-1. Start `uv run drost-deployer run`
+1. Start `uv run drost`
 2. Wait for `uv run drost-deployer status` to report `state=healthy`
 3. Run `uv run drost-deployer promote`
 4. Make and commit a safe code change

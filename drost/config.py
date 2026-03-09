@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     gateway_health_url: str = ""
     log_level: str = "INFO"
     repo_root: Path = Field(default_factory=lambda: Path.cwd())
-    runtime_launch_mode: str = "uv-run"
+    runtime_launch_mode: str = "deployer-default"
     runtime_start_command: str = "uv run drost"
 
     telegram_bot_token: str = ""

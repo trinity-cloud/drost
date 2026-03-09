@@ -68,6 +68,10 @@ class DeployerStateStore:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         if not self.config.config_path.exists():
             self.config.config_path.write_text(self.config.render_toml(), encoding="utf-8")
+        else:
+            config_text = self.config.config_path.read_text(encoding="utf-8")
+            if 'start_command = "uv run drost"' in config_text or 'start_command = "drost"' in config_text:
+                self.config.config_path.write_text(self.config.render_toml(), encoding="utf-8")
         if not self.status_path.exists():
             self.write_status(self.default_status())
         if not self.known_good_path.exists():

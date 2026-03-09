@@ -11,6 +11,16 @@ def _resolve_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+LEGACY_CHILD_START_COMMANDS = {"uv run drost", "drost"}
+
+
+def _normalize_child_start_command(value: str) -> str:
+    cleaned = str(value or "").strip() or "uv run drost-gateway"
+    if cleaned in LEGACY_CHILD_START_COMMANDS:
+        return "uv run drost-gateway"
+    return cleaned
+
+
 @dataclass(slots=True)
 class DeployerConfig:
     repo_root: Path
@@ -45,7 +55,7 @@ class DeployerConfig:
             ),
             "workspace_dir": str(resolved_workspace_dir),
             "state_dir": str(resolved_state_dir),
-            "start_command": os.environ.get("DROST_DEPLOYER_START_COMMAND", "uv run drost"),
+            "start_command": os.environ.get("DROST_DEPLOYER_START_COMMAND", "uv run drost-gateway"),
             "health_url": os.environ.get("DROST_DEPLOYER_HEALTH_URL", "http://127.0.0.1:8766/health"),
             "startup_grace_seconds": float(os.environ.get("DROST_DEPLOYER_STARTUP_GRACE_SECONDS", "2.0")),
             "health_timeout_seconds": float(os.environ.get("DROST_DEPLOYER_HEALTH_TIMEOUT_SECONDS", "20.0")),
@@ -71,7 +81,7 @@ class DeployerConfig:
             workspace_dir=_resolve_path(merged["workspace_dir"]),
             state_dir=_resolve_path(merged["state_dir"]),
             config_path=resolved_config_path,
-            start_command=str(merged["start_command"]).strip() or "uv run drost",
+            start_command=_normalize_child_start_command(str(merged["start_command"])),
             health_url=str(merged["health_url"]).strip() or "http://127.0.0.1:8766/health",
             startup_grace_seconds=max(0.0, float(merged["startup_grace_seconds"])),
             health_timeout_seconds=max(1.0, float(merged["health_timeout_seconds"])),
@@ -86,7 +96,7 @@ class DeployerConfig:
                 f'repo_root = "{self.repo_root}"',
                 f'workspace_dir = "{self.workspace_dir}"',
                 f'state_dir = "{self.state_dir}"',
-                f'start_command = "{self.start_command}"',
+                f'start_command = "{_normalize_child_start_command(self.start_command)}"',
                 f'health_url = "{self.health_url}"',
                 f"startup_grace_seconds = {self.startup_grace_seconds}",
                 f"health_timeout_seconds = {self.health_timeout_seconds}",
