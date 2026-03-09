@@ -1,41 +1,143 @@
 # Drost
 
-Drost is a stripped-down open-source AI agent gateway built from Morpheus patterns.
+Drost is an open-source personal AI agent for trusted, owner-operated environments.
 
-It includes:
+It is built from Morpheus patterns, but intentionally stripped down: one gateway, one messaging channel, three providers, a real tool-using loop, multimodal input, persistent sessions, and memory that compounds over time.
+
+Drost is not a chatbot wrapper. It is an agent runtime.
+
+## Why Drost
+
+Most open-source "agents" are one of two things:
+
+- a thin chat UI over a model API
+- a framework that gives you abstractions but not a finished personal agent
+
+Drost takes a different position:
+
+- Telegram-native conversational interface
+- real iterative tool execution (`LLM -> tools -> LLM`)
+- persistent sessions with continuity across `/new`
+- durable memory on disk, not just prompt stuffing
+- vision support across all providers
+- self-hosted workspace under `~/.drost`
+- strong observability through JSONL transcripts and run traces
+
+If you want an agent that actually runs, remembers, sees, and acts, this is what Drost is for.
+
+## What Ships Today
+
+### Core runtime
+
 - FastAPI gateway
-- Telegram messaging channel
-- Session management
-- Persistent memory on SQLite
-- sqlite-vec acceleration (`sqvector`-style vector search) with fallback
-- Iterative tool-calling agent loop (`LLM -> tools -> LLM`)
-- Live Telegram progress updates by editing one in-flight "working" message
-- 3 model providers:
-  - OpenAI Codex OAuth / OpenAI Responses API
-  - Anthropic Claude (API key or Claude Code setup-token)
-  - xAI (OpenAI-compatible Responses API)
+- Telegram channel with polling or webhook mode
+- iterative agent loop with tool calling
+- timestamped sessions and session switching
+- live Telegram progress updates via one edited working message
+- multimodal image + text turns
+- Telegram media-group album bundling
 
-## License
+### Providers
 
-Apache-2.0 (`LICENSE`).
+- `openai-codex`
+  - OpenAI Codex OAuth / Responses API flow
+- `anthropic`
+  - API key or Claude Code setup-token flow
+- `xai`
+  - OpenAI-compatible Responses API
+
+### Tooling
+
+Drost currently ships with these built-in tools:
+
+- `memory_search`
+- `memory_get`
+- `session_status`
+- `file_read`
+- `file_write`
+- `shell_execute`
+- `web_search`
+- `web_fetch`
+
+### Memory
+
+- SQLite-backed memory store
+- `sqlite-vec` acceleration with fallback search path
+- Gemini embeddings via `gemini-embedding-001` at full `3072` dimensions
+- transcript-to-memory background extraction
+- daily memory files
+- entity fact files
+- entity summary synthesis
+- session continuity handoff on `/new`
+- prompt-time memory capsule built from ranked memory sources
+
+### Observability
+
+- per-session JSONL transcript files
+- full JSONL traces including tool calls and tool results
+- run traces
+- tool traces
+- memory maintenance status endpoint
+- continuity status endpoint
+
+## Architecture
+
+Drost’s current architecture is intentionally simple:
+
+```text
+Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
+                                 |
+                                 +-> Tool Registry
+                                 +-> SQLite Store
+                                 +-> JSONL Session Logs
+                                 +-> Workspace Memory Files
+                                 +-> Background Memory Maintenance
+                                 +-> Session Continuity Manager
+```
+
+At runtime, a typical turn looks like this:
+
+1. Load workspace context from `~/.drost`
+2. Retrieve relevant memory and build a prompt-time memory capsule
+3. Run the agent loop
+4. Execute tools as needed
+5. Persist transcript + traces
+6. Let maintenance compound durable memory in the background
 
 ## Quick Start
 
-1. Install:
+### 1. Install
 
 ```bash
 cd /Users/migel/drost
 uv sync --extra dev
 ```
 
-2. Configure:
+### 2. Configure
+
+Create your `.env` in the repo root:
 
 ```bash
 cp .env.example .env
-# edit .env
 ```
 
-3. Run:
+Minimal practical setup:
+
+```env
+DROST_TELEGRAM_BOT_TOKEN=...
+EXA_API_KEY=...
+GEMINI_API_KEY=...
+DROST_DEFAULT_PROVIDER=openai-codex
+```
+
+Optional but recommended runtime tuning:
+
+```env
+DROST_AGENT_MAX_TOOL_CALLS_PER_RUN=100
+DROST_AGENT_MAX_ITERATIONS=100
+```
+
+### 3. Run
 
 ```bash
 uv run drost
@@ -43,110 +145,35 @@ uv run drost
 
 The gateway starts on `http://0.0.0.0:8766` by default.
 
-## Provider Modes
+## Where Things Live
 
-### 1) OpenAI Codex OAuth (`openai-codex`)
+This is important because Drost has two different roots.
 
-If `DROST_OPENAI_API_KEY` is empty, Drost reads Codex tokens from:
-- `~/.codex/auth.json` (or `CODEX_HOME/auth.json`)
+### Repo root
 
-It auto-refreshes via OpenAI OAuth refresh token flow.
+This is where code and runtime config live.
 
-### 2) Anthropic (`anthropic`)
+- `.env`
+- `README.md`
+- `drost/`
+- `tests/`
 
-Set:
-- `DROST_ANTHROPIC_TOKEN`
+### Agent workspace
 
-This supports:
-- API keys (`sk-ant-...`)
-- Claude Code setup-token / OAuth-style tokens (`sk-ant-oat...`)
+This is where the agent’s persistent runtime state lives.
 
-### 3) xAI (`xai`)
+Default:
 
-Set:
-- `DROST_XAI_API_KEY`
+- `~/.drost`
 
-Uses OpenAI-compatible Responses API with:
-- `DROST_XAI_BASE_URL` (default `https://api.x.ai/v1`)
+This directory is automatically created on startup. It contains the agent’s workspace, memory, sessions, traces, and attachments.
 
-## Telegram
+## Workspace Layout
 
-Required:
-- `DROST_TELEGRAM_BOT_TOKEN`
+On first boot, Drost seeds missing workspace files from in-repo templates.
 
-Optional:
-- `DROST_TELEGRAM_ALLOWED_USER_IDS` (comma-separated numeric IDs)
-- Webhook mode:
-  - `DROST_TELEGRAM_WEBHOOK_URL`
-  - `DROST_TELEGRAM_WEBHOOK_PATH`
-  - `DROST_TELEGRAM_WEBHOOK_SECRET`
+Seeded files:
 
-If webhook URL is not set, Drost runs Telegram polling.
-
-## Session Commands (Telegram)
-
-- `/new [title]`
-- `/sessions`
-- `/use <id|index>`
-- `/current`
-- `/reset`
-
-## Memory
-
-Memory is persisted in:
-- `DROST_SQLITE_PATH` (default `~/.drost/drost.sqlite3`)
-
-Embeddings default to Google Gemini:
-- `GEMINI_API_KEY`
-- `DROST_MEMORY_EMBEDDING_PROVIDER=gemini`
-- `DROST_MEMORY_EMBEDDING_MODEL=gemini-embedding-001`
-- `DROST_MEMORY_EMBEDDING_DIMENSIONS=3072`
-
-Background transcript-to-memory extraction defaults to:
-- `DROST_MEMORY_MAINTENANCE_ENABLED=true`
-- `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
-- `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
-- `DROST_MEMORY_ENTITY_SYNTHESIS_ENABLED=true`
-- `DROST_MEMORY_CONTINUITY_ENABLED=true`
-- `DROST_MEMORY_CONTINUITY_AUTO_ON_NEW=true`
-
-Vector mode:
-- Attempts to load `sqlite-vec` automatically
-- Optional explicit extension path:
-  - `DROST_SQVECTOR_EXTENSION_PATH`
-- Falls back to brute-force cosine search if extension is unavailable
-
-When embedding dimensions change, Drost rebuilds the derived vector lane automatically.
-Incompatible old embedding blobs are cleared so keyword search stays valid and new turns repopulate semantic memory with the new dimension.
-
-Memory maintenance:
-- runs once shortly after startup
-- then runs in the background on the configured interval
-- reads session JSONL transcripts incrementally from `~/.drost/sessions`
-- writes durable memory into:
-  - `~/.drost/memory/daily/*.md`
-  - `~/.drost/memory/entities/*/*/items.md`
-- synthesizes touched entities into:
-  - `~/.drost/memory/entities/*/*/summary.md`
-- stores cursor state in:
-  - `~/.drost/state/memory-maintenance.json`
-
-Session continuity:
-- `/new` schedules a background carryover summary from the prior session into the new one
-- continuity is stored as an internal session artifact, not as a visible chat message
-- the continuity summary is injected into early turns of the new session prompt
-- continuity is also indexed as a searchable memory source
-
-Prompt-time memory capsule:
-- before each turn, Drost assembles a bounded memory capsule from ranked memory sources
-- the capsule prefers `MEMORY.md`, session continuity, recent daily notes, and entity summaries
-- transcript snippets are only used as fallback when higher-order memory is weak
-
-## Workspace Bootstrap
-
-On startup, Drost ensures `~/.drost` exists (or `DROST_WORKSPACE_DIR` when set).
-
-It seeds missing workspace prompt files from in-repo templates on first boot:
 - `AGENTS.md`
 - `BOOTSTRAP.md` for brand-new workspaces only
 - `SOUL.md`
@@ -156,31 +183,201 @@ It seeds missing workspace prompt files from in-repo templates on first boot:
 - `HEARTBEAT.md`
 - `MEMORY.md`
 
-It also creates:
+Generated directories:
+
 - `memory/daily/`
 - `memory/entities/`
-
-Seed templates are maintained in:
-- `drost/bootstrap/workspace/`
+- `sessions/`
+- `traces/`
+- `attachments/`
+- `state/`
 
 Existing files are never overwritten.
 
-## Traces
+## Provider Setup
 
-When `DROST_TRACE_ENABLED=true` (default), run and tool traces are appended to:
+### `openai-codex`
+
+If `DROST_OPENAI_API_KEY` is unset, Drost reads Codex OAuth tokens from:
+
+- `~/.codex/auth.json`
+- or `CODEX_HOME/auth.json`
+
+It automatically refreshes them when needed.
+
+### `anthropic`
+
+Set:
+
+- `DROST_ANTHROPIC_TOKEN`
+
+Supported token types:
+
+- standard API keys (`sk-ant-...`)
+- Claude Code setup-token / OAuth-style tokens (`sk-ant-oat...`)
+
+### `xai`
+
+Set:
+
+- `DROST_XAI_API_KEY`
+
+Optional:
+
+- `DROST_XAI_BASE_URL` (default `https://api.x.ai/v1`)
+
+## Telegram
+
+Required:
+
+- `DROST_TELEGRAM_BOT_TOKEN`
+
+Optional:
+
+- `DROST_TELEGRAM_ALLOWED_USER_IDS`
+- `DROST_TELEGRAM_WEBHOOK_URL`
+- `DROST_TELEGRAM_WEBHOOK_PATH`
+- `DROST_TELEGRAM_WEBHOOK_SECRET`
+
+If webhook URL is not configured, Drost uses Telegram polling.
+
+### Telegram commands
+
+- `/new [title]`
+- `/sessions`
+- `/use <id|index>`
+- `/current`
+- `/reset`
+
+## Vision
+
+Drost supports image + text turns across all three providers.
+
+Current behavior:
+
+- send a photo with a caption to Telegram
+- send an image document with a caption
+- send a media-group album
+- Drost bundles the images into a single multimodal turn
+
+Providers with vision support in Drost:
+
+- `openai-codex`
+- `anthropic`
+- `xai`
+
+## Memory Model
+
+Drost’s memory system now has multiple layers.
+
+### 1. Raw session logs
+
+Per-session JSONL files live under:
+
+- `~/.drost/sessions/<session>.jsonl`
+- `~/.drost/sessions/<session>.full.jsonl`
+
+These are the source of truth for conversation/debug history.
+
+### 2. Durable workspace memory
+
+Drost compounds memory into Markdown files under `~/.drost`:
+
+- `MEMORY.md`
+- `memory/daily/YYYY-MM-DD.md`
+- `memory/entities/<type>/<id>/items.md`
+- `memory/entities/<type>/<id>/summary.md`
+
+These files are human-readable, editable, and treated as durable memory substrate.
+
+### 3. Unified index
+
+SQLite acts as the derived memory index over:
+
+- transcript messages
+- workspace memory files
+- continuity summaries
+
+Embedding defaults:
+
+- `GEMINI_API_KEY`
+- `DROST_MEMORY_EMBEDDING_PROVIDER=gemini`
+- `DROST_MEMORY_EMBEDDING_MODEL=gemini-embedding-001`
+- `DROST_MEMORY_EMBEDDING_DIMENSIONS=3072`
+
+Vector mode:
+
+- attempts to load `sqlite-vec` automatically
+- optional explicit extension path via `DROST_SQVECTOR_EXTENSION_PATH`
+- falls back to brute-force cosine search if the vector extension is unavailable
+
+When embedding dimensions change, Drost rebuilds the derived vector lane automatically. Incompatible old embedding blobs are cleared so keyword search still works and new turns repopulate semantic memory.
+
+## Memory Maintenance
+
+Background memory maintenance is enabled by default.
+
+Key settings:
+
+- `DROST_MEMORY_MAINTENANCE_ENABLED=true`
+- `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
+- `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
+- `DROST_MEMORY_ENTITY_SYNTHESIS_ENABLED=true`
+
+What it does:
+
+- runs once shortly after startup
+- then runs on the configured interval
+- reads new JSONL transcript lines incrementally
+- writes daily notes
+- writes durable atomic facts into entity folders
+- synthesizes touched entity summaries
+- reindexes the updated memory files
+- stores cursor state in `~/.drost/state/memory-maintenance.json`
+
+## Session Continuity
+
+Drost now carries context across `/new`.
+
+Key settings:
+
+- `DROST_MEMORY_CONTINUITY_ENABLED=true`
+- `DROST_MEMORY_CONTINUITY_AUTO_ON_NEW=true`
+
+Behavior:
+
+- `/new` creates the new session immediately
+- Drost summarizes the prior session in the background
+- the continuity summary is stored as an internal session artifact
+- early turns in the new session get that continuity injected into the prompt
+- continuity is also indexed as a searchable memory source
+
+## Prompt-Time Memory Capsule
+
+Before each turn, Drost assembles a bounded memory capsule from ranked memory results.
+
+The capsule prefers:
+
+- `MEMORY.md`
+- session continuity
+- recent daily memory
+- entity summaries
+- transcript snippets only when higher-order memory is weak
+
+This is what makes Drost feel less like “a model with tools” and more like “an agent with working memory.”
+
+## Traces And Debuggability
+
+When `DROST_TRACE_ENABLED=true` (default), Drost writes:
+
 - `~/.drost/traces/runs.jsonl`
 - `~/.drost/traces/tools.jsonl`
 
-## Session JSONL Transcripts
+This makes agent behavior inspectable instead of opaque.
 
-Drost also writes per-session JSONL transcripts under:
-- `~/.drost/sessions/<session_key>.jsonl` (user/assistant only)
-- `~/.drost/sessions/<session_key>.full.jsonl` (full turn flow with tool calls/results)
+## HTTP API
 
-When no active session exists for a chat, Drost auto-creates one using a timestamped
-session id (`s_YYYY-MM-DD_HH-MM-SS`), so transcript filenames include datetime by default.
-
-## Gateway Endpoints
+Current gateway endpoints:
 
 - `GET /health`
 - `GET /v1/providers`
@@ -193,3 +390,42 @@ session id (`s_YYYY-MM-DD_HH-MM-SS`), so transcript filenames include datetime b
 - `GET /v1/memory/search?query=...&limit=...`
 - `GET /v1/runs/last`
 - `POST /v1/chat`
+
+## Deployment Model
+
+Drost is built for trusted, self-hosted, single-owner use.
+
+Current assumptions:
+
+- file tools can read and write across the host filesystem
+- shell execution is not sandboxed
+- the agent is intended to run under the owner’s control, not as a multi-tenant hosted service
+
+That is deliberate. Drost optimizes for capability and simplicity in personal deployment, not for untrusted-user isolation.
+
+## Project Status
+
+Drost is currently alpha software.
+
+What is already strong:
+
+- agent loop
+- Telegram UX
+- provider support
+- vision
+- sessions
+- transcript logging
+- memory foundation
+- continuity
+- prompt-time recall
+
+What is still evolving:
+
+- memory quality tuning
+- graph-lite relationship memory
+- richer personality compounding
+- broader channels and tool surface
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
