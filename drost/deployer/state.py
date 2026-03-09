@@ -42,6 +42,10 @@ class DeployerStateStore:
         return self.config.state_dir / "locks"
 
     @property
+    def run_lock_path(self) -> Path:
+        return self.locks_dir / "deployer-run.lock"
+
+    @property
     def logs_dir(self) -> Path:
         return self.config.state_dir / "logs"
 

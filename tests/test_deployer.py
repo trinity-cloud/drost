@@ -12,6 +12,7 @@ from drost.deployer.config import DeployerConfig
 from drost.deployer.main import main
 from drost.deployer.request_queue import DeployerRequestQueue
 from drost.deployer.rollout import DeployerRolloutManager
+from drost.deployer.run_lock import DeployerRunLock, follow_existing_logs
 from drost.deployer.service import DeployerService
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
@@ -461,6 +462,79 @@ def test_deployer_supervisor_run_forever_mirrors_child_logs_to_console(tmp_path:
     assert "child-stderr-line" in captured.err
     assert "child-stdout-line" in store.logs_dir.joinpath("child.stdout.log").read_text(encoding="utf-8")
     assert "child-stderr-line" in store.logs_dir.joinpath("child.stderr.log").read_text(encoding="utf-8")
+
+
+def test_deployer_run_lock_is_exclusive(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+
+    first = DeployerRunLock(store)
+    second = DeployerRunLock(store)
+
+    assert first.acquire() is True
+    assert second.acquire() is False
+    assert first.read_owner()["pid"] > 0
+    first.release()
+    assert second.acquire() is True
+    second.release()
+
+
+def test_follow_existing_logs_streams_log_files_and_exits_on_signal(tmp_path: Path, monkeypatch, capsys) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+
+    run_lock = DeployerRunLock(store)
+    assert run_lock.acquire() is True
+    store.logs_dir.joinpath("child.stdout.log").write_text("stdout-line\n", encoding="utf-8")
+    store.logs_dir.joinpath("child.stderr.log").write_text("stderr-line\n", encoding="utf-8")
+
+    owner_message = run_lock.read_owner()
+    assert owner_message["pid"] > 0
+
+    original_signal = __import__("signal").signal
+    captured_handler = {}
+
+    def _fake_signal(sig, handler):
+        captured_handler[int(sig)] = handler
+        return original_signal(sig, handler)
+
+    monkeypatch.setattr("signal.signal", _fake_signal)
+
+    def _trigger_stop():
+        time.sleep(0.2)
+        handler = captured_handler.get(int(signal.SIGINT))
+        assert handler is not None
+        handler(signal.SIGINT, None)
+
+    import signal
+    import threading
+
+    stop_thread = threading.Thread(target=_trigger_stop, daemon=True)
+    stop_thread.start()
+    try:
+        exit_code = follow_existing_logs(store, out=sys.stdout, err=sys.stderr)
+    finally:
+        run_lock.release()
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "attaching to existing child logs" in captured.err
+    assert "stdout-line" in captured.out
+    assert "stderr-line" in captured.err
 
 
 def test_deployer_rollout_promote_and_deploy_candidate_success(tmp_path: Path) -> None:

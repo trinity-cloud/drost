@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from drost.deployer.config import DeployerConfig
 from drost.deployer.request_queue import DeployerRequestQueue
 from drost.deployer.rollout import DeployerRolloutManager
+from drost.deployer.run_lock import DeployerRunLock, follow_existing_logs
 from drost.deployer.service import DeployerService
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
@@ -296,6 +297,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "run":
+            run_lock = DeployerRunLock(store)
+            if not run_lock.acquire():
+                if args.json:
+                    _print_status(supervisor.refresh_status(), as_json=True)
+                    return 0
+                return follow_existing_logs(store, out=sys.stdout, err=sys.stderr)
             store.append_event(
                 "deployer_started",
                 repo_root=str(store.config.repo_root),
@@ -303,10 +310,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 start_command=store.config.start_command,
                 health_url=store.config.health_url,
             )
-            exit_code = service.run_forever()
-            current = supervisor.refresh_status()
-            _print_status(current, as_json=bool(args.json))
-            return exit_code
+            try:
+                exit_code = service.run_forever()
+                current = supervisor.refresh_status()
+                _print_status(current, as_json=bool(args.json))
+                return exit_code
+            finally:
+                run_lock.release()
     except Exception as exc:
         status = store.read_status()
         status["last_error"] = str(exc)
