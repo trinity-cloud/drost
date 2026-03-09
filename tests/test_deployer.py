@@ -189,7 +189,13 @@ def test_deployer_cli_operator_views_render_config_events_and_requests(tmp_path:
     assert any(row["event_type"] == "request_received" for row in events_out)
 
 
-def _write_child_script(path: Path, *, immediate_exit: bool = False) -> None:
+def _write_child_script(
+    path: Path,
+    *,
+    immediate_exit: bool = False,
+    stdout_text: str = "",
+    stderr_text: str = "",
+) -> None:
     body = [
         "from __future__ import annotations",
         "import signal",
@@ -200,6 +206,10 @@ def _write_child_script(path: Path, *, immediate_exit: bool = False) -> None:
         "marker = Path(sys.argv[1])",
         "marker.write_text('started', encoding='utf-8')",
     ]
+    if stdout_text:
+        body.append(f"print({stdout_text!r}, flush=True)")
+    if stderr_text:
+        body.append(f"print({stderr_text!r}, file=sys.stderr, flush=True)")
     if immediate_exit:
         body.extend(["", "raise SystemExit(0)"])
     else:
@@ -418,6 +428,39 @@ def test_deployer_run_forever_tracks_short_lived_child_exit(tmp_path: Path) -> N
     assert status["state"] == "idle"
     assert status["child_pid"] is None
     assert status["child_exited_at"]
+
+
+def test_deployer_supervisor_run_forever_mirrors_child_logs_to_console(tmp_path: Path, capsys) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    marker = tmp_path / "marker.txt"
+    script = tmp_path / "child_exit.py"
+    _write_child_script(
+        script,
+        immediate_exit=True,
+        stdout_text="child-stdout-line",
+        stderr_text="child-stderr-line",
+    )
+
+    start_command = f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(marker))}"
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    config.start_command = start_command
+    store = DeployerStateStore(config)
+    store.bootstrap()
+    supervisor = DeployerSupervisor(store, mirror_child_logs=True)
+
+    returncode = supervisor.run_forever()
+    captured = capsys.readouterr()
+
+    assert returncode == 0
+    assert "child-stdout-line" in captured.out
+    assert "child-stderr-line" in captured.err
+    assert "child-stdout-line" in store.logs_dir.joinpath("child.stdout.log").read_text(encoding="utf-8")
+    assert "child-stderr-line" in store.logs_dir.joinpath("child.stderr.log").read_text(encoding="utf-8")
 
 
 def test_deployer_rollout_promote_and_deploy_candidate_success(tmp_path: Path) -> None:

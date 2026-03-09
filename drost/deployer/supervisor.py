@@ -4,9 +4,11 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
+import threading
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import IO, Any
 
 from drost.deployer.state import DeployerStateStore
 
@@ -15,8 +17,9 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 class DeployerSupervisor:
-    def __init__(self, store: DeployerStateStore) -> None:
+    def __init__(self, store: DeployerStateStore, *, mirror_child_logs: bool = False) -> None:
         self._store = store
+        self._mirror_child_logs = bool(mirror_child_logs)
 
     @staticmethod
     def _is_pid_alive(pid: int | None) -> bool:
@@ -40,6 +43,32 @@ class DeployerSupervisor:
             return ""
         return str(result.stdout or "").strip()
 
+    def _tee_stream(
+        self,
+        stream: IO[str] | None,
+        *,
+        file_path: str,
+        console_stream: IO[str] | None,
+    ) -> threading.Thread | None:
+        if stream is None:
+            return None
+
+        def _forward() -> None:
+            with open(file_path, "a", encoding="utf-8") as file_handle:
+                while True:
+                    chunk = stream.readline()
+                    if chunk == "":
+                        break
+                    file_handle.write(chunk)
+                    file_handle.flush()
+                    if console_stream is not None:
+                        console_stream.write(chunk)
+                        console_stream.flush()
+
+        thread = threading.Thread(target=_forward, daemon=True)
+        thread.start()
+        return thread
+
     def _spawn_process(self) -> tuple[subprocess.Popen[str], str]:
         command = shlex.split(self._store.config.start_command)
         stdout_path = self._store.logs_dir / "child.stdout.log"
@@ -50,19 +79,34 @@ class DeployerSupervisor:
         env.setdefault("DROST_REPO_ROOT", str(self._store.config.repo_root))
         env.setdefault("DROST_GATEWAY_HEALTH_URL", self._store.config.health_url)
 
-        with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open(
-            "a", encoding="utf-8"
-        ) as stderr_handle:
+        if self._mirror_child_logs:
             process = subprocess.Popen(
                 command,
                 cwd=self._store.config.repo_root,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                bufsize=1,
                 start_new_session=True,
                 env=env,
             )
+            self._tee_stream(process.stdout, file_path=str(stdout_path), console_stream=sys.stdout)
+            self._tee_stream(process.stderr, file_path=str(stderr_path), console_stream=sys.stderr)
+        else:
+            with stdout_path.open("a", encoding="utf-8") as stdout_handle, stderr_path.open(
+                "a", encoding="utf-8"
+            ) as stderr_handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self._store.config.repo_root,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    start_new_session=True,
+                    env=env,
+                )
         return process, self._git_head()
 
     def _write_running_status(self, *, pid: int, active_commit: str) -> dict[str, Any]:

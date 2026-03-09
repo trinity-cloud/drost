@@ -167,7 +167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     config, store = _load_state(args)
-    supervisor = DeployerSupervisor(store)
+    supervisor = DeployerSupervisor(store, mirror_child_logs=(args.command == "run"))
     queue = DeployerRequestQueue(store)
     rollout = DeployerRolloutManager(store=store, supervisor=supervisor)
     service = DeployerService(store=store, supervisor=supervisor, rollout=rollout, queue=queue)
