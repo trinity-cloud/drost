@@ -178,8 +178,10 @@ Current scope:
 - status file
 - known-good record
 - append-only event log
+- file-backed request queue under `~/.drost/deployer/requests/`
 - subprocess child supervision
 - operator commands for `start`, `stop`, `restart`, foreground `run`, `healthcheck`, `promote`, `deploy`, and `rollback`
+- queued request commands for `request restart`, `request deploy`, and `request rollback`
 - health-gated candidate deployment
 - known-good commit tracking outside the repo checkout
 - automatic rollback to the last known-good commit when candidate validation fails

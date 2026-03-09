@@ -6,7 +6,9 @@ import sys
 from collections.abc import Sequence
 
 from drost.deployer.config import DeployerConfig
+from drost.deployer.request_queue import DeployerRequestQueue
 from drost.deployer.rollout import DeployerRolloutManager
+from drost.deployer.service import DeployerService
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
 
@@ -54,6 +56,26 @@ def _build_parser() -> argparse.ArgumentParser:
     rollback_parser.add_argument("--to-ref", default=None, help="Optional rollback target ref or commit.")
     rollback_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
+    request_parser = subparsers.add_parser("request", help="Queue a deployer request for the long-lived service.")
+    request_subparsers = request_parser.add_subparsers(dest="request_command", required=True)
+
+    request_restart_parser = request_subparsers.add_parser("restart", help="Queue a restart request.")
+    request_restart_parser.add_argument("--requested-by", default="", help="Operator or subsystem queuing the request.")
+    request_restart_parser.add_argument("--reason", default="", help="Why the restart is being requested.")
+    request_restart_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    request_deploy_parser = request_subparsers.add_parser("deploy", help="Queue a candidate deploy request.")
+    request_deploy_parser.add_argument("candidate_ref", help="Candidate git ref or commit to deploy.")
+    request_deploy_parser.add_argument("--requested-by", default="", help="Operator or subsystem queuing the request.")
+    request_deploy_parser.add_argument("--reason", default="", help="Why the deploy is being requested.")
+    request_deploy_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    request_rollback_parser = request_subparsers.add_parser("rollback", help="Queue a rollback request.")
+    request_rollback_parser.add_argument("--to-ref", default="", help="Optional rollback target ref or commit.")
+    request_rollback_parser.add_argument("--requested-by", default="", help="Operator or subsystem queuing the request.")
+    request_rollback_parser.add_argument("--reason", default="", help="Why the rollback is being requested.")
+    request_rollback_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
     run_parser = subparsers.add_parser("run", help="Run the deployer in foreground supervision mode.")
     run_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
@@ -81,6 +103,9 @@ def _render_status_text(status: dict[str, object]) -> str:
         f"state_dir={status.get('state_dir') or ''}",
         f"active_commit={status.get('active_commit') or ''}",
         f"known_good_commit={status.get('known_good_commit') or ''}",
+        f"active_request_id={status.get('active_request_id') or ''}",
+        f"active_request_type={status.get('active_request_type') or ''}",
+        f"pending_request_ids={status.get('pending_request_ids') or []}",
         f"child_pid={status.get('child_pid')}",
         f"child_started_at={status.get('child_started_at') or ''}",
         f"child_exited_at={status.get('child_exited_at') or ''}",
@@ -107,7 +132,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     _, store = _load_state(args)
     supervisor = DeployerSupervisor(store)
+    queue = DeployerRequestQueue(store)
     rollout = DeployerRolloutManager(store=store, supervisor=supervisor)
+    service = DeployerService(store=store, supervisor=supervisor, rollout=rollout, queue=queue)
 
     if args.command == "init":
         store.append_event(
@@ -160,6 +187,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_status(status, as_json=bool(args.json))
             return 0
 
+        if args.command == "request":
+            if args.request_command == "restart":
+                request = queue.enqueue(
+                    "restart",
+                    requested_by=args.requested_by,
+                    reason=args.reason,
+                )
+            elif args.request_command == "deploy":
+                request = queue.enqueue(
+                    "deploy_candidate",
+                    requested_by=args.requested_by,
+                    reason=args.reason,
+                    candidate_ref=args.candidate_ref,
+                )
+            elif args.request_command == "rollback":
+                request = queue.enqueue(
+                    "rollback",
+                    requested_by=args.requested_by,
+                    reason=args.reason,
+                    rollback_ref=args.to_ref,
+                )
+            else:
+                raise ValueError(f"unknown request command: {args.request_command}")
+            payload = request.as_dict()
+            payload["pending_request_ids"] = queue.pending_request_ids()
+            if getattr(args, "json", False):
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+
         if args.command == "run":
             store.append_event(
                 "deployer_started",
@@ -168,7 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 start_command=store.config.start_command,
                 health_url=store.config.health_url,
             )
-            exit_code = supervisor.run_forever()
+            exit_code = service.run_forever()
             current = supervisor.refresh_status()
             _print_status(current, as_json=bool(args.json))
             return exit_code

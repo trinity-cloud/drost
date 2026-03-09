@@ -10,7 +10,9 @@ from pathlib import Path
 
 from drost.deployer.config import DeployerConfig
 from drost.deployer.main import main
+from drost.deployer.request_queue import DeployerRequestQueue
 from drost.deployer.rollout import DeployerRolloutManager
+from drost.deployer.service import DeployerService
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
 
@@ -31,6 +33,10 @@ def test_deployer_bootstrap_creates_external_state(tmp_path: Path) -> None:
 
     assert config.config_path.exists()
     assert store.requests_dir.exists()
+    assert store.pending_requests_dir.exists()
+    assert store.inflight_requests_dir.exists()
+    assert store.processed_requests_dir.exists()
+    assert store.failed_requests_dir.exists()
     assert store.locks_dir.exists()
     assert store.status_path.exists()
     assert store.known_good_path.exists()
@@ -62,14 +68,11 @@ def test_deployer_event_log_and_status_round_trip(tmp_path: Path) -> None:
     assert json.loads(events[-1])["active_commit"] == "abc123"
 
 
-def test_deployer_cli_run_tracks_short_lived_child(tmp_path: Path, capsys) -> None:
+def test_deployer_cli_request_enqueue_tracks_pending_request(tmp_path: Path, capsys) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     workspace_dir = tmp_path / "workspace"
     state_dir = workspace_dir / "deployer"
-    marker = tmp_path / "cli-marker.txt"
-    script = tmp_path / "cli-child.py"
-    _write_child_script(script, immediate_exit=True)
     config_path = state_dir / "config.toml"
     state_dir.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -79,7 +82,6 @@ def test_deployer_cli_run_tracks_short_lived_child(tmp_path: Path, capsys) -> No
                 f'repo_root = "{repo_root.resolve()}"',
                 f'workspace_dir = "{workspace_dir.resolve()}"',
                 f'state_dir = "{state_dir.resolve()}"',
-                f'start_command = "{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(marker))}"',
                 "",
             ]
         ),
@@ -96,7 +98,12 @@ def test_deployer_cli_run_tracks_short_lived_child(tmp_path: Path, capsys) -> No
             str(state_dir),
             "--config-path",
             str(config_path),
-            "run",
+            "request",
+            "restart",
+            "--requested-by",
+            "test",
+            "--reason",
+            "cli queue",
             "--json",
         ]
     )
@@ -105,15 +112,15 @@ def test_deployer_cli_run_tracks_short_lived_child(tmp_path: Path, capsys) -> No
     payload = json.loads(out)
 
     assert code == 0
-    assert payload["state"] == "idle"
-    assert payload["repo_root"] == str(repo_root.resolve())
-    assert marker.exists()
+    assert payload["type"] == "restart"
+    assert payload["requested_by"] == "test"
+    assert payload["reason"] == "cli queue"
+    assert payload["pending_request_ids"] == [payload["request_id"]]
 
     events = state_dir.joinpath("events.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert events
     event_types = [json.loads(line)["event_type"] for line in events]
-    assert "deployer_started" in event_types
-    assert "child_started" in event_types
+    assert "request_received" in event_types
 
 
 def _write_child_script(path: Path, *, immediate_exit: bool = False) -> None:
@@ -156,6 +163,7 @@ def _write_health_server_script(path: Path) -> None:
         "import json",
         "import signal",
         "import sys",
+        "import threading",
         "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer",
         "from pathlib import Path",
         "",
@@ -189,7 +197,7 @@ def _write_health_server_script(path: Path) -> None:
         "",
         "def _stop(signum, frame):",
         "    _ = signum, frame",
-        "    server.shutdown()",
+        "    threading.Thread(target=server.shutdown, daemon=True).start()",
         "",
         "signal.signal(signal.SIGTERM, _stop)",
         "signal.signal(signal.SIGINT, _stop)",
@@ -265,6 +273,15 @@ def _make_health_rollout_runtime(tmp_path: Path) -> tuple[DeployerConfig, Deploy
     supervisor = DeployerSupervisor(store)
     rollout = DeployerRolloutManager(store=store, supervisor=supervisor)
     return config, store, supervisor, rollout
+
+
+def _make_health_service_runtime(
+    tmp_path: Path,
+) -> tuple[DeployerConfig, DeployerStateStore, DeployerSupervisor, DeployerRolloutManager, DeployerRequestQueue, DeployerService]:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    queue = DeployerRequestQueue(store)
+    service = DeployerService(store=store, supervisor=supervisor, rollout=rollout, queue=queue)
+    return config, store, supervisor, rollout, queue, service
 
 
 def test_deployer_supervisor_start_stop_restart_lifecycle(tmp_path: Path) -> None:
@@ -433,5 +450,96 @@ def test_deployer_rollout_enters_degraded_mode_when_rollback_fails(tmp_path: Pat
         events = store.events_path.read_text(encoding="utf-8")
         assert "deploy_candidate_failed_validation" in events
         assert "rollback_failed" in events
+    finally:
+        supervisor.stop_child()
+
+
+def test_deployer_request_queue_deduplicates_pending_restart_requests(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+    queue = DeployerRequestQueue(store)
+
+    first = queue.enqueue("restart", requested_by="test", reason="first")
+    second = queue.enqueue("restart", requested_by="test", reason="duplicate")
+
+    assert first.request_id == second.request_id
+    assert queue.pending_request_ids() == [first.request_id]
+    assert len(list(store.pending_requests_dir.glob("*.json"))) == 1
+
+
+def test_deployer_request_queue_survives_restart_with_inflight_request(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+    queue = DeployerRequestQueue(store)
+
+    request = queue.enqueue("restart", requested_by="test", reason="recover")
+    claimed = queue.claim_next()
+    assert claimed is not None
+    assert claimed.request_id == request.request_id
+
+    store_after_restart = DeployerStateStore(config)
+    queue_after_restart = DeployerRequestQueue(store_after_restart)
+    claimed_again = queue_after_restart.claim_next()
+
+    assert claimed_again is not None
+    assert claimed_again.request_id == request.request_id
+    assert len(list(store.inflight_requests_dir.glob("*.json"))) == 1
+
+
+def test_deployer_service_processes_requests_fifo(tmp_path: Path) -> None:
+    config, store, supervisor, rollout, queue, service = _make_health_service_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    candidate_commit = _commit_health_state(repo_root, mode="ok", message="candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        restart_request = queue.enqueue("restart", requested_by="test", reason="queue restart")
+        deploy_request = queue.enqueue(
+            "deploy_candidate",
+            requested_by="test",
+            reason="queue deploy",
+            candidate_ref=candidate_commit,
+        )
+
+        first = service.process_next_request()
+        assert first is not None
+        assert first["state"] == "healthy"
+        assert first["active_commit"] == stable_commit
+        assert store.read_status()["last_request_id"] == restart_request.request_id
+        assert queue.pending_request_ids() == [deploy_request.request_id]
+
+        second = service.process_next_request()
+        assert second is not None
+        assert second["state"] == "healthy"
+        assert second["active_commit"] == candidate_commit
+        assert store.read_status()["last_request_id"] == deploy_request.request_id
+        assert queue.pending_request_ids() == []
+        assert len(list(store.processed_requests_dir.glob("*.json"))) == 2
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "request_received" in events
+        assert "request_started" in events
+        assert "request_completed" in events
     finally:
         supervisor.stop_child()

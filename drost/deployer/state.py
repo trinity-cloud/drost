@@ -22,6 +22,22 @@ class DeployerStateStore:
         return self.config.state_dir / "requests"
 
     @property
+    def pending_requests_dir(self) -> Path:
+        return self.requests_dir / "pending"
+
+    @property
+    def inflight_requests_dir(self) -> Path:
+        return self.requests_dir / "inflight"
+
+    @property
+    def processed_requests_dir(self) -> Path:
+        return self.requests_dir / "processed"
+
+    @property
+    def failed_requests_dir(self) -> Path:
+        return self.requests_dir / "failed"
+
+    @property
     def locks_dir(self) -> Path:
         return self.config.state_dir / "locks"
 
@@ -44,6 +60,10 @@ class DeployerStateStore:
     def bootstrap(self) -> None:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         self.requests_dir.mkdir(parents=True, exist_ok=True)
+        self.pending_requests_dir.mkdir(parents=True, exist_ok=True)
+        self.inflight_requests_dir.mkdir(parents=True, exist_ok=True)
+        self.processed_requests_dir.mkdir(parents=True, exist_ok=True)
+        self.failed_requests_dir.mkdir(parents=True, exist_ok=True)
         self.locks_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         if not self.config.config_path.exists():
@@ -64,6 +84,8 @@ class DeployerStateStore:
             "state_dir": str(self.config.state_dir),
             "active_commit": "",
             "known_good_commit": "",
+            "active_request_id": "",
+            "active_request_type": "",
             "child_pid": None,
             "child_started_at": "",
             "child_exited_at": "",
