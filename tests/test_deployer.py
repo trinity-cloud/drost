@@ -123,6 +123,72 @@ def test_deployer_cli_request_enqueue_tracks_pending_request(tmp_path: Path, cap
     assert "request_received" in event_types
 
 
+def test_deployer_cli_operator_views_render_config_events_and_requests(tmp_path: Path, capsys) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    workspace_dir = tmp_path / "workspace"
+    state_dir = workspace_dir / "deployer"
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=workspace_dir,
+        state_dir=state_dir,
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+    queue = DeployerRequestQueue(store)
+    queue.enqueue("restart", requested_by="test", reason="inspect")
+
+    config_code = main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--workspace-dir",
+            str(workspace_dir),
+            "--state-dir",
+            str(state_dir),
+            "config",
+            "--json",
+        ]
+    )
+    config_out = json.loads(capsys.readouterr().out)
+    assert config_code == 0
+    assert config_out["repo_root"] == str(repo_root.resolve())
+
+    requests_code = main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--workspace-dir",
+            str(workspace_dir),
+            "--state-dir",
+            str(state_dir),
+            "requests",
+            "--json",
+        ]
+    )
+    requests_out = json.loads(capsys.readouterr().out)
+    assert requests_code == 0
+    assert requests_out["pending"][0]["type"] == "restart"
+
+    events_code = main(
+        [
+            "--repo-root",
+            str(repo_root),
+            "--workspace-dir",
+            str(workspace_dir),
+            "--state-dir",
+            str(state_dir),
+            "events",
+            "--limit",
+            "5",
+            "--json",
+        ]
+    )
+    events_out = json.loads(capsys.readouterr().out)
+    assert events_code == 0
+    assert any(row["event_type"] == "request_received" for row in events_out)
+
+
 def _write_child_script(path: Path, *, immediate_exit: bool = False) -> None:
     body = [
         "from __future__ import annotations",

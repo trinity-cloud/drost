@@ -90,6 +90,14 @@ class DeployerRequestQueue:
                     request_ids.append(request.request_id)
         return request_ids
 
+    def list_requests(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "inflight": [request.as_dict() for _, request in self._sorted_requests(self._store.inflight_requests_dir)],
+            "pending": [request.as_dict() for _, request in self._sorted_requests(self._store.pending_requests_dir)],
+            "processed": [request.as_dict() for _, request in self._sorted_requests(self._store.processed_requests_dir)],
+            "failed": [request.as_dict() for _, request in self._sorted_requests(self._store.failed_requests_dir)],
+        }
+
     def enqueue(
         self,
         request_type: str,

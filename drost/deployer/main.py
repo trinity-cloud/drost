@@ -30,6 +30,16 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Print deployer status.")
     status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
+    config_parser = subparsers.add_parser("config", help="Print resolved deployer config.")
+    config_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    events_parser = subparsers.add_parser("events", help="Print deployer events.")
+    events_parser.add_argument("--limit", type=int, default=20, help="Number of most recent events to print.")
+    events_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    requests_parser = subparsers.add_parser("requests", help="Print queued deployer requests.")
+    requests_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
     start_parser = subparsers.add_parser("start", help="Start Drost as a supervised child process.")
     start_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
@@ -127,10 +137,36 @@ def _print_status(status: dict[str, object], *, as_json: bool) -> None:
         print(_render_status_text(status))
 
 
+def _render_config_text(config: DeployerConfig) -> str:
+    lines = [
+        f"repo_root={config.repo_root}",
+        f"workspace_dir={config.workspace_dir}",
+        f"state_dir={config.state_dir}",
+        f"config_path={config.config_path}",
+        f"start_command={config.start_command}",
+        f"health_url={config.health_url}",
+        f"startup_grace_seconds={config.startup_grace_seconds}",
+        f"health_timeout_seconds={config.health_timeout_seconds}",
+        f"request_poll_interval_seconds={config.request_poll_interval_seconds}",
+        f"known_good_ref_name={config.known_good_ref_name}",
+    ]
+    return "\n".join(lines)
+
+
+def _tail_events(events_path: str, *, limit: int) -> list[dict[str, object]]:
+    from pathlib import Path
+
+    path = Path(events_path)
+    if not path.exists():
+        return []
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in lines[-max(1, int(limit)) :]]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    _, store = _load_state(args)
+    config, store = _load_state(args)
     supervisor = DeployerSupervisor(store)
     queue = DeployerRequestQueue(store)
     rollout = DeployerRolloutManager(store=store, supervisor=supervisor)
@@ -149,6 +185,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         status = supervisor.refresh_status()
         _print_status(status, as_json=bool(args.json))
+        return 0
+
+    if args.command == "config":
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "repo_root": str(config.repo_root),
+                        "workspace_dir": str(config.workspace_dir),
+                        "state_dir": str(config.state_dir),
+                        "config_path": str(config.config_path),
+                        "start_command": config.start_command,
+                        "health_url": config.health_url,
+                        "startup_grace_seconds": config.startup_grace_seconds,
+                        "health_timeout_seconds": config.health_timeout_seconds,
+                        "request_poll_interval_seconds": config.request_poll_interval_seconds,
+                        "known_good_ref_name": config.known_good_ref_name,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(_render_config_text(config))
+        return 0
+
+    if args.command == "events":
+        payload = _tail_events(str(store.events_path), limit=int(args.limit))
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            for row in payload:
+                print(json.dumps(row, sort_keys=True))
+        return 0
+
+    if args.command == "requests":
+        payload = queue.list_requests()
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     try:

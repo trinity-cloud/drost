@@ -187,6 +187,106 @@ Current scope:
 - automatic rollback to the last known-good commit when candidate validation fails
 - degraded-mode fallback when rollback cannot recover the runtime
 
+### Sample config
+
+A sample deployer config is included at:
+
+- `examples/deployer.config.toml`
+
+The active runtime config is written to:
+
+- `~/.drost/deployer/config.toml`
+
+You can inspect the resolved config at any time:
+
+```bash
+uv run drost-deployer config
+```
+
+### Recommended local operator flow
+
+1. Start Drost under the deployer:
+
+```bash
+uv run drost-deployer run
+```
+
+2. In another shell, inspect status:
+
+```bash
+uv run drost-deployer status
+```
+
+3. Once the runtime is healthy, promote the current commit to known-good:
+
+```bash
+uv run drost-deployer promote
+```
+
+4. Queue deploy-affecting actions instead of improvising shell restarts:
+
+```bash
+uv run drost-deployer request restart --reason "reload runtime"
+uv run drost-deployer request deploy HEAD --reason "candidate self-edit"
+uv run drost-deployer request rollback --reason "operator rollback"
+```
+
+5. Inspect queue and events while the service loop is running:
+
+```bash
+uv run drost-deployer requests
+uv run drost-deployer events --limit 20
+```
+
+### Manual recovery
+
+If deployer state goes degraded, use this sequence:
+
+1. Inspect deployer state:
+
+```bash
+uv run drost-deployer status
+uv run drost-deployer events --limit 50
+```
+
+2. Check the current repo checkout:
+
+```bash
+git rev-parse HEAD
+cat ~/.drost/deployer/known_good.json
+```
+
+3. Force rollback to the known-good commit:
+
+```bash
+uv run drost-deployer rollback
+```
+
+4. If needed, force a specific target:
+
+```bash
+uv run drost-deployer rollback --to-ref <commit-or-ref>
+```
+
+### Local rollout test
+
+Minimal manual acceptance path:
+
+1. Start `uv run drost-deployer run`
+2. Wait for `uv run drost-deployer status` to report `state=healthy`
+3. Run `uv run drost-deployer promote`
+4. Make and commit a safe code change
+5. Run `uv run drost-deployer request deploy HEAD --reason "manual rollout test"`
+6. Confirm status returns to `healthy`
+7. Inspect `~/.drost/deployer/events.jsonl`
+
+Broken-candidate test:
+
+1. Commit an intentionally bad candidate
+2. Queue `uv run drost-deployer request deploy HEAD --reason "rollback test"`
+3. Confirm deployer rolls back automatically to the last known-good commit
+4. Confirm the rollback is visible in `status.json` and `events.jsonl`
+
 ## Where Things Live
 
 This is important because Drost has two different roots.
