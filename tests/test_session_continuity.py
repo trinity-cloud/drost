@@ -110,6 +110,7 @@ async def test_session_continuity_manager_generates_and_persists_summary(tmp_pat
         store=store,
         sessions_dir=sessions,
         provider_getter=lambda: provider,
+        embed_document=lambda text, title=None: _embed_constant(text, title),
         enabled=True,
         source_max_messages=50,
         source_max_chars=12_000,
@@ -132,6 +133,13 @@ async def test_session_continuity_manager_generates_and_persists_summary(tmp_pat
     continuity = store.get_session_continuity(to_key)
     assert continuity is not None
     assert "Improve memory continuity" in continuity["summary"]
+    rows = store.search_memory(
+        query_text="memory continuity prompt injection",
+        query_embedding=[0.25] * 64,
+        limit=5,
+    )
+    assert rows
+    assert rows[0]["source_kind"] == "session_continuity"
     assert provider.calls
     assert "continuity handoff" in str(provider.calls[0]["system"]).lower()
     prompt = str(provider.calls[0]["messages"][0].content or "")
@@ -169,3 +177,8 @@ async def test_session_continuity_schedule_skips_when_no_prior_messages(tmp_path
     assert result["queued"] is False
     assert "no prior messages" in result["message"].lower()
     store.close()
+
+
+async def _embed_constant(text: str, title: str | None = None) -> list[float]:
+    _ = text, title
+    return [0.25] * 64

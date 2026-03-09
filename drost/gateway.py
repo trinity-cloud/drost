@@ -60,6 +60,7 @@ class Gateway:
             store=self.store,
             sessions_dir=settings.workspace_dir / "sessions",
             provider_getter=self.providers.get,
+            embed_document=self.embeddings.embed_document,
             enabled=settings.memory_continuity_enabled,
             auto_on_new=settings.memory_continuity_auto_on_new,
             source_max_messages=settings.memory_continuity_source_max_messages,

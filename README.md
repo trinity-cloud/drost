@@ -135,6 +135,12 @@ Session continuity:
 - `/new` schedules a background carryover summary from the prior session into the new one
 - continuity is stored as an internal session artifact, not as a visible chat message
 - the continuity summary is injected into early turns of the new session prompt
+- continuity is also indexed as a searchable memory source
+
+Prompt-time memory capsule:
+- before each turn, Drost assembles a bounded memory capsule from ranked memory sources
+- the capsule prefers `MEMORY.md`, session continuity, recent daily notes, and entity summaries
+- transcript snippets are only used as fallback when higher-order memory is weak
 
 ## Workspace Bootstrap
 

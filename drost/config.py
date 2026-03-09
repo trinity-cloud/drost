@@ -74,6 +74,8 @@ class Settings(BaseSettings):
     memory_continuity_summary_max_tokens: int = 1_500
     memory_continuity_summary_max_chars: int = 12_000
     memory_continuity_inject_until_messages: int = 12
+    memory_capsule_enabled: bool = True
+    memory_capsule_search_limit: int = 18
 
     session_history_limit: int = 64
 
@@ -192,6 +194,7 @@ class Settings(BaseSettings):
         "memory_continuity_summary_max_tokens",
         "memory_continuity_summary_max_chars",
         "memory_continuity_inject_until_messages",
+        "memory_capsule_search_limit",
         "context_budget_total_tokens",
         "context_budget_system_tokens",
         "context_budget_history_tokens",

@@ -15,6 +15,7 @@ from drost.context_budget import (
     truncate_text_to_budget,
 )
 from drost.embeddings import EmbeddingService
+from drost.memory_capsule import MemoryCapsuleBuilder
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
 from drost.storage import (
@@ -55,6 +56,7 @@ class AgentRuntime:
             store=store,
             embeddings=embeddings,
         )
+        self._memory_capsule_builder = MemoryCapsuleBuilder(settings)
         self._last_run: dict[str, Any] | None = None
 
     @property
@@ -277,14 +279,26 @@ class AgentRuntime:
 
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []
+        memory_block = ""
+        continuity_summary = self._load_continuity_summary(session_key)
         if self._settings.memory_enabled and query_text:
             await self._workspace_memory_indexer.sync()
             query_embedding = await self._embeddings.embed_query(query_text)
             memories = self._store.search_memory(
                 query_text=query_text,
                 query_embedding=query_embedding,
-                limit=self._settings.memory_top_k,
+                limit=max(
+                    int(self._settings.memory_top_k),
+                    int(self._settings.memory_capsule_search_limit),
+                ),
             )
+            memory_block = self._memory_capsule_builder.build(
+                query_text=query_text,
+                candidates=memories,
+                continuity_summary=continuity_summary,
+            )
+            if not memory_block:
+                memory_block = self._build_memory_block(memories)
 
         raw_history_rows = self._store.read_history(
             session_key,
@@ -320,12 +334,10 @@ class AgentRuntime:
             current_session_key=lambda: session_key,
         )
         tool_names = list(dict.fromkeys([*tool_registry.names(), *internal_loop_tool_names()]))
-        memory_block = self._build_memory_block(memories)
-        continuity_summary = self._load_continuity_summary(session_key)
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,
             memory_block=memory_block,
-            continuity_summary=continuity_summary,
+            continuity_summary="" if memory_block else continuity_summary,
             history_summary=history_summary,
             provider_name=provider.name,
             tool_names=tool_names,

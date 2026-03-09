@@ -5,7 +5,7 @@ import json
 import logging
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +57,7 @@ class SessionContinuityManager:
         store: SQLiteStore,
         sessions_dir: Path,
         provider_getter: Callable[[], BaseProvider],
+        embed_document: Callable[[str, str | None], Awaitable[list[float]]] | None = None,
         enabled: bool,
         auto_on_new: bool = True,
         source_max_messages: int = 120,
@@ -68,6 +69,7 @@ class SessionContinuityManager:
         self._store = store
         self._sessions_dir = Path(sessions_dir).expanduser()
         self._provider_getter = provider_getter
+        self._embed_document = embed_document
         self._enabled = bool(enabled)
         self._auto_on_new = bool(auto_on_new)
         self._source_max_messages = max(10, int(source_max_messages))
@@ -150,6 +152,22 @@ class SessionContinuityManager:
                     from_session_key=req.from_session_key,
                     from_session_id=req.from_session_id,
                     summary=summary[: self._summary_max_chars],
+                )
+                embedding: list[float] = []
+                if self._embed_document is not None:
+                    try:
+                        embedding = await self._embed_document(
+                            summary,
+                            f"continuity/{req.from_session_id}",
+                        )
+                    except Exception:
+                        logger.warning("Continuity embedding failed; storing keyword-only continuity row", exc_info=True)
+                self._store.replace_session_continuity_memory(
+                    to_session_key=req.to_session_key,
+                    from_session_key=req.from_session_key,
+                    from_session_id=req.from_session_id,
+                    summary=summary[: self._summary_max_chars],
+                    embedding=embedding,
                 )
                 self._completed_jobs += 1
                 self._last_completed_at = datetime.now(UTC).isoformat()

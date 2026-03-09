@@ -6,10 +6,15 @@ import struct
 import threading
 from contextlib import suppress
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from drost.storage.keys import parse_session_key, session_key_for_telegram_chat
+from drost.storage.keys import (
+    parse_session_key,
+    session_key_for_telegram_chat,
+    session_key_to_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -622,12 +627,41 @@ class SQLiteStore:
                 "DELETE FROM session_continuity WHERE to_session_key = ?",
                 (session_key,),
             )
+            self._delete_memory_rows_for_session_source(
+                session_key=session_key,
+                source_kind="session_continuity",
+            )
             self._conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
                 (self._utc_now(), session_key),
             )
             self._conn.commit()
             return int(cursor.rowcount)
+
+    def _delete_memory_rows_for_session_source(self, *, session_key: str, source_kind: str) -> None:
+        cleaned_session = str(session_key or "").strip()
+        cleaned_kind = str(source_kind or "").strip()
+        if not cleaned_session or not cleaned_kind:
+            return
+        ids = [
+            int(row["id"])
+            for row in self._conn.execute(
+                """
+                SELECT id
+                  FROM memory_chunks
+                 WHERE session_key = ?
+                   AND source_kind = ?
+                """,
+                (cleaned_session, cleaned_kind),
+            ).fetchall()
+        ]
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        self._conn.execute(f"DELETE FROM memory_fts WHERE rowid IN ({placeholders})", ids)
+        if self._vector_enabled:
+            self._conn.execute(f"DELETE FROM memory_vec WHERE id IN ({placeholders})", ids)
+        self._conn.execute(f"DELETE FROM memory_chunks WHERE id IN ({placeholders})", ids)
 
     def set_session_continuity(
         self,
@@ -696,6 +730,47 @@ class SQLiteStore:
             "created_at": str(row["created_at"] or ""),
             "updated_at": str(row["updated_at"] or ""),
         }
+
+    def replace_session_continuity_memory(
+        self,
+        *,
+        to_session_key: str,
+        from_session_key: str,
+        from_session_id: str,
+        summary: str,
+        embedding: list[float],
+    ) -> None:
+        cleaned_to = str(to_session_key or "").strip()
+        cleaned_from = str(from_session_key or "").strip()
+        cleaned_summary = str(summary or "").strip()
+        if not cleaned_to or not cleaned_from or not cleaned_summary:
+            return
+
+        with self._lock:
+            self._ensure_session_row(cleaned_to)
+            self._delete_memory_rows_for_session_source(
+                session_key=cleaned_to,
+                source_kind="session_continuity",
+            )
+            now = self._utc_now()
+            title = f"continuity/{str(from_session_id or '').strip() or 'previous'}"
+            path = f"sessions/{session_key_to_filename(cleaned_to)}.continuity.md"
+            self._insert_memory_chunk(
+                session_key=cleaned_to,
+                role="system",
+                content=cleaned_summary,
+                embedding=embedding,
+                source_kind="session_continuity",
+                path=path,
+                line_start=1,
+                line_end=max(1, len(cleaned_summary.splitlines())),
+                title=title,
+                derived_from=cleaned_from,
+                content_hash=sha256(cleaned_summary.encode("utf-8")).hexdigest(),
+                created_at=now,
+                updated_at=now,
+            )
+            self._conn.commit()
 
     # --- Memory helpers --------------------------------------------------
 
