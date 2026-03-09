@@ -163,6 +163,24 @@ For local health validation, Drost derives:
 
 - `http://127.0.0.1:8766/health`
 
+## Deployer Skeleton
+
+Drost now ships an external deployer entry point:
+
+```bash
+uv run drost-deployer --help
+```
+
+Current Phase 2 scope:
+
+- deployer config loading
+- external state bootstrap under `~/.drost/deployer`
+- status file
+- known-good record
+- append-only event log
+
+It is a control-plane skeleton today. Process supervision, health-gated promotion, and rollback land in later phases.
+
 ## Where Things Live
 
 This is important because Drost has two different roots.
