@@ -89,6 +89,17 @@ class _FakeTelegramMessage:
         self.answers.append({"text": text, "parse_mode": parse_mode})
 
 
+class _FakeInboundTelegramMessage:
+    def __init__(self, chat_id: int, text: str, *, message_id: int = 77) -> None:
+        self.chat = SimpleNamespace(id=chat_id, type="private")
+        self.from_user = SimpleNamespace(id=999, is_bot=False, username="migel", first_name="Migel")
+        self.text = text
+        self.message_id = message_id
+        self.caption = None
+        self.photo = None
+        self.document = None
+
+
 def _build_channel(monkeypatch: pytest.MonkeyPatch, bot: _FakeBot) -> TelegramChannel:
     monkeypatch.setattr("drost.channels.telegram.Bot", lambda token: bot)
     return TelegramChannel(
@@ -237,3 +248,76 @@ async def test_new_session_calls_continuity_handler(monkeypatch: pytest.MonkeyPa
     assert message.answers
     assert "New session active: s_next" in str(message.answers[0]["text"])
     assert "Continuity queued from s_prev to s_next." in str(message.answers[0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_route_context_streams_working_message_before_final_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _FakeBot(token="test-token")
+    channel = _build_channel(monkeypatch, bot)
+    message = _FakeInboundTelegramMessage(chat_id=123, text="hello")
+
+    async def _handler(context: dict[str, object]) -> str:
+        status_callback = context["status_callback"]
+        answer_stream_callback = context["answer_stream_callback"]
+        assert callable(status_callback)
+        assert callable(answer_stream_callback)
+        await status_callback("Thinking...")
+        await answer_stream_callback("Partial")
+        await asyncio.sleep(0.4)
+        await answer_stream_callback("Partial answer")
+        await asyncio.sleep(0.4)
+        return "Final **answer**"
+
+    channel.set_message_handler(_handler)
+
+    await channel._route_context(message, text="hello", media=None)
+
+    plain_text_edits = [edit for edit in bot.edited if edit["parse_mode"] is None]
+    html_edits = [edit for edit in bot.edited if edit["parse_mode"] == "HTML"]
+
+    assert bot.sent[0]["text"] == "Working..."
+    assert any(edit["text"] == "Thinking..." for edit in plain_text_edits)
+    assert any(edit["text"] == "Partial" for edit in plain_text_edits)
+    assert any(edit["text"] == "Partial answer" for edit in plain_text_edits)
+    assert html_edits
+    assert "<b>answer</b>" in str(html_edits[-1]["text"])
+
+
+@pytest.mark.asyncio
+async def test_route_context_preserves_streamed_text_when_tool_phase_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _FakeBot(token="test-token")
+    channel = _build_channel(monkeypatch, bot)
+    message = _FakeInboundTelegramMessage(chat_id=123, text="hello")
+
+    async def _handler(context: dict[str, object]) -> str:
+        status_callback = context["status_callback"]
+        answer_stream_callback = context["answer_stream_callback"]
+        assert callable(status_callback)
+        assert callable(answer_stream_callback)
+        await answer_stream_callback("Brain surgery on yourself.")
+        await asyncio.sleep(0.4)
+        await answer_stream_callback(None)
+        await status_callback("Using tools: file_write")
+        await asyncio.sleep(0.1)
+        return "Noted. Source code = handle with extreme care."
+
+    channel.set_message_handler(_handler)
+
+    await channel._route_context(message, text="hello", media=None)
+
+    assert len(bot.sent) == 2
+    assert bot.sent[0]["text"] == "Working..."
+    assert bot.sent[1]["text"] == "Working..."
+
+    html_edits = [edit for edit in bot.edited if edit["parse_mode"] == "HTML"]
+    plain_text_edits = [edit for edit in bot.edited if edit["parse_mode"] is None]
+
+    assert any("Brain surgery on yourself." in str(edit["text"]) for edit in html_edits)
+    assert any(str(edit["text"]) == "Using tools: file_write" for edit in plain_text_edits)
+    assert any(
+        "Noted. Source code = handle with extreme care." in str(edit["text"]) for edit in html_edits
+    )

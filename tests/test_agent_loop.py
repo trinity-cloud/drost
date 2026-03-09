@@ -183,6 +183,22 @@ class ToolThenPlainTextProvider(_BaseFakeProvider):
         yield StreamDelta(content="done")
 
 
+class PlainTextStreamingProvider(_BaseFakeProvider):
+    async def chat_stream(
+        self,
+        messages: list[Message],
+        *,
+        system: str | None = None,
+        tools: list[object] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        stop_sequences: list[str] | None = None,
+    ) -> AsyncIterator[StreamDelta]:
+        _ = messages, system, tools, max_tokens, temperature, stop_sequences
+        yield StreamDelta(content="Hello")
+        yield StreamDelta(content=" world")
+
+
 class ToolThenPlainTextThenFinishProvider(_BaseFakeProvider):
     def __init__(self) -> None:
         self.calls = 0
@@ -375,6 +391,33 @@ async def test_agent_loop_emits_status_updates(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_streams_plain_text_answer_updates(tmp_path) -> None:
+    settings = Settings(workspace_dir=tmp_path)
+    registry = ToolRegistry()
+    runner = DefaultSingleLoopRunner(
+        provider=PlainTextStreamingProvider(),
+        tool_registry=registry,
+        settings=settings,
+    )
+
+    updates: list[str | None] = []
+
+    async def _answer(text: str | None) -> None:
+        updates.append(text)
+
+    result = await runner.run_turn(
+        messages=[Message(role=MessageRole.USER, content="hi")],
+        system_prompt="system",
+        answer_stream_callback=_answer,
+    )
+
+    assert result.final_text == "Hello world"
+    assert updates[0] is None
+    assert "Hello" in updates
+    assert updates[-1] == "Hello world"
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_requires_explicit_finish_after_tool_use(tmp_path) -> None:
     settings = Settings(workspace_dir=tmp_path, agent_max_iterations=3)
     registry = ToolRegistry()
@@ -468,6 +511,33 @@ async def test_agent_loop_adds_ephemeral_user_ping_for_providers_requiring_user_
     )
     assert result.final_text == "done after controller user ping"
     assert provider.saw_controller_user_ping
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_animates_loop_finish_response_into_answer_stream(tmp_path) -> None:
+    settings = Settings(workspace_dir=tmp_path)
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    runner = DefaultSingleLoopRunner(
+        provider=ToolThenFinishProvider(),
+        tool_registry=registry,
+        settings=settings,
+    )
+
+    updates: list[str | None] = []
+
+    async def _answer(text: str | None) -> None:
+        updates.append(text)
+
+    result = await runner.run_turn(
+        messages=[Message(role=MessageRole.USER, content="hi")],
+        system_prompt="system",
+        answer_stream_callback=_answer,
+    )
+
+    assert result.final_text == "done"
+    assert updates[0] is None
+    assert updates[-1] == "done"
 
 
 @pytest.mark.asyncio

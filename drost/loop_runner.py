@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 from typing import Protocol
 
 from drost.providers import Message
 
 StatusCallback = Callable[[str], Awaitable[None]]
+AnswerStreamCallback = Callable[[str | None], Awaitable[None]]
 
 
 @dataclass
@@ -28,5 +29,6 @@ class LoopRunner(Protocol):
         messages: list[Message],
         system_prompt: str,
         status_callback: StatusCallback | None = None,
+        answer_stream_callback: AnswerStreamCallback | None = None,
     ) -> LoopRunResult:
         ...

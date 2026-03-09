@@ -188,6 +188,7 @@ class AgentRuntime:
         session_id: str | None,
         media: list[dict[str, Any]] | None = None,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
+        answer_stream_callback: Callable[[str | None], Awaitable[None]] | None = None,
     ) -> str:
         requested_sid = (session_id or "").strip()
         if requested_sid == "legacy-main":
@@ -214,6 +215,7 @@ class AgentRuntime:
                 text=text,
                 media=media,
                 status_callback=status_callback,
+                answer_stream_callback=answer_stream_callback,
             )
 
     @staticmethod
@@ -266,6 +268,7 @@ class AgentRuntime:
         text: str,
         media: list[dict[str, Any]] | None = None,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
+        answer_stream_callback: Callable[[str | None], Awaitable[None]] | None = None,
     ) -> str:
         started = time.monotonic()
         normalized_media = self._normalize_media(media)
@@ -354,6 +357,7 @@ class AgentRuntime:
                 messages=provider_messages,
                 system_prompt=system_prompt,
                 status_callback=status_callback,
+                answer_stream_callback=answer_stream_callback,
             )
             assistant_text = str(run.final_text or "").strip()
             if not assistant_text:

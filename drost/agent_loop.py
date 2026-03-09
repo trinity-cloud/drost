@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from drost.config import Settings
-from drost.loop_runner import LoopRunResult, StatusCallback
+from drost.loop_runner import AnswerStreamCallback, LoopRunResult, StatusCallback
 from drost.providers import BaseProvider, Message, MessageRole, ToolDefinition, ToolResult
 from drost.tools import ToolRegistry
 
@@ -74,6 +74,18 @@ class DefaultSingleLoopRunner:
             await status_callback(text)
         except Exception:
             logger.debug("Status callback failed", exc_info=True)
+
+    @staticmethod
+    async def _emit_answer_stream(
+        answer_stream_callback: AnswerStreamCallback | None,
+        text: str | None,
+    ) -> None:
+        if answer_stream_callback is None:
+            return
+        try:
+            await answer_stream_callback(text)
+        except Exception:
+            logger.debug("Answer stream callback failed", exc_info=True)
 
     @staticmethod
     def _utc_now() -> str:
@@ -550,6 +562,41 @@ class DefaultSingleLoopRunner:
             logger.debug("Failed to append trace", exc_info=True)
 
     @staticmethod
+    def _stream_chunks(text: str, *, chunk_size: int = 96) -> list[str]:
+        cleaned = str(text or "")
+        if not cleaned:
+            return []
+        chunks: list[str] = []
+        cursor = 0
+        while cursor < len(cleaned):
+            end = min(len(cleaned), cursor + chunk_size)
+            if end < len(cleaned):
+                split = cleaned.rfind(" ", cursor, end)
+                if split > cursor + (chunk_size // 2):
+                    end = split + 1
+            chunks.append(cleaned[cursor:end])
+            cursor = end
+        return chunks
+
+    async def _animate_final_response(
+        self,
+        answer_stream_callback: AnswerStreamCallback | None,
+        text: str,
+    ) -> None:
+        if answer_stream_callback is None:
+            return
+        chunks = self._stream_chunks(text)
+        if not chunks:
+            await self._emit_answer_stream(answer_stream_callback, text)
+            return
+        current = ""
+        for idx, chunk in enumerate(chunks):
+            current += chunk
+            await self._emit_answer_stream(answer_stream_callback, current)
+            if idx != len(chunks) - 1:
+                await asyncio.sleep(0.035)
+
+    @staticmethod
     def _add_usage_delta(
         *,
         total_usage: dict[str, int],
@@ -574,6 +621,7 @@ class DefaultSingleLoopRunner:
         messages: list[Message],
         system_prompt: str,
         status_callback: StatusCallback | None = None,
+        answer_stream_callback: AnswerStreamCallback | None = None,
     ) -> LoopRunResult:
         run_id = uuid.uuid4().hex
         total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -591,6 +639,7 @@ class DefaultSingleLoopRunner:
         controller_notice = ""
 
         await self._emit_status(status_callback, "Thinking...")
+        await self._emit_answer_stream(answer_stream_callback, None)
 
         for iteration in range(max_iterations):
             if (time.monotonic() - started) > run_timeout:
@@ -600,6 +649,7 @@ class DefaultSingleLoopRunner:
             assistant_text_parts: list[str] = []
             tool_calls = []
             iter_last_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+            streamed_answer_text = ""
             provider_messages = messages
             if (
                 controller_notice
@@ -635,7 +685,12 @@ class DefaultSingleLoopRunner:
                         )
                     if delta.content:
                         assistant_text_parts.append(delta.content)
+                        streamed_answer_text += delta.content
+                        await self._emit_answer_stream(answer_stream_callback, streamed_answer_text)
                     if delta.tool_call:
+                        if streamed_answer_text:
+                            streamed_answer_text = ""
+                            await self._emit_answer_stream(answer_stream_callback, None)
                         tool_calls.append(delta.tool_call)
             except Exception as exc:
                 logger.exception("Provider streaming failed during agent loop")
@@ -768,6 +823,7 @@ class DefaultSingleLoopRunner:
                     f"or call `{LOOP_BLOCKED}` with reason/ask_user."
                 )
                 controller_notice = reminder
+                await self._emit_answer_stream(answer_stream_callback, None)
                 await self._emit_status(status_callback, "Awaiting explicit run stop signal...")
                 continue
 
@@ -775,6 +831,7 @@ class DefaultSingleLoopRunner:
                 status_callback,
                 "Using tools: " + ", ".join(tc.name for tc in tool_calls),
             )
+            await self._emit_answer_stream(answer_stream_callback, None)
             controller_notice = ""
             tool_results: list[ToolResult] = []
             has_non_internal_tools = any(
@@ -850,6 +907,10 @@ class DefaultSingleLoopRunner:
                         "result_preview": str(raw)[:500],
                     },
                 )
+                if tool_call.name == LOOP_FINISH and not is_error:
+                    final_response = str(tool_call.arguments.get("final_response") or "").strip()
+                    if final_response:
+                        await self._animate_final_response(answer_stream_callback, final_response)
                 tool_results.append(
                     ToolResult(
                         tool_call_id=tool_call.id,

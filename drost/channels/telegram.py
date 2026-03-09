@@ -614,39 +614,138 @@ class TelegramChannel(BaseChannel):
             parse_mode=None,
             reply_to_message_id=message.message_id,
         )
-        working_id = int(working.message_id)
+        working_ref = {"message_id": int(working.message_id)}
         status_lock = asyncio.Lock()
-        status_cache = {"text": "Working..."}
+        render_state = {
+            "status_text": "Working...",
+            "stream_text": "",
+            "stream_active": False,
+            "last_sent_text": "",
+            "last_edit_at": 0.0,
+            "flush_task": None,
+        }
+
+        async def _render_locked(*, force: bool) -> None:
+            target = (
+                str(render_state["stream_text"]).strip()
+                if bool(render_state["stream_active"]) and str(render_state["stream_text"]).strip()
+                else str(render_state["status_text"]).strip()
+            )
+            if not target:
+                target = "Working..."
+            if target == str(render_state["last_sent_text"]):
+                return
+
+            now = time.monotonic()
+            if not force and (now - float(render_state["last_edit_at"])) < 0.35:
+                flush_task = render_state["flush_task"]
+                if not isinstance(flush_task, asyncio.Task) or flush_task.done():
+                    async def _flush() -> None:
+                        try:
+                            await asyncio.sleep(0.35)
+                            async with status_lock:
+                                render_state["flush_task"] = None
+                                await _render_locked(force=True)
+                        except asyncio.CancelledError:
+                            return
+
+                    render_state["flush_task"] = asyncio.create_task(_flush())
+                return
+
+            render_state["last_sent_text"] = target
+            render_state["last_edit_at"] = now
+            await self._edit_message(chat_id, int(working_ref["message_id"]), target)
+
+        async def _cancel_flush_locked() -> None:
+            flush_task = render_state["flush_task"]
+            if isinstance(flush_task, asyncio.Task) and not flush_task.done():
+                flush_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await flush_task
+            render_state["flush_task"] = None
+
+        async def _split_stream_segment_locked() -> None:
+            preserved = str(render_state["stream_text"]).strip()
+            if not preserved:
+                render_state["stream_text"] = ""
+                render_state["stream_active"] = False
+                return
+
+            await _cancel_flush_locked()
+            await self._finalize_working_message(
+                chat_id=chat_id,
+                message_id=int(working_ref["message_id"]),
+                text=preserved,
+                reply_to=message.message_id,
+            )
+
+            next_status = str(render_state["status_text"]).strip() or "Working..."
+            next_working = await self.bot.send_message(
+                chat_id,
+                next_status,
+                parse_mode=None,
+            )
+            working_ref["message_id"] = int(next_working.message_id)
+            render_state["status_text"] = next_status
+            render_state["stream_text"] = ""
+            render_state["stream_active"] = False
+            render_state["last_sent_text"] = next_status
+            render_state["last_edit_at"] = 0.0
+            render_state["flush_task"] = None
 
         async def _status_callback(status_text: str) -> None:
             cleaned = str(status_text or "").strip()
             if not cleaned:
                 return
             async with status_lock:
-                if cleaned == status_cache["text"]:
+                if cleaned == str(render_state["status_text"]):
                     return
-                status_cache["text"] = cleaned
-                await self._edit_message(chat_id, working_id, cleaned)
+                render_state["status_text"] = cleaned
+                if not bool(render_state["stream_active"]):
+                    await _render_locked(force=False)
+
+        async def _answer_stream_callback(text: str | None) -> None:
+            async with status_lock:
+                if text is None:
+                    if str(render_state["stream_text"]).strip():
+                        await _split_stream_segment_locked()
+                        return
+                    render_state["stream_active"] = False
+                    render_state["stream_text"] = ""
+                else:
+                    render_state["stream_active"] = True
+                    render_state["stream_text"] = str(text)
+                await _render_locked(force=False)
 
         context["status_callback"] = _status_callback
+        context["answer_stream_callback"] = _answer_stream_callback
 
         try:
             reply = await self._message_handler(context)
         except Exception:
             logger.exception("Error handling inbound Telegram message")
-            await self._edit_message(chat_id, working_id, "Internal error while processing message.")
+            async with status_lock:
+                await _cancel_flush_locked()
+            await self._edit_message(
+                chat_id,
+                int(working_ref["message_id"]),
+                "Internal error while processing message.",
+            )
             return
+
+        async with status_lock:
+            await _cancel_flush_locked()
 
         if reply:
             await self._finalize_working_message(
                 chat_id=chat_id,
-                message_id=working_id,
+                message_id=int(working_ref["message_id"]),
                 text=reply,
                 reply_to=message.message_id,
             )
             return
 
-        await self._edit_message(chat_id, working_id, "No response generated.")
+        await self._edit_message(chat_id, int(working_ref["message_id"]), "No response generated.")
 
     def _setup_handlers(self) -> None:
         self.router.message.register(self._handle_start, Command("start"))

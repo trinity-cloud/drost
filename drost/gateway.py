@@ -99,12 +99,14 @@ class Gateway:
         chat_id = int(context.get("chat_id") or 0)
         session_id = context.get("session_id")
         status_callback = context.get("status_callback")
+        answer_stream_callback = context.get("answer_stream_callback")
         return await self.agent.respond(
             chat_id=chat_id,
             text=text,
             session_id=(str(session_id).strip() if session_id is not None else None),
             media=media,
             status_callback=status_callback if callable(status_callback) else None,
+            answer_stream_callback=answer_stream_callback if callable(answer_stream_callback) else None,
         )
 
     async def _handle_new_session_transition(self, payload: dict[str, Any]) -> dict[str, Any]:
