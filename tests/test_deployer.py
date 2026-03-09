@@ -726,3 +726,32 @@ def test_deployer_service_processes_requests_fifo(tmp_path: Path) -> None:
         assert "request_completed" in events
     finally:
         supervisor.stop_child()
+
+
+def test_deployer_service_reclaims_child_from_stale_supervisor(tmp_path: Path) -> None:
+    config, store, supervisor, _rollout, _queue, service = _make_health_service_runtime(tmp_path)
+    _commit_health_state(config.repo_root, mode="ok", message="stable")
+    marker = tmp_path / "health-marker.txt"
+
+    try:
+        started = supervisor.start_child()
+        _wait_for_path(marker)
+        first_child_pid = int(started["child_pid"])
+
+        status = store.read_status()
+        status["state"] = "healthy"
+        status["supervisor_pid"] = 1
+        store.write_status(status)
+
+        reclaimed = service.ensure_runtime()
+
+        assert reclaimed["state"] == "healthy"
+        assert isinstance(reclaimed["supervisor_pid"], int)
+        assert reclaimed["supervisor_pid"] > 1
+        assert int(reclaimed["child_pid"]) != first_child_pid
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "child_reclaim_started" in events
+        assert "child_reclaim_succeeded" in events
+    finally:
+        supervisor.stop_child()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import signal
 import time
 from typing import Any
@@ -37,6 +38,30 @@ class DeployerService:
     def ensure_runtime(self) -> dict[str, Any]:
         status = self._supervisor.refresh_status()
         if isinstance(status.get("child_pid"), int) and int(status["child_pid"]) > 0:
+            supervisor_pid = status.get("supervisor_pid")
+            if not isinstance(supervisor_pid, int) or supervisor_pid != os.getpid():
+                self._store.append_event(
+                    "child_reclaim_started",
+                    previous_supervisor_pid=supervisor_pid,
+                    child_pid=status.get("child_pid"),
+                )
+                self._write_status(state="reclaiming_child", last_error="")
+                self._supervisor.restart_child()
+                status = self._rollout.healthcheck()
+                if status.get("state") == "healthy":
+                    self._store.append_event(
+                        "child_reclaim_succeeded",
+                        supervisor_pid=os.getpid(),
+                        child_pid=status.get("child_pid"),
+                    )
+                    return self._refresh_pending_ids()
+                self._store.append_event(
+                    "child_reclaim_failed",
+                    supervisor_pid=os.getpid(),
+                    child_pid=status.get("child_pid"),
+                    last_error=status.get("last_error"),
+                )
+                return status
             if status.get("state") != "healthy":
                 return self._rollout.healthcheck()
             return self._refresh_pending_ids()

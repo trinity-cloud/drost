@@ -94,6 +94,7 @@ class DeployerStateStore:
             "known_good_commit": "",
             "active_request_id": "",
             "active_request_type": "",
+            "supervisor_pid": None,
             "child_pid": None,
             "child_started_at": "",
             "child_exited_at": "",

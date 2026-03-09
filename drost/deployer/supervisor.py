@@ -119,6 +119,7 @@ class DeployerSupervisor:
                 "workspace_dir": str(self._store.config.workspace_dir),
                 "state_dir": str(self._store.config.state_dir),
                 "active_commit": active_commit,
+                "supervisor_pid": os.getpid(),
                 "child_pid": int(pid),
                 "child_started_at": _utc_now(),
                 "child_exited_at": "",
@@ -135,6 +136,7 @@ class DeployerSupervisor:
             status.update(
                 {
                     "state": "idle",
+                    "supervisor_pid": None,
                     "child_pid": None,
                     "child_exited_at": status.get("child_exited_at") or _utc_now(),
                 }
@@ -205,6 +207,7 @@ class DeployerSupervisor:
         status.update(
             {
                 "state": "idle",
+                "supervisor_pid": None,
                 "child_pid": None,
                 "child_exited_at": _utc_now(),
                 "child_returncode": returncode,
@@ -266,6 +269,7 @@ class DeployerSupervisor:
                     status.update(
                         {
                             "state": "idle",
+                            "supervisor_pid": None,
                             "child_pid": None,
                             "child_exited_at": _utc_now(),
                             "child_returncode": returncode,

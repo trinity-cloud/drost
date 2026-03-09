@@ -117,6 +117,7 @@ def _render_status_text(status: dict[str, object]) -> str:
         f"active_request_id={status.get('active_request_id') or ''}",
         f"active_request_type={status.get('active_request_type') or ''}",
         f"pending_request_ids={status.get('pending_request_ids') or []}",
+        f"supervisor_pid={status.get('supervisor_pid')}",
         f"child_pid={status.get('child_pid')}",
         f"child_started_at={status.get('child_started_at') or ''}",
         f"child_exited_at={status.get('child_exited_at') or ''}",
