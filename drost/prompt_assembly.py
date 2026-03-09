@@ -41,6 +41,7 @@ class PromptAssembler:
         *,
         base_prompt: str,
         memory_block: str = "",
+        continuity_summary: str = "",
         history_summary: str = "",
         provider_name: str = "",
         tool_names: list[str] | None = None,
@@ -62,6 +63,9 @@ class PromptAssembler:
 
         sections.append(self._build_workspace_runtime_section())
         sections.extend(self._build_workspace_sections(workspace))
+
+        if continuity_summary.strip():
+            sections.append(f"[Session Continuity]\n{continuity_summary.strip()}")
 
         if history_summary.strip():
             sections.append(f"[Conversation Summary]\n{history_summary.strip()}")

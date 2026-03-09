@@ -12,6 +12,7 @@ from drost.config import Settings
 from drost.embeddings import EmbeddingService
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
+from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
 from drost.storage import SQLiteStore
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,17 @@ class Gateway:
             max_events_per_run=settings.memory_maintenance_max_events_per_run,
             entity_synthesis_enabled=settings.memory_entity_synthesis_enabled,
         )
+        self.session_continuity = SessionContinuityManager(
+            store=self.store,
+            sessions_dir=settings.workspace_dir / "sessions",
+            provider_getter=self.providers.get,
+            enabled=settings.memory_continuity_enabled,
+            auto_on_new=settings.memory_continuity_auto_on_new,
+            source_max_messages=settings.memory_continuity_source_max_messages,
+            source_max_chars=settings.memory_continuity_source_max_chars,
+            summary_max_tokens=settings.memory_continuity_summary_max_tokens,
+            summary_max_chars=settings.memory_continuity_summary_max_chars,
+        )
 
         if not settings.telegram_bot_token:
             raise ValueError("DROST_TELEGRAM_BOT_TOKEN is required")
@@ -70,8 +82,10 @@ class Gateway:
             max_inline_image_bytes=settings.vision_max_inline_image_bytes,
         )
         self.telegram.set_message_handler(self._handle_telegram_message)
+        self.telegram.set_new_session_handler(self._handle_new_session_transition)
 
         self.app = FastAPI(title="Drost Gateway", version="0.1.0")
+        self.app.state.gateway = self
         self._mount_routes()
         self._mount_lifecycle()
 
@@ -92,6 +106,24 @@ class Gateway:
             status_callback=status_callback if callable(status_callback) else None,
         )
 
+    async def _handle_new_session_transition(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from_session_key = str(payload.get("from_session_key") or "").strip()
+        to_session_key = str(payload.get("to_session_key") or "").strip()
+        from_session_id = str(payload.get("from_session_id") or "").strip() or "legacy-main"
+        to_session_id = str(payload.get("to_session_id") or "").strip() or "legacy-main"
+        chat_id = int(payload.get("chat_id") or 0)
+        if not from_session_key or not to_session_key:
+            return {"queued": False, "message": "Continuity skipped (invalid session transition)."}
+        return await self.session_continuity.schedule(
+            ContinuityJobRequest(
+                chat_id=chat_id,
+                from_session_id=from_session_id,
+                from_session_key=from_session_key,
+                to_session_id=to_session_id,
+                to_session_key=to_session_key,
+            )
+        )
+
     def _mount_lifecycle(self) -> None:
         @self.app.on_event("startup")
         async def startup() -> None:
@@ -108,6 +140,7 @@ class Gateway:
         @self.app.on_event("shutdown")
         async def shutdown() -> None:
             await self.telegram.stop()
+            await self.session_continuity.shutdown()
             await self.memory_maintenance.stop()
             await self.agent.close()
             self.store.close()
@@ -149,6 +182,10 @@ class Gateway:
         @self.app.get("/v1/memory/maintenance/status")
         async def memory_maintenance_status() -> dict[str, Any]:
             return self.memory_maintenance.status()
+
+        @self.app.get("/v1/memory/continuity/status")
+        async def memory_continuity_status() -> dict[str, Any]:
+            return self.session_continuity.status()
 
         @self.app.post("/v1/memory/maintenance/run-once")
         async def memory_maintenance_run_once() -> dict[str, Any]:

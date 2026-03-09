@@ -64,6 +64,7 @@ class TelegramChannel(BaseChannel):
         self.dp.include_router(self.router)
 
         self._message_handler: Callable[[dict[str, Any]], Awaitable[str | None]] | None = None
+        self._new_session_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None
         self._polling_task: asyncio.Task[None] | None = None
         self._polling_active = False
         self._pending_media_groups: dict[tuple[int, str], PendingMediaGroup] = {}
@@ -95,6 +96,12 @@ class TelegramChannel(BaseChannel):
                 logger.warning("Unauthorized Telegram user %s attempted access", uid)
                 return False
         return True
+
+    def set_new_session_handler(
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None,
+    ) -> None:
+        self._new_session_handler = handler
 
     async def _send_long(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         body = str(text or "").strip()
@@ -227,8 +234,33 @@ class TelegramChannel(BaseChannel):
     async def _handle_new_session(self, message: TgMessage, args: str) -> None:
         chat_id = int(message.chat.id)
         title = (args or "").strip()
+        from_session_id = self._current_session_id(chat_id)
+        from_session_key = session_key_for_telegram_chat(
+            chat_id,
+            None if from_session_id == "legacy-main" else from_session_id,
+        )
         sid = self.store.create_session(chat_id, title=title)
-        await message.answer(f"New session active: {sid}", parse_mode=None)
+        to_session_key = session_key_for_telegram_chat(chat_id, None if sid == "legacy-main" else sid)
+        continuity_line = ""
+        if self._new_session_handler is not None:
+            try:
+                continuity_result = await self._new_session_handler(
+                    {
+                        "chat_id": chat_id,
+                        "from_session_id": from_session_id,
+                        "from_session_key": from_session_key,
+                        "to_session_id": sid,
+                        "to_session_key": to_session_key,
+                    }
+                )
+                if isinstance(continuity_result, dict):
+                    continuity_line = str(continuity_result.get("message") or "").strip()
+            except Exception:
+                logger.warning("Session continuity callback failed", exc_info=True)
+        summary = f"New session active: {sid}"
+        if continuity_line:
+            summary = f"{summary}\n{continuity_line}"
+        await message.answer(summary, parse_mode=None)
 
     async def _handle_list_sessions(self, message: TgMessage) -> None:
         chat_id = int(message.chat.id)

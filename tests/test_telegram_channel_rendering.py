@@ -10,7 +10,18 @@ from drost.gateway import Gateway
 
 
 class _DummyStore:
-    pass
+    def __init__(self) -> None:
+        self.active_session_id = "s_prev"
+        self.created: list[tuple[int, str]] = []
+
+    def get_active_session_id(self, chat_id: int) -> str | None:
+        _ = chat_id
+        return self.active_session_id
+
+    def create_session(self, chat_id: int, title: str = "") -> str:
+        self.created.append((chat_id, title))
+        self.active_session_id = "s_next"
+        return "s_next"
 
 
 class _DummySession:
@@ -67,6 +78,15 @@ class _FakeBot:
         if parse_mode == "HTML" and self.fail_html_edit:
             raise RuntimeError("invalid html")
         return SimpleNamespace(message_id=message_id)
+
+
+class _FakeTelegramMessage:
+    def __init__(self, chat_id: int) -> None:
+        self.chat = SimpleNamespace(id=chat_id)
+        self.answers: list[dict[str, object]] = []
+
+    async def answer(self, text: str, *, parse_mode: str | None = None) -> None:
+        self.answers.append({"text": text, "parse_mode": parse_mode})
 
 
 def _build_channel(monkeypatch: pytest.MonkeyPatch, bot: _FakeBot) -> TelegramChannel:
@@ -183,3 +203,37 @@ async def test_gateway_accepts_media_only_telegram_turn() -> None:
     assert reply == "ok"
     assert len(gateway.agent.calls) == 1
     assert gateway.agent.calls[0]["media"] == context["media"]
+
+
+@pytest.mark.asyncio
+async def test_new_session_calls_continuity_handler(monkeypatch: pytest.MonkeyPatch) -> None:
+    bot = _FakeBot(token="test-token")
+    store = _DummyStore()
+    monkeypatch.setattr("drost.channels.telegram.Bot", lambda token: bot)
+    channel = TelegramChannel(
+        token="test-token",
+        store=store,  # type: ignore[arg-type]
+        webhook_url=None,
+        webhook_path="/webhook/telegram",
+        webhook_secret=None,
+        allowed_users=None,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    async def _new_session_handler(payload: dict[str, object]) -> dict[str, object]:
+        calls.append(payload)
+        return {"queued": True, "message": "Continuity queued from s_prev to s_next."}
+
+    channel.set_new_session_handler(_new_session_handler)
+    message = _FakeTelegramMessage(chat_id=123)
+
+    await channel._handle_new_session(message, "Project branch")
+
+    assert store.created == [(123, "Project branch")]
+    assert len(calls) == 1
+    assert calls[0]["from_session_id"] == "s_prev"
+    assert calls[0]["to_session_id"] == "s_next"
+    assert message.answers
+    assert "New session active: s_next" in str(message.answers[0]["text"])
+    assert "Continuity queued from s_prev to s_next." in str(message.answers[0]["text"])

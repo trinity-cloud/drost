@@ -107,6 +107,8 @@ Background transcript-to-memory extraction defaults to:
 - `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
 - `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
 - `DROST_MEMORY_ENTITY_SYNTHESIS_ENABLED=true`
+- `DROST_MEMORY_CONTINUITY_ENABLED=true`
+- `DROST_MEMORY_CONTINUITY_AUTO_ON_NEW=true`
 
 Vector mode:
 - Attempts to load `sqlite-vec` automatically
@@ -128,6 +130,11 @@ Memory maintenance:
   - `~/.drost/memory/entities/*/*/summary.md`
 - stores cursor state in:
   - `~/.drost/state/memory-maintenance.json`
+
+Session continuity:
+- `/new` schedules a background carryover summary from the prior session into the new one
+- continuity is stored as an internal session artifact, not as a visible chat message
+- the continuity summary is injected into early turns of the new session prompt
 
 ## Workspace Bootstrap
 
@@ -175,6 +182,7 @@ session id (`s_YYYY-MM-DD_HH-MM-SS`), so transcript filenames include datetime b
 - `GET /v1/sessions/{chat_id}`
 - `GET /v1/memory/status`
 - `GET /v1/memory/maintenance/status`
+- `GET /v1/memory/continuity/status`
 - `POST /v1/memory/maintenance/run-once`
 - `GET /v1/memory/search?query=...&limit=...`
 - `GET /v1/runs/last`

@@ -107,6 +107,16 @@ class AgentRuntime:
             return ""
         return truncate_text_to_budget("\n".join(lines), self._settings.context_budget_memory_tokens)
 
+    def _load_continuity_summary(self, session_key: str) -> str:
+        if not self._settings.memory_continuity_enabled:
+            return ""
+        if self._store.message_count(session_key) > self._settings.memory_continuity_inject_until_messages:
+            return ""
+        continuity = self._store.get_session_continuity(session_key)
+        if not continuity:
+            return ""
+        return str(continuity.get("summary") or "").strip()
+
     async def _summarize_history(self, provider_name: str, history_rows: list[dict[str, Any]]) -> str:
         if not history_rows:
             return ""
@@ -311,9 +321,11 @@ class AgentRuntime:
         )
         tool_names = list(dict.fromkeys([*tool_registry.names(), *internal_loop_tool_names()]))
         memory_block = self._build_memory_block(memories)
+        continuity_summary = self._load_continuity_summary(session_key)
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,
             memory_block=memory_block,
+            continuity_summary=continuity_summary,
             history_summary=history_summary,
             provider_name=provider.name,
             tool_names=tool_names,

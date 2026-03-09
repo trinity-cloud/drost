@@ -75,6 +75,19 @@ class SQLiteStore:
               updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS session_continuity (
+              to_session_key TEXT PRIMARY KEY,
+              from_session_key TEXT NOT NULL,
+              from_session_id TEXT NOT NULL DEFAULT '',
+              summary TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (to_session_key) REFERENCES sessions(session_key) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_session_continuity_from
+              ON session_continuity(from_session_key, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS messages (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               session_key TEXT NOT NULL,
@@ -606,11 +619,83 @@ class SQLiteStore:
                 (session_key,),
             )
             self._conn.execute(
+                "DELETE FROM session_continuity WHERE to_session_key = ?",
+                (session_key,),
+            )
+            self._conn.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
                 (self._utc_now(), session_key),
             )
             self._conn.commit()
             return int(cursor.rowcount)
+
+    def set_session_continuity(
+        self,
+        *,
+        to_session_key: str,
+        from_session_key: str,
+        from_session_id: str,
+        summary: str,
+    ) -> None:
+        cleaned_to = str(to_session_key or "").strip()
+        cleaned_from = str(from_session_key or "").strip()
+        cleaned_summary = str(summary or "").strip()
+        if not cleaned_to:
+            raise ValueError("to_session_key is required")
+        if not cleaned_from:
+            raise ValueError("from_session_key is required")
+        if not cleaned_summary:
+            raise ValueError("summary is required")
+        with self._lock:
+            self._ensure_session_row(cleaned_to)
+            now = self._utc_now()
+            self._conn.execute(
+                """
+                INSERT INTO session_continuity(
+                  to_session_key, from_session_key, from_session_id, summary, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(to_session_key) DO UPDATE SET
+                  from_session_key=excluded.from_session_key,
+                  from_session_id=excluded.from_session_id,
+                  summary=excluded.summary,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    cleaned_to,
+                    cleaned_from,
+                    str(from_session_id or "").strip(),
+                    cleaned_summary,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+    def get_session_continuity(self, session_key: str) -> dict[str, Any] | None:
+        cleaned = str(session_key or "").strip()
+        if not cleaned:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT to_session_key, from_session_key, from_session_id, summary, created_at, updated_at
+                  FROM session_continuity
+                 WHERE to_session_key = ?
+                 LIMIT 1
+                """,
+                (cleaned,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "to_session_key": str(row["to_session_key"] or ""),
+            "from_session_key": str(row["from_session_key"] or ""),
+            "from_session_id": str(row["from_session_id"] or ""),
+            "summary": str(row["summary"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
 
     # --- Memory helpers --------------------------------------------------
 

@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     memory_maintenance_interval_seconds: int = 1800
     memory_maintenance_max_events_per_run: int = 200
     memory_entity_synthesis_enabled: bool = True
+    memory_continuity_enabled: bool = True
+    memory_continuity_auto_on_new: bool = True
+    memory_continuity_source_max_messages: int = 120
+    memory_continuity_source_max_chars: int = 40_000
+    memory_continuity_summary_max_tokens: int = 1_500
+    memory_continuity_summary_max_chars: int = 12_000
+    memory_continuity_inject_until_messages: int = 12
 
     session_history_limit: int = 64
 
@@ -180,6 +187,11 @@ class Settings(BaseSettings):
         "agent_max_tool_calls_per_run",
         "memory_maintenance_interval_seconds",
         "memory_maintenance_max_events_per_run",
+        "memory_continuity_source_max_messages",
+        "memory_continuity_source_max_chars",
+        "memory_continuity_summary_max_tokens",
+        "memory_continuity_summary_max_chars",
+        "memory_continuity_inject_until_messages",
         "context_budget_total_tokens",
         "context_budget_system_tokens",
         "context_budget_history_tokens",

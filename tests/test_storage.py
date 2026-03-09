@@ -24,6 +24,29 @@ def test_session_roundtrip(tmp_path: Path) -> None:
     store.close()
 
 
+def test_session_continuity_roundtrip_and_reset(tmp_path: Path) -> None:
+    store = SQLiteStore(db_path=tmp_path / "drost-continuity.sqlite3")
+    from_key = session_key_for_telegram_chat(12345, "s_2026-03-07_10-00-00")
+    to_key = session_key_for_telegram_chat(12345, "s_2026-03-07_11-00-00")
+
+    store.append_message(from_key, "user", "We agreed to build session continuity.")
+    store.set_session_continuity(
+        to_session_key=to_key,
+        from_session_key=from_key,
+        from_session_id="s_2026-03-07_10-00-00",
+        summary="## Session Continuity\n### Open Threads\n- Build continuity.",
+    )
+
+    row = store.get_session_continuity(to_key)
+    assert row is not None
+    assert row["from_session_key"] == from_key
+    assert "Build continuity" in row["summary"]
+
+    store.reset_session(to_key)
+    assert store.get_session_continuity(to_key) is None
+    store.close()
+
+
 def test_memory_search_fallback(tmp_path: Path) -> None:
     store = SQLiteStore(
         db_path=tmp_path / "drost-memory.sqlite3",

@@ -63,6 +63,21 @@ def test_prompt_assembly_includes_bootstrap_when_active(tmp_path: Path) -> None:
     assert "bootstrap=active" in prompt
 
 
+def test_prompt_assembly_includes_session_continuity(tmp_path: Path) -> None:
+    settings = Settings(
+        workspace_dir=tmp_path,
+        context_budget_system_tokens=8_000,
+    )
+    prompt = PromptAssembler(settings).assemble(
+        base_prompt="Base prompt",
+        continuity_summary="## Session Continuity\n### Open Threads\n- Finish the memory capsule.",
+        tool_names=["memory_search"],
+    )
+
+    assert "[Session Continuity]" in prompt
+    assert "Finish the memory capsule" in prompt
+
+
 def test_prompt_assembly_omits_bootstrap_after_completion(tmp_path: Path) -> None:
     (tmp_path / "BOOTSTRAP.md").write_text("Bootstrap body", encoding="utf-8")
     (tmp_path / ".bootstrap-complete").write_text("done", encoding="utf-8")
