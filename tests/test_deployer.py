@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import shlex
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 from drost.deployer.config import DeployerConfig
 from drost.deployer.main import main
+from drost.deployer.rollout import DeployerRolloutManager
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
 
@@ -147,6 +150,123 @@ def _write_child_script(path: Path, *, immediate_exit: bool = False) -> None:
     path.write_text("\n".join(body) + "\n", encoding="utf-8")
 
 
+def _write_health_server_script(path: Path) -> None:
+    body = [
+        "from __future__ import annotations",
+        "import json",
+        "import signal",
+        "import sys",
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer",
+        "from pathlib import Path",
+        "",
+        "repo_root = Path(sys.argv[1])",
+        "port = int(sys.argv[2])",
+        "marker = Path(sys.argv[3])",
+        "marker.write_text('started', encoding='utf-8')",
+        "",
+        "class Handler(BaseHTTPRequestHandler):",
+        "    def do_GET(self):",
+        "        if self.path != '/health':",
+        "            self.send_response(404)",
+        "            self.end_headers()",
+        "            return",
+        "        mode = repo_root.joinpath('health.txt').read_text(encoding='utf-8').strip()",
+        "        if mode == 'ok':",
+        "            payload = {'status': 'ok'}",
+        "            self.send_response(200)",
+        "        else:",
+        "            payload = {'status': 'error', 'mode': mode or 'missing'}",
+        "            self.send_response(503)",
+        "        self.send_header('Content-Type', 'application/json')",
+        "        self.end_headers()",
+        "        self.wfile.write(json.dumps(payload).encode('utf-8'))",
+        "",
+        "    def log_message(self, format, *args):",
+        "        _ = format, args",
+        "        return",
+        "",
+        "server = ThreadingHTTPServer(('127.0.0.1', port), Handler)",
+        "",
+        "def _stop(signum, frame):",
+        "    _ = signum, frame",
+        "    server.shutdown()",
+        "",
+        "signal.signal(signal.SIGTERM, _stop)",
+        "signal.signal(signal.SIGINT, _stop)",
+        "server.serve_forever(poll_interval=0.1)",
+        "server.server_close()",
+    ]
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+
+
+def _git(repo_root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return (result.stdout or "").strip()
+
+
+def _init_git_repo(repo_root: Path) -> None:
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init")
+    _git(repo_root, "config", "user.name", "Drost Tests")
+    _git(repo_root, "config", "user.email", "drost-tests@example.com")
+
+
+def _commit_health_state(repo_root: Path, *, mode: str, message: str) -> str:
+    repo_root.joinpath("health.txt").write_text(mode + "\n", encoding="utf-8")
+    repo_root.joinpath("README.md").write_text(message + "\n", encoding="utf-8")
+    _git(repo_root, "add", "health.txt", "README.md")
+    _git(repo_root, "commit", "-m", message)
+    return _git(repo_root, "rev-parse", "HEAD")
+
+
+def _reserve_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
+
+
+def _wait_for_path(path: Path, *, timeout_seconds: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {path}")
+
+
+def _make_health_rollout_runtime(tmp_path: Path) -> tuple[DeployerConfig, DeployerStateStore, DeployerSupervisor, DeployerRolloutManager]:
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    port = _reserve_port()
+    marker = tmp_path / "health-marker.txt"
+    script = tmp_path / "health-child.py"
+    _write_health_server_script(script)
+
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+        state_dir=tmp_path / "workspace" / "deployer",
+    )
+    config.start_command = (
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+        f" {shlex.quote(str(repo_root))} {int(port)} {shlex.quote(str(marker))}"
+    )
+    config.health_url = f"http://127.0.0.1:{int(port)}/health"
+    config.startup_grace_seconds = 0.1
+    config.health_timeout_seconds = 3.0
+    config.request_poll_interval_seconds = 0.1
+    store = DeployerStateStore(config)
+    store.bootstrap()
+    supervisor = DeployerSupervisor(store)
+    rollout = DeployerRolloutManager(store=store, supervisor=supervisor)
+    return config, store, supervisor, rollout
+
+
 def test_deployer_supervisor_start_stop_restart_lifecycle(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -215,3 +335,103 @@ def test_deployer_run_forever_tracks_short_lived_child_exit(tmp_path: Path) -> N
     assert status["state"] == "idle"
     assert status["child_pid"] is None
     assert status["child_exited_at"]
+
+
+def test_deployer_rollout_promote_and_deploy_candidate_success(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    candidate_commit = _commit_health_state(repo_root, mode="ok", message="candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        started = supervisor.start_child()
+        assert started["state"] == "running"
+        _wait_for_path(marker)
+
+        promoted = rollout.promote_current()
+        assert promoted["state"] == "healthy"
+        assert promoted["known_good_commit"] == stable_commit
+        assert store.read_known_good()["commit"] == stable_commit
+
+        deployed = rollout.deploy_candidate(candidate_commit)
+        assert deployed["state"] == "healthy"
+        assert deployed["active_commit"] == candidate_commit
+        assert deployed["known_good_commit"] == candidate_commit
+        assert _git(repo_root, "rev-parse", "HEAD") == candidate_commit
+        assert store.read_known_good()["commit"] == candidate_commit
+        assert store.read_known_good()["ref_name"] == f"refs/drost/{config.known_good_ref_name}"
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "promote_current_succeeded" in events
+        assert "deploy_candidate_succeeded" in events
+    finally:
+        supervisor.stop_child()
+
+
+def test_deployer_rollout_failed_candidate_rolls_back_to_known_good(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    bad_commit = _commit_health_state(repo_root, mode="fail", message="bad-candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        deployed = rollout.deploy_candidate(bad_commit)
+        assert deployed["state"] == "healthy"
+        assert deployed["active_commit"] == stable_commit
+        assert deployed["known_good_commit"] == stable_commit
+        assert "rolled back" in str(deployed["last_error"])
+        assert _git(repo_root, "rev-parse", "HEAD") == stable_commit
+        assert store.read_known_good()["commit"] == stable_commit
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "deploy_candidate_failed_validation" in events
+        assert "rollback_succeeded" in events
+    finally:
+        supervisor.stop_child()
+
+
+def test_deployer_rollout_enters_degraded_mode_when_rollback_fails(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    bad_commit = _commit_health_state(repo_root, mode="fail", message="bad-candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    exit_script = tmp_path / "exit-child.py"
+    exit_marker = tmp_path / "exit-marker.txt"
+    _write_child_script(exit_script, immediate_exit=True)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        config.start_command = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(exit_script))} {shlex.quote(str(exit_marker))}"
+        )
+        config.startup_grace_seconds = 0.0
+        config.health_timeout_seconds = 1.0
+
+        deployed = rollout.deploy_candidate(bad_commit)
+        assert deployed["state"] == "degraded"
+        assert deployed["active_commit"] == stable_commit
+        assert "rollback validation failed" in str(deployed["last_error"])
+        assert _git(repo_root, "rev-parse", "HEAD") == stable_commit
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "deploy_candidate_failed_validation" in events
+        assert "rollback_failed" in events
+    finally:
+        supervisor.stop_child()

@@ -163,7 +163,7 @@ For local health validation, Drost derives:
 
 - `http://127.0.0.1:8766/health`
 
-## Deployer Skeleton
+## Deployer
 
 Drost now ships an external deployer entry point:
 
@@ -171,7 +171,7 @@ Drost now ships an external deployer entry point:
 uv run drost-deployer --help
 ```
 
-Current Phase 2 scope:
+Current scope:
 
 - deployer config loading
 - external state bootstrap under `~/.drost/deployer`
@@ -179,11 +179,11 @@ Current Phase 2 scope:
 - known-good record
 - append-only event log
 - subprocess child supervision
-- operator commands for `start`, `stop`, `restart`, and foreground `run`
-
-Current limitation:
-
-- health-gated promotion and rollback are not implemented yet
+- operator commands for `start`, `stop`, `restart`, foreground `run`, `healthcheck`, `promote`, `deploy`, and `rollback`
+- health-gated candidate deployment
+- known-good commit tracking outside the repo checkout
+- automatic rollback to the last known-good commit when candidate validation fails
+- degraded-mode fallback when rollback cannot recover the runtime
 
 ## Where Things Live
 
