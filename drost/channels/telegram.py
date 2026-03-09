@@ -131,6 +131,12 @@ class TelegramChannel(BaseChannel):
             # Ignore edit races / "message is not modified" errors.
             logger.debug("Telegram message edit failed", exc_info=True)
 
+    async def _delete_message(self, chat_id: int, message_id: int) -> None:
+        try:
+            await self.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            logger.debug("Telegram message delete failed", exc_info=True)
+
     async def _send_rendered_message(
         self,
         *,
@@ -623,6 +629,7 @@ class TelegramChannel(BaseChannel):
             "last_sent_text": "",
             "last_edit_at": 0.0,
             "flush_task": None,
+            "last_committed_stream_text": "",
         }
 
         async def _render_locked(*, force: bool) -> None:
@@ -692,6 +699,7 @@ class TelegramChannel(BaseChannel):
             render_state["last_sent_text"] = next_status
             render_state["last_edit_at"] = 0.0
             render_state["flush_task"] = None
+            render_state["last_committed_stream_text"] = preserved
 
         async def _status_callback(status_text: str) -> None:
             cleaned = str(status_text or "").strip()
@@ -737,6 +745,10 @@ class TelegramChannel(BaseChannel):
             await _cancel_flush_locked()
 
         if reply:
+            committed_stream = str(render_state["last_committed_stream_text"]).strip()
+            if committed_stream and str(reply).strip() == committed_stream:
+                await self._delete_message(chat_id, int(working_ref["message_id"]))
+                return
             await self._finalize_working_message(
                 chat_id=chat_id,
                 message_id=int(working_ref["message_id"]),

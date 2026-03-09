@@ -34,6 +34,7 @@ class _FakeBot:
         self.token = token
         self.sent: list[dict[str, object]] = []
         self.edited: list[dict[str, object]] = []
+        self.deleted: list[dict[str, object]] = []
         self.session = _DummySession()
         self.fail_html_edit = False
 
@@ -78,6 +79,22 @@ class _FakeBot:
         if parse_mode == "HTML" and self.fail_html_edit:
             raise RuntimeError("invalid html")
         return SimpleNamespace(message_id=message_id)
+
+    async def delete_message(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        **kwargs: object,
+    ) -> bool:
+        self.deleted.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "kwargs": kwargs,
+            }
+        )
+        return True
 
 
 class _FakeTelegramMessage:
@@ -321,3 +338,31 @@ async def test_route_context_preserves_streamed_text_when_tool_phase_starts(
     assert any(
         "Noted. Source code = handle with extreme care." in str(edit["text"]) for edit in html_edits
     )
+
+
+@pytest.mark.asyncio
+async def test_route_context_suppresses_duplicate_final_after_preserved_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _FakeBot(token="test-token")
+    channel = _build_channel(monkeypatch, bot)
+    message = _FakeInboundTelegramMessage(chat_id=123, text="hello")
+
+    final_text = "Okay, I've got a solid picture now."
+
+    async def _handler(context: dict[str, object]) -> str:
+        answer_stream_callback = context["answer_stream_callback"]
+        assert callable(answer_stream_callback)
+        await answer_stream_callback(final_text)
+        await asyncio.sleep(0.4)
+        await answer_stream_callback(None)
+        return final_text
+
+    channel.set_message_handler(_handler)
+
+    await channel._route_context(message, text="hello", media=None)
+
+    assert len(bot.sent) == 2
+    assert any(final_text in str(edit["text"]) for edit in bot.edited)
+    assert bot.deleted
+    assert bot.deleted[-1]["message_id"] == 2
