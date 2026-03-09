@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from drost.deployer.config import DeployerConfig
 from drost.deployer.state import DeployerStateStore
+from drost.deployer.supervisor import DeployerSupervisor
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -25,7 +26,16 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Print deployer status.")
     status_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
-    run_parser = subparsers.add_parser("run", help="Bootstrap deployer state and mark the skeleton as started.")
+    start_parser = subparsers.add_parser("start", help="Start Drost as a supervised child process.")
+    start_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    stop_parser = subparsers.add_parser("stop", help="Stop the current supervised Drost child process.")
+    stop_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    restart_parser = subparsers.add_parser("restart", help="Restart the current supervised Drost child process.")
+    restart_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
+
+    run_parser = subparsers.add_parser("run", help="Run the deployer in foreground supervision mode.")
     run_parser.add_argument("--json", action="store_true", help="Print raw JSON.")
 
     return parser
@@ -53,6 +63,9 @@ def _render_status_text(status: dict[str, object]) -> str:
         f"active_commit={status.get('active_commit') or ''}",
         f"known_good_commit={status.get('known_good_commit') or ''}",
         f"child_pid={status.get('child_pid')}",
+        f"child_started_at={status.get('child_started_at') or ''}",
+        f"child_exited_at={status.get('child_exited_at') or ''}",
+        f"child_returncode={status.get('child_returncode')}",
         f"last_health_ok_at={status.get('last_health_ok_at') or ''}",
         f"last_error={status.get('last_error') or ''}",
         f"updated_at={status.get('updated_at') or ''}",
@@ -64,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     _, store = _load_state(args)
+    supervisor = DeployerSupervisor(store)
 
     if args.command == "init":
         store.append_event(
@@ -76,7 +90,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "status":
-        status = store.read_status()
+        status = supervisor.refresh_status()
+        if args.json:
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print(_render_status_text(status))
+        return 0
+
+    if args.command == "start":
+        status = supervisor.start_child()
+        if args.json:
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print(_render_status_text(status))
+        return 0
+
+    if args.command == "stop":
+        status = supervisor.stop_child()
+        if args.json:
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print(_render_status_text(status))
+        return 0
+
+    if args.command == "restart":
+        status = supervisor.restart_child()
         if args.json:
             print(json.dumps(status, indent=2, sort_keys=True))
         else:
@@ -84,31 +122,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        status = store.read_status()
-        status.update(
-            {
-                "mode": "skeleton",
-                "state": "idle",
-                "repo_root": str(store.config.repo_root),
-                "workspace_dir": str(store.config.workspace_dir),
-                "state_dir": str(store.config.state_dir),
-            }
-        )
-        store.write_status(status)
         store.append_event(
             "deployer_started",
             repo_root=str(store.config.repo_root),
             state_dir=str(store.config.state_dir),
             start_command=store.config.start_command,
             health_url=store.config.health_url,
-            note="Phase 2 skeleton only. Supervision lands in Phase 3.",
         )
-        current = store.read_status()
+        exit_code = supervisor.run_forever()
+        current = supervisor.refresh_status()
         if args.json:
             print(json.dumps(current, indent=2, sort_keys=True))
         else:
             print(_render_status_text(current))
-        return 0
+        return exit_code
 
     parser.error(f"unknown command: {args.command}")
     return 2

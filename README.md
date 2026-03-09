@@ -178,8 +178,12 @@ Current Phase 2 scope:
 - status file
 - known-good record
 - append-only event log
+- subprocess child supervision
+- operator commands for `start`, `stop`, `restart`, and foreground `run`
 
-It is a control-plane skeleton today. Process supervision, health-gated promotion, and rollback land in later phases.
+Current limitation:
+
+- health-gated promotion and rollback are not implemented yet
 
 ## Where Things Live
 

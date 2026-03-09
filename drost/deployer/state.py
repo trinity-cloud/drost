@@ -26,6 +26,10 @@ class DeployerStateStore:
         return self.config.state_dir / "locks"
 
     @property
+    def logs_dir(self) -> Path:
+        return self.config.state_dir / "logs"
+
+    @property
     def status_path(self) -> Path:
         return self.config.state_dir / "status.json"
 
@@ -41,6 +45,7 @@ class DeployerStateStore:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         self.requests_dir.mkdir(parents=True, exist_ok=True)
         self.locks_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
         if not self.config.config_path.exists():
             self.config.config_path.write_text(self.config.render_toml(), encoding="utf-8")
         if not self.status_path.exists():
@@ -61,6 +66,8 @@ class DeployerStateStore:
             "known_good_commit": "",
             "child_pid": None,
             "child_started_at": "",
+            "child_exited_at": "",
+            "child_returncode": None,
             "last_health_ok_at": "",
             "last_request_id": "",
             "pending_request_ids": [],
