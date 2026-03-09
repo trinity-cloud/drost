@@ -53,6 +53,8 @@ Drost currently ships with these built-in tools:
 - `memory_search`
 - `memory_get`
 - `session_status`
+- `deployer_status`
+- `deployer_request`
 - `file_read`
 - `file_write`
 - `shell_execute`
@@ -186,6 +188,7 @@ Current scope:
 - known-good commit tracking outside the repo checkout
 - automatic rollback to the last known-good commit when candidate validation fails
 - degraded-mode fallback when rollback cannot recover the runtime
+- Drost-side explicit deployer tools instead of ad hoc shell restart/deploy flows
 
 ### Sample config
 

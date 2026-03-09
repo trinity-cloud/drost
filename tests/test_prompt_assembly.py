@@ -28,7 +28,7 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
         memory_block="Memory block",
         history_summary="Summary block",
         provider_name="openai-codex",
-        tool_names=["file_read", "memory_search", "web_search"],
+        tool_names=["file_read", "memory_search", "web_search", "deployer_request", "deployer_status"],
     )
 
     assert "Base prompt" in prompt
@@ -45,6 +45,7 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "Do not claim you searched" in prompt
     assert "[Tool Call Style]" in prompt
     assert "[Memory Recall]" in prompt
+    assert "[Deployer Control]" in prompt
     assert "[Workspace Runtime]" in prompt
     assert f"repo_root={settings.repo_root}" in prompt
     assert f"workspace_root={settings.workspace_dir}" in prompt

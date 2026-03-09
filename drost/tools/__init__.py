@@ -5,6 +5,8 @@ from collections.abc import Callable
 from drost.config import Settings
 from drost.embeddings import EmbeddingService
 from drost.storage import SQLiteStore, WorkspaceMemoryIndexer
+from drost.tools.deployer_request import DeployerRequestTool
+from drost.tools.deployer_status import DeployerStatusTool
 from drost.tools.file_read import FileReadTool
 from drost.tools.file_write import FileWriteTool
 from drost.tools.memory_get import MemoryGetTool
@@ -48,6 +50,8 @@ def build_default_registry(
             current_session_key=current_session_key,
         )
     )
+    registry.register(DeployerStatusTool(settings=settings))
+    registry.register(DeployerRequestTool(settings=settings))
     registry.register(FileReadTool())
     registry.register(FileWriteTool())
     registry.register(ShellExecuteTool(default_timeout_seconds=settings.agent_tool_timeout_seconds))

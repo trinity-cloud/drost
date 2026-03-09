@@ -26,6 +26,10 @@ RUNTIME_TOPOLOGY_GUIDANCE = """[Runtime Topology]
 - The runtime facts below are authoritative for this turn.
 - Do not call tools just to rediscover repo root, workspace root, launch mode, or health URL unless you have reason to think they changed."""
 
+DEPLOYER_CONTROL_GUIDANCE = """[Deployer Control]
+- For runtime lifecycle actions such as restart, candidate deploy, rollback, or deployer inspection, use deployer_request and deployer_status.
+- Do not improvise deploy control with shell_execute when the deployer tools are available."""
+
 BOOTSTRAP_RUNTIME_CONTRACT = """[Bootstrap Contract]
 - This workspace is still in bootstrap mode.
 - Your near-term job is to establish a concrete agent identity and a concrete user profile.
@@ -64,6 +68,8 @@ class PromptAssembler:
             sections.append(TOOL_STYLE_GUIDANCE)
             if "memory_search" in tools or "memory_get" in tools:
                 sections.append(MEMORY_RECALL_GUIDANCE)
+            if "deployer_request" in tools or "deployer_status" in tools:
+                sections.append(DEPLOYER_CONTROL_GUIDANCE)
 
         sections.append(self._build_workspace_runtime_section())
         sections.extend(self._build_workspace_sections(workspace))
