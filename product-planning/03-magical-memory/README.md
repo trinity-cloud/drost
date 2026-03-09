@@ -4,7 +4,7 @@
 
 Turn Drost's current transcript recall into a compounding memory system that feels personal, continuous, and inspectable.
 
-The target product effect is the Morpheus feel:
+The target product effect is the reference implementation feel:
 
 - the agent has a stable sense of self and user context
 - important facts compound into durable workspace memory
@@ -24,11 +24,11 @@ Drost is already strong on:
 - SQLite + vector-backed recall over transcripts
 - workspace-based personality scaffolding
 
-The main gap is that Drost still remembers mostly like a search engine over prior chat. Morpheus feels stronger because memory compounds into durable files, gets summarized, and flows across sessions.
+The main gap is that Drost still remembers mostly like a search engine over prior chat. reference implementation feels stronger because memory compounds into durable files, gets summarized, and flows across sessions.
 
 ## Documents
 
-- `01-current-state-and-gap.md`: exact gap between Drost today and Morpheus-grade memory behavior
+- `01-current-state-and-gap.md`: exact gap between Drost today and reference implementation-grade memory behavior
 - `02-canonical-memory-model.md`: on-disk file layout and source-of-truth rules
 - `03-index-and-retrieval-contract.md`: SQLite index model, search contract, and retrieval behavior
 - `04-maintenance-and-continuity.md`: extraction, synthesis, and `/new` carryover design
@@ -38,15 +38,15 @@ The main gap is that Drost still remembers mostly like a search engine over prio
 
 ## Source Basis
 
-This package is grounded in these Morpheus references:
+This package is grounded in these reference implementation references:
 
-- `/Users/migel/Morpheus/morpheus/workspace/loader.py`
-- `/Users/migel/Morpheus/morpheus/workspace/prompt.py`
-- `/Users/migel/Morpheus/morpheus/memory/maintenance.py`
-- `/Users/migel/Morpheus/morpheus/sessions/continuity.py`
-- `/Users/migel/Morpheus/sample-workspace/AGENTS.md`
-- `/Users/migel/Morpheus/sample-workspace/BOOTSTRAP.md`
-- `/Users/migel/Morpheus/sample-workspace/MEMORY.md`
+- `/Users/migel/reference implementation/reference-runtime/workspace/loader.py`
+- `/Users/migel/reference implementation/reference-runtime/workspace/prompt.py`
+- `/Users/migel/reference implementation/reference-runtime/memory/maintenance.py`
+- `/Users/migel/reference implementation/reference-runtime/sessions/continuity.py`
+- `/Users/migel/reference implementation/sample-workspace/AGENTS.md`
+- `/Users/migel/reference implementation/sample-workspace/BOOTSTRAP.md`
+- `/Users/migel/reference implementation/sample-workspace/MEMORY.md`
 
 And these Google Gemini references:
 

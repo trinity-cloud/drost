@@ -4,7 +4,7 @@
 
 Build the software-owned memory processes that turn conversation into durable memory and carry context across session boundaries.
 
-This should follow the Morpheus pattern:
+This should follow the reference implementation pattern:
 
 - extraction is not a vague instruction in `HEARTBEAT.md`
 - maintenance is a real runtime subsystem
@@ -157,7 +157,7 @@ When the user starts a new session, Drost should inherit enough carryover that t
 
 ## Design
 
-Use a background continuity manager modeled after Morpheus.
+Use a background continuity manager modeled after reference implementation.
 
 Inputs:
 

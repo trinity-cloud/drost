@@ -406,7 +406,7 @@ class AgentRuntime:
         self._store.append_message(session_key, "user", query_text)
         self._store.append_message(session_key, "assistant", assistant_text)
 
-        # Persist JSONL transcript files for debugging parity with Morpheus patterns.
+        # Persist JSONL transcript files for debugging parity with reference implementation patterns.
         full_messages = list(provider_messages[turn_start_index:])
         if not full_messages:
             full_messages = [Message(role=MessageRole.USER, content=query_text)]

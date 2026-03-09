@@ -88,7 +88,7 @@ Mitigation:
 
 ## 4. Product Risks
 
-## 4.1 Complexity Drift Toward Morpheus
+## 4.1 Complexity Drift Toward reference implementation
 
 Risk:
 

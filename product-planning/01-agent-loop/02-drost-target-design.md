@@ -9,7 +9,7 @@ Target properties:
 - deterministic tool invocation lifecycle,
 - provider-agnostic loop core,
 - no regression to Telegram/session/memory persistence,
-- minimal surface area compared with Morpheus,
+- minimal surface area compared with reference implementation,
 - unrestricted tool execution (filesystem + shell) with no confirmation/sandbox gate in v1,
 - clean extension points for future multi-loop orchestration (Gen 3).
 
@@ -90,7 +90,7 @@ Reference:
 - stable contract for any loop strategy:
   - `run_turn(...) -> AsyncIterator[AgentEvent]`
 - initial implementation:
-  - `DefaultSingleLoopRunner` (Morpheus-style iterative loop)
+  - `DefaultSingleLoopRunner` (reference implementation-style iterative loop)
 - future implementation:
   - `LoopManager` for multi-loop/mind-state orchestration without replacing `AgentRuntime`.
 
@@ -110,7 +110,7 @@ Must be provider-neutral:
 - `description: str`
 - `input_schema: dict[str, Any]`
 
-This mirrors Morpheus and aligns with existing provider abstractions already present in Drost.
+This mirrors reference implementation and aligns with existing provider abstractions already present in Drost.
 
 ## 5.2 Tool Result (Model Facing Feedback)
 
@@ -138,7 +138,7 @@ Rationale:
 
 - Minimum viable autonomous capability for OSS adoption.
 - Preserves memory/session introspection while adding practical action tools.
-- Aligns with Morpheus learnings on real agent usefulness.
+- Aligns with reference implementation learnings on real agent usefulness.
 
 ## 7. Prompt Assembly Design
 
@@ -174,7 +174,7 @@ Compaction-style summarization behavior:
 - inject summary context as synthetic carry-forward context,
 - if summarization fails, continue with deterministic truncation (no turn failure).
 
-This mirrors Morpheus compaction philosophy while keeping v1 latency/cost predictable.
+This mirrors reference implementation compaction philosophy while keeping v1 latency/cost predictable.
 
 ## 8. Execution Permissions
 
@@ -197,7 +197,7 @@ Hard requirements for v1:
 
 Optional v1.1:
 
-- stuck-loop fingerprint detection (Morpheus-style repeated tool signature/output),
+- stuck-loop fingerprint detection (reference implementation-style repeated tool signature/output),
 - dynamic disabling of repeatedly failing tools during a run.
 
 ## 10. Telegram UX for Long Runs
@@ -215,4 +215,4 @@ This avoids message spam and gives user feedback during 30s+ executions.
 - plugin runtime/tool factories,
 - multi-profile runtime boot system.
 
-These can be introduced later if Drost needs Morpheus-level operational complexity.
+These can be introduced later if Drost needs reference implementation-level operational complexity.

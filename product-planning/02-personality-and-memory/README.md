@@ -8,7 +8,7 @@ Shift Drost from a capable tool-using agent into a personal AI with:
 - memory that compounds over time instead of only retrieving transcript chunks
 - recall that feels "magical" because the right context appears at the right time
 
-Morpheus is the north star. The point is not to blindly port every subsystem. The point is to preserve the product behavior that makes Morpheus feel alive while keeping Drost lean:
+reference implementation is the north star. The point is not to blindly port every subsystem. The point is to preserve the product behavior that makes reference implementation feel alive while keeping Drost lean:
 
 - keep SQLite + sqvector as the persistence substrate
 - keep workspace files as the source of truth
@@ -17,19 +17,19 @@ Morpheus is the north star. The point is not to blindly port every subsystem. Th
 
 ## Documents
 
-- `01-feature-matrix.md`: Morpheus-to-Drost capability matrix with recommended implementation targets
+- `01-feature-matrix.md`: reference implementation-to-Drost capability matrix with recommended implementation targets
 - `02-target-architecture.md`: lean Drost architecture for personality and magical memory
 - `03-implementation-sequence.md`: phased build order with acceptance criteria
 
 ## Source Basis
 
-This package is based on the current Drost codebase and these Morpheus reference points:
+This package is based on the current Drost codebase and these reference implementation reference points:
 
-- `morpheus/workspace/loader.py`
-- `morpheus/workspace/prompt.py`
-- `morpheus/memory/maintenance.py`
-- `morpheus/sessions/continuity.py`
-- `morpheus/graph/context.py`
+- `reference-runtime/workspace/loader.py`
+- `reference-runtime/workspace/prompt.py`
+- `reference-runtime/memory/maintenance.py`
+- `reference-runtime/sessions/continuity.py`
+- `reference-runtime/graph/context.py`
 - `sample-workspace/AGENTS.md`
 - `sample-workspace/BOOTSTRAP.md`
 - `sample-workspace/SOUL.md`

@@ -1,7 +1,7 @@
 # Drost Agent Loop Planning Package
 
 ## Goal
-Design and stage a Morpheus-inspired agentic loop for Drost that supports:
+Design and stage a production-style agentic loop for Drost that supports:
 
 - provider-native tool calling (OpenAI Codex OAuth, Anthropic setup-token/API key, xAI OpenAI-compatible),
 - a deterministic tool registry and dispatch layer,
@@ -14,7 +14,7 @@ This planning package is implementation-focused and maps directly to Drost’s c
 
 It includes:
 
-1. North-star analysis from Morpheus internals.
+1. North-star analysis from reference implementation internals.
 2. Target Drost architecture for tool-enabled turns.
 3. Tool creation and invocation contract.
 4. Detailed loop algorithm/state machine.
@@ -48,7 +48,7 @@ It includes:
 
 ## Document Map
 
-1. [01-morpheus-loop-analysis.md](./01-morpheus-loop-analysis.md)
+1. [01-reference-loop-analysis.md](./01-reference-loop-analysis.md)
 2. [02-drost-target-design.md](./02-drost-target-design.md)
 3. [03-tool-registry-and-invocation.md](./03-tool-registry-and-invocation.md)
 4. [04-agent-loop-algorithm.md](./04-agent-loop-algorithm.md)
@@ -56,20 +56,20 @@ It includes:
 6. [06-test-observability-plan.md](./06-test-observability-plan.md)
 7. [07-risks-open-questions.md](./07-risks-open-questions.md)
 
-## Primary North-Star References (Morpheus)
+## Primary North-Star References (reference implementation)
 
-- `morpheus/agent_run.py`
-- `morpheus/agent.py`
-- `morpheus/gateway/streaming_turn.py`
-- `morpheus/gateway/streaming.py`
-- `morpheus/tools/base.py`
-- `morpheus/tools/registry.py`
-- `morpheus/tools/__init__.py`
-- `morpheus/tools/policy.py`
-- `morpheus/providers/openai.py`
-- `morpheus/providers/openai_streaming.py`
-- `morpheus/providers/anthropic.py`
-- `morpheus/orchestration/runtime.py`
+- `reference-runtime/agent_run.py`
+- `reference-runtime/agent.py`
+- `reference-runtime/gateway/streaming_turn.py`
+- `reference-runtime/gateway/streaming.py`
+- `reference-runtime/tools/base.py`
+- `reference-runtime/tools/registry.py`
+- `reference-runtime/tools/__init__.py`
+- `reference-runtime/tools/policy.py`
+- `reference-runtime/providers/openai.py`
+- `reference-runtime/providers/openai_streaming.py`
+- `reference-runtime/providers/anthropic.py`
+- `reference-runtime/orchestration/runtime.py`
 
 ## Current Drost Baseline
 

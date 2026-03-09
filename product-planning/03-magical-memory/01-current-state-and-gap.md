@@ -21,9 +21,9 @@ On embeddings specifically, Drost today is still configured around the older Ope
 
 This is a solid base. The problem is not lack of data. The problem is lack of durable synthesis.
 
-## What Morpheus Does Better
+## What reference implementation Does Better
 
-Morpheus is stronger in memory because it layers the system correctly:
+reference implementation is stronger in memory because it layers the system correctly:
 
 1. Workspace files define identity and relationship context.
 2. Daily memory files capture recent life and ongoing work.
@@ -60,7 +60,7 @@ Missing pieces:
 
 ### 3. No Daily Memory Layer
 
-Morpheus treats today and yesterday as special. Drost currently has the directory scaffolding but no compounding process that fills it.
+reference implementation treats today and yesterday as special. Drost currently has the directory scaffolding but no compounding process that fills it.
 
 That means:
 

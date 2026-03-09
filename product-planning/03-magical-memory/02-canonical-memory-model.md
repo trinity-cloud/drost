@@ -142,7 +142,7 @@ Example:
 # Atomic Facts (append-only)
 
 - [id:projects/drost/0001] [ts:2026-03-06] [kind:status] [conf:0.95]
-  Drost is an open-source stripped-down version of Morpheus.
+  Drost is an open-source stripped-down version of reference implementation.
 
 - [id:projects/drost/0002] [ts:2026-03-06] [kind:capability] [conf:0.91]
   Drost supports OpenAI Codex OAuth, Anthropic, and xAI providers.
@@ -176,7 +176,7 @@ Drost is Migel's open-source personal agent runtime. It runs through Telegram an
 
 ## Entity Types
 
-Default entity types should match the Morpheus maintenance runner where practical:
+Default entity types should match the reference implementation maintenance runner where practical:
 
 - `people`
 - `projects`

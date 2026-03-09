@@ -1,8 +1,8 @@
-# Morpheus North-Star Analysis
+# Reference Loop Analysis
 
 ## 1. End-to-End Turn Flow
 
-In Morpheus, a user turn passes through these layers:
+In reference implementation, a user turn passes through these layers:
 
 1. Channel receives inbound user text.
 2. `StreamingHandler.handle_streaming(...)` enqueues work into orchestration lanes.
@@ -11,9 +11,9 @@ In Morpheus, a user turn passes through these layers:
 
 Key references:
 
-- `morpheus/gateway/streaming.py` lines ~305-336
-- `morpheus/gateway/streaming_turn.py` lines ~22-347
-- `morpheus/agent_run.py` lines ~99-407
+- `reference-runtime/gateway/streaming.py` lines ~305-336
+- `reference-runtime/gateway/streaming_turn.py` lines ~22-347
+- `reference-runtime/agent_run.py` lines ~99-407
 
 ## 2. How Tools Are Created
 
@@ -28,7 +28,7 @@ Every tool extends `BaseTool`:
 
 Reference:
 
-- `morpheus/tools/base.py` lines ~9-48
+- `reference-runtime/tools/base.py` lines ~9-48
 
 ### 2.2 Registry Pattern
 
@@ -41,7 +41,7 @@ Reference:
 
 Reference:
 
-- `morpheus/tools/registry.py` lines ~12-107
+- `reference-runtime/tools/registry.py` lines ~12-107
 
 Important behavior:
 
@@ -59,11 +59,11 @@ Tools are assembled during profile boot:
 
 References:
 
-- `morpheus/tools/__init__.py` lines ~101-275
-- `morpheus/gateway/boot_mixins_profiles.py` lines ~55-190
-- `morpheus/gateway/boot_profile_runtime.py` lines ~13-176
-- `morpheus/tools/policy.py` lines ~151-209
-- `morpheus/plugins/runtime.py` lines ~166-287
+- `reference-runtime/tools/__init__.py` lines ~101-275
+- `reference-runtime/gateway/boot_mixins_profiles.py` lines ~55-190
+- `reference-runtime/gateway/boot_profile_runtime.py` lines ~13-176
+- `reference-runtime/tools/policy.py` lines ~151-209
+- `reference-runtime/plugins/runtime.py` lines ~166-287
 
 ## 3. How Tools Are Invoked
 
@@ -76,7 +76,7 @@ Tool invocation happens inside a wrapper executor defined per turn in `process_m
 
 Reference:
 
-- `morpheus/gateway/streaming_turn.py` lines ~261-315
+- `reference-runtime/gateway/streaming_turn.py` lines ~261-315
 
 Inside `AgentRunMixin.run(...)`, each tool call:
 
@@ -87,7 +87,7 @@ Inside `AgentRunMixin.run(...)`, each tool call:
 
 Reference:
 
-- `morpheus/agent_run.py` lines ~224-307
+- `reference-runtime/agent_run.py` lines ~224-307
 
 ## 4. Agentic Loop Mechanics
 
@@ -105,7 +105,7 @@ Core loop behavior in `AgentRunMixin.run(...)`:
 
 Reference:
 
-- `morpheus/agent_run.py` lines ~109-384
+- `reference-runtime/agent_run.py` lines ~109-384
 
 Safety mechanisms:
 
@@ -116,24 +116,24 @@ Safety mechanisms:
 
 Reference:
 
-- `morpheus/agent_run.py` lines ~125-131, ~309-378, ~386-406
+- `reference-runtime/agent_run.py` lines ~125-131, ~309-378, ~386-406
 
 ## 5. Provider-Level Tool Call Parsing
 
-Morpheus keeps provider-specific parsing in provider adapters while exposing a normalized stream interface (`StreamDelta` with optional `tool_call`):
+reference implementation keeps provider-specific parsing in provider adapters while exposing a normalized stream interface (`StreamDelta` with optional `tool_call`):
 
 - OpenAI Responses API parsing from stream events and `response.completed`.
 - Anthropic tool-use block parsing via streaming events.
 
 References:
 
-- `morpheus/providers/openai_streaming.py` lines ~215-410
-- `morpheus/providers/openai.py` lines ~432-454
-- `morpheus/providers/anthropic.py` lines ~281-389
+- `reference-runtime/providers/openai_streaming.py` lines ~215-410
+- `reference-runtime/providers/openai.py` lines ~432-454
+- `reference-runtime/providers/anthropic.py` lines ~281-389
 
 ## 6. Orchestration Around the Loop
 
-Morpheus runs per-lane orchestration for concurrent sessions:
+reference implementation runs per-lane orchestration for concurrent sessions:
 
 - submission queue policies (`collect`, `queue`, `interrupt`, `steer`, etc.),
 - active run cancellation/replacement,
@@ -142,9 +142,9 @@ Morpheus runs per-lane orchestration for concurrent sessions:
 
 References:
 
-- `morpheus/gateway/streaming.py` lines ~82-87, ~305-337
-- `morpheus/orchestration/runtime.py` lines ~70-167, ~422-492
-- `morpheus/orchestration/runtime_internals.py` lines ~69-119
+- `reference-runtime/gateway/streaming.py` lines ~82-87, ~305-337
+- `reference-runtime/orchestration/runtime.py` lines ~70-167, ~422-492
+- `reference-runtime/orchestration/runtime_internals.py` lines ~69-119
 
 ## 7. What to Reuse for Drost
 
@@ -165,7 +165,7 @@ Patterns to simplify for Drost v1:
 
 Locked Drost v1 implication:
 
-- keep Morpheus loop mechanics, but ship a practical initial tool pack:
+- keep reference implementation loop mechanics, but ship a practical initial tool pack:
   - memory (`memory_search`, `memory_get`),
   - session (`session_status`),
   - filesystem (`file_read`, `file_write`),

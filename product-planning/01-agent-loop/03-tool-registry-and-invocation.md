@@ -9,7 +9,7 @@ Define a stable contract for how Drost tools are:
 - invoked from model tool calls,
 - traced and error-normalized.
 
-This contract is modeled after Morpheus’s `BaseTool` + `ToolRegistry` pattern.
+This contract is modeled after reference implementation’s `BaseTool` + `ToolRegistry` pattern.
 
 ## 2. Core Interfaces
 
@@ -58,7 +58,7 @@ Dispatch requirements:
 2. Drop `None` values before passing kwargs to preserve defaults.
 3. Catch unexpected exceptions and return `Error executing <tool>: <msg>`.
 
-This behavior mirrors Morpheus `ToolRegistry.dispatch(...)` and keeps loop robust under model mistakes.
+This behavior mirrors reference implementation `ToolRegistry.dispatch(...)` and keeps loop robust under model mistakes.
 
 ## 4. Tool Lifecycle Per Turn
 
@@ -183,7 +183,7 @@ v1 stance:
 
 Recommended output handling:
 
-- wrap external-content tool outputs (`web_search`, `web_fetch`) as untrusted content to reduce prompt-injection effects (Morpheus pattern).
+- wrap external-content tool outputs (`web_search`, `web_fetch`) as untrusted content to reduce prompt-injection effects (reference implementation pattern).
 - redact secrets and truncate large outputs in traces.
 
 ## 7. Observability Contract

@@ -1,6 +1,6 @@
 """OAuth helpers for OpenAI Codex authentication.
 
-Behavior mirrors Morpheus:
+Behavior mirrors reference implementation:
 - If OpenAI API key is absent, read Codex tokens from ~/.codex/auth.json
 - Refresh using refresh_token grant against auth.openai.com
 """

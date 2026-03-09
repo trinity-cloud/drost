@@ -128,7 +128,7 @@ Exit criteria:
 Tasks:
 
 - add `LoopRunner` interface (`run_turn(...)` contract).
-- add `DefaultSingleLoopRunner` with Morpheus-style iteration.
+- add `DefaultSingleLoopRunner` with reference implementation-style iteration.
 - integrate usage aggregation, tool call counting, and loop cap enforcement.
 - keep return API compatible with existing `AgentRuntime.respond(...)`.
 

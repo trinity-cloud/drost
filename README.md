@@ -2,7 +2,7 @@
 
 Drost is an open-source personal AI agent for trusted, owner-operated environments.
 
-It is built from Morpheus patterns, but intentionally stripped down: one gateway, one messaging channel, three providers, a real tool-using loop, multimodal input, persistent sessions, and memory that compounds over time.
+It is intentionally stripped down: one gateway, one messaging channel, three providers, a real tool-using loop, multimodal input, persistent sessions, and memory that compounds over time.
 
 Drost is not a chatbot wrapper. It is an agent runtime.
 

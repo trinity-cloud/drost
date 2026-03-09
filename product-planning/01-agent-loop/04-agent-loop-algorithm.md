@@ -2,7 +2,7 @@
 
 ## 1. Algorithm Overview
 
-Target loop (Morpheus-derived):
+Target loop (reference implementation-derived):
 
 1. Assemble prompt context (`SOUL.md` + workspace context + memory context) under budget.
 2. Apply deterministic history trimming to fit budgets.
@@ -120,7 +120,7 @@ Recommended event types:
 - `error`
 - `complete`
 
-This mirrors Morpheus `AgentEvent` and allows future UI/transport upgrades with no loop rewrite.
+This mirrors reference implementation `AgentEvent` and allows future UI/transport upgrades with no loop rewrite.
 
 Telegram mapping:
 

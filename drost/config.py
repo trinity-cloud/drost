@@ -279,7 +279,7 @@ class Settings(BaseSettings):
 
     @property
     def codex_oauth_enabled(self) -> bool:
-        # Morpheus behavior: missing API key means use Codex OAuth.
+        # reference implementation behavior: missing API key means use Codex OAuth.
         return not bool(self.openai_api_key)
 
 

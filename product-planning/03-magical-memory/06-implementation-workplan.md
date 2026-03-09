@@ -2,7 +2,7 @@
 
 ## Build Objective
 
-Ship compounding memory without bloating Drost into Morpheus.
+Ship compounding memory without bloating Drost into reference implementation.
 
 The work should preserve the current architecture:
 

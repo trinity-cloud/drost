@@ -2,7 +2,7 @@
 
 ## Design Goal
 
-Recreate the Morpheus product effect with a lean Drost stack:
+Recreate the reference implementation product effect with a lean Drost stack:
 
 - file-backed workspace context for identity and memory
 - SQLite + sqvector as the index and retrieval engine
@@ -100,7 +100,7 @@ This order matters. `SOUL.md` and `IDENTITY.md` should shape the agent before ta
           summary.md
 ```
 
-Default entity types should match Morpheus where practical:
+Default entity types should match reference implementation where practical:
 
 - people
 - projects
@@ -201,7 +201,7 @@ This is the cheapest high-impact feature for making separate sessions feel like 
 
 ## Graph-Lite Instead Of Full Graph
 
-Do not port Morpheus graph infrastructure yet.
+Do not port reference implementation graph infrastructure yet.
 
 Instead:
 

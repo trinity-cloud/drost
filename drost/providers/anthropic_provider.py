@@ -115,7 +115,7 @@ class AnthropicProvider(BaseProvider):
 
         self._is_setup_token = "sk-ant-oat" in token
         if self._is_setup_token:
-            # Mirror Morpheus/OAuth behavior for Claude Code setup-token or OAuth token.
+            # Mirror reference implementation/OAuth behavior for Claude Code setup-token or OAuth token.
             for var in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]:
                 os.environ.pop(var, None)
             client_kwargs["api_key"] = None

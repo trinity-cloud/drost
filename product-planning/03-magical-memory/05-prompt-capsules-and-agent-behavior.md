@@ -10,7 +10,7 @@ This is where the memory system becomes a product feature rather than just a sto
 
 Workspace files are reread and injected on every LLM call.
 
-That already matches the current Drost direction and the Morpheus pattern. The model should not need to explicitly `file_read` core workspace files just to absorb them.
+That already matches the current Drost direction and the reference implementation pattern. The model should not need to explicitly `file_read` core workspace files just to absorb them.
 
 ## Prompt Stack
 

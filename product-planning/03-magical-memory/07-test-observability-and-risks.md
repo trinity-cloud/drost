@@ -204,9 +204,9 @@ Mitigation:
 - log changed files and counts
 - never make SQLite the only place meaning lives
 
-### 7. Over-Porting Morpheus
+### 7. Over-Porting reference implementation
 
-Drost does not need every Morpheus subsystem.
+Drost does not need every reference implementation subsystem.
 
 Mitigation:
 
