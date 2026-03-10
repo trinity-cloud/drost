@@ -78,6 +78,11 @@ class ManagedRunnerLoop(ManagedLoop):
         self._last_started_at = ""
         self._last_stopped_at = ""
         self._last_error = ""
+        self._last_failure_at = ""
+        self._start_count = 0
+        self._stop_count = 0
+        self._failure_count = 0
+        self._recovery_count = 0
 
     @property
     def name(self) -> str:
@@ -92,14 +97,20 @@ class ManagedRunnerLoop(ManagedLoop):
         return self._visibility
 
     async def start(self) -> None:
+        prior_state = self._state
         try:
             await self._start_fn()
         except Exception as exc:
             self._state = LoopLifecycleState.FAILED
             self._last_error = str(exc)
+            self._last_failure_at = self._utc_now()
+            self._failure_count += 1
             raise
+        if prior_state == LoopLifecycleState.FAILED:
+            self._recovery_count += 1
         self._state = LoopLifecycleState.RUNNING
         self._last_started_at = self._utc_now()
+        self._start_count += 1
         self._last_error = ""
 
     async def stop(self) -> None:
@@ -108,9 +119,12 @@ class ManagedRunnerLoop(ManagedLoop):
         except Exception as exc:
             self._state = LoopLifecycleState.FAILED
             self._last_error = str(exc)
+            self._last_failure_at = self._utc_now()
+            self._failure_count += 1
             raise
         self._state = LoopLifecycleState.STOPPED
         self._last_stopped_at = self._utc_now()
+        self._stop_count += 1
 
     def status(self) -> dict[str, Any]:
         details: dict[str, Any]
@@ -119,6 +133,8 @@ class ManagedRunnerLoop(ManagedLoop):
         except Exception as exc:
             self._state = LoopLifecycleState.FAILED
             self._last_error = str(exc)
+            self._last_failure_at = self._utc_now()
+            self._failure_count += 1
             details = {"status_error": str(exc)}
         details.update(
             {
@@ -129,6 +145,11 @@ class ManagedRunnerLoop(ManagedLoop):
                 "last_started_at": self._last_started_at,
                 "last_stopped_at": self._last_stopped_at,
                 "last_error": self._last_error,
+                "last_failure_at": self._last_failure_at,
+                "start_count": self._start_count,
+                "stop_count": self._stop_count,
+                "failure_count": self._failure_count,
+                "recovery_count": self._recovery_count,
             }
         )
         return details

@@ -96,8 +96,11 @@ async def test_loop_manager_status_aggregates_loop_metadata() -> None:
     assert status["running"] is True
     assert status["loop_count"] == 1
     assert status["loop_names"] == ["maintenance_loop"]
+    assert status["loop_health"]["running"] == 1
+    assert status["failed_loops"] == []
     assert status["loops"]["maintenance_loop"]["state"] == "running"
     assert status["loops"]["maintenance_loop"]["enabled"] is True
+    assert status["loops"]["maintenance_loop"]["start_count"] == 1
 
 
 @pytest.mark.asyncio

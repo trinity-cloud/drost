@@ -48,6 +48,11 @@ async def test_conversation_loop_tracks_turn_lifecycle_from_events() -> None:
         await loop.stop()
 
     status = loop.status()
+    assert status["state"] == "stopped"
+    assert status["name"] == "conversation_loop"
+    assert status["start_count"] == 1
+    assert status["stop_count"] == 1
+    assert status["failure_count"] == 0
     assert status["last_chat_id"] == 123
     assert status["last_session_key"] == "main:telegram:123__s_2026-03-10_11-00-00"
     assert status["last_user_message_at"]

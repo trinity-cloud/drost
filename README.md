@@ -220,6 +220,14 @@ Additional runtime inspection endpoints:
 - `GET /v1/mind/status`
 - `GET /v1/events/status`
 
+`GET /v1/loops/status` is now the consolidated operator view. It includes:
+
+- loop-manager policy state
+- loop health summary
+- per-loop status
+- current mode/focus/activity/health from shared mind state
+- event counts and recent event tail
+
 ## Deployer
 
 Drost now ships these entry points:

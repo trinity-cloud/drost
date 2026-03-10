@@ -170,6 +170,23 @@ class Gateway:
     async def _noop_start(self) -> None:
         return None
 
+    def _runtime_status_payload(self) -> dict[str, Any]:
+        loops = self.loop_manager.status()
+        mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+        events = self.loop_events.status()
+        return {
+            **loops,
+            "mode": str(mind.get("mode") or "active"),
+            "focus": dict(mind.get("focus") or {}),
+            "activity": dict(mind.get("activity") or {}),
+            "health": dict(mind.get("health") or {}),
+            "event_counts": dict(events.get("event_counts") or {}),
+            "recent_events": list(events.get("recent_events") or []),
+            "subscriber_count": int(events.get("subscriber_count") or 0),
+            "subscriptions": dict(events.get("subscriptions") or {}),
+            "total_events_emitted": int(events.get("total_emitted") or 0),
+        }
+
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()
         media = context.get("media") if isinstance(context.get("media"), list) else None
@@ -322,9 +339,8 @@ class Gateway:
 
         @self.app.get("/v1/loops/status")
         async def loops_status() -> dict[str, Any]:
-            status = self.loop_manager.status()
             self._sync_shared_mind_state()
-            return status
+            return self._runtime_status_payload()
 
         @self.app.get("/v1/events/status")
         async def events_status() -> dict[str, Any]:

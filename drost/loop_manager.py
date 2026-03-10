@@ -75,6 +75,14 @@ class LoopManager:
                 raise RuntimeError(self._last_error)
 
     def status(self) -> dict[str, Any]:
+        loops = {loop.name: loop.status() for loop in self._ordered_loops()}
+        states = [str(item.get("state") or "") for item in loops.values() if isinstance(item, dict)]
+        loop_health = {
+            "running": sum(1 for state in states if state == "running"),
+            "failed": sum(1 for state in states if state == "failed"),
+            "stopped": sum(1 for state in states if state == "stopped"),
+            "registered": sum(1 for state in states if state == "registered"),
+        }
         return {
             "running": self._running,
             "loop_count": len(self._loops),
@@ -88,7 +96,9 @@ class LoopManager:
             "proactive_action_owner": self._proactive_action_owner,
             "last_proactive_action_at": self._last_proactive_action_at,
             "last_proactive_action_reason": self._last_proactive_action_reason,
-            "loops": {loop.name: loop.status() for loop in self._ordered_loops()},
+            "loop_health": loop_health,
+            "failed_loops": sorted(name for name, item in loops.items() if str(item.get("state") or "") == "failed"),
+            "loops": loops,
         }
 
     def background_policy(self, loop_name: str) -> dict[str, Any]:
