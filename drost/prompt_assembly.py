@@ -27,6 +27,11 @@ FOLLOW_UP_AWARENESS_GUIDANCE = """[Follow-Up Awareness]
 - If the user resolves one, acknowledge it and keep that resolution in mind.
 - Do not force an unrelated follow-up into the reply unless it materially helps with the user's current request."""
 
+FOLLOW_UP_CONTROL_GUIDANCE = """[Follow-Up Control]
+- Use followup_status to inspect outstanding follow-ups for the current chat.
+- Use followup_update to complete, dismiss, or snooze a follow-up when the user clearly resolves or postpones it.
+- Prefer resolving a surfaced follow-up in the same turn instead of letting it linger."""
+
 RUNTIME_TOPOLOGY_GUIDANCE = """[Runtime Topology]
 - The runtime facts below are authoritative for this turn.
 - Do not call tools just to rediscover repo root, workspace root, launch mode, or health URL unless you have reason to think they changed."""
@@ -76,6 +81,8 @@ class PromptAssembler:
                 sections.append(MEMORY_RECALL_GUIDANCE)
             if "deployer_request" in tools or "deployer_status" in tools:
                 sections.append(DEPLOYER_CONTROL_GUIDANCE)
+            if "followup_status" in tools or "followup_update" in tools:
+                sections.append(FOLLOW_UP_CONTROL_GUIDANCE)
 
         sections.append(self._build_workspace_runtime_section())
         sections.extend(self._build_workspace_sections(workspace))

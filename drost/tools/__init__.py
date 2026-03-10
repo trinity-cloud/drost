@@ -4,11 +4,14 @@ from collections.abc import Callable
 
 from drost.config import Settings
 from drost.embeddings import EmbeddingService
+from drost.followups import FollowUpStore
 from drost.storage import SQLiteStore, WorkspaceMemoryIndexer
 from drost.tools.deployer_request import DeployerRequestTool
 from drost.tools.deployer_status import DeployerStatusTool
 from drost.tools.file_read import FileReadTool
 from drost.tools.file_write import FileWriteTool
+from drost.tools.followup_status import FollowUpStatusTool
+from drost.tools.followup_update import FollowUpUpdateTool
 from drost.tools.memory_get import MemoryGetTool
 from drost.tools.memory_search import MemorySearchTool
 from drost.tools.registry import ToolRegistry
@@ -29,6 +32,7 @@ def build_default_registry(
     store: SQLiteStore,
     embeddings: EmbeddingService,
     workspace_memory_indexer: WorkspaceMemoryIndexer,
+    followups: FollowUpStore,
     current_chat_id: Callable[[], int],
     current_session_key: Callable[[], str],
 ) -> ToolRegistry:
@@ -41,6 +45,8 @@ def build_default_registry(
             default_limit=settings.memory_top_k,
         )
     )
+    registry.register(FollowUpStatusTool(followups=followups, current_chat_id=current_chat_id))
+    registry.register(FollowUpUpdateTool(followups=followups, current_chat_id=current_chat_id))
     registry.register(MemoryGetTool(store=store, workspace_dir=settings.workspace_dir))
     registry.register(
         SessionStatusTool(

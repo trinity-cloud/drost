@@ -127,15 +127,17 @@ class AgentRuntime:
 
         lines = ["[Due Follow-Ups]"]
         for item in items:
+            followup_id = str(item.get("id") or "").strip()
             due_at = str(item.get("due_at") or "").strip()
             priority = str(item.get("priority") or "medium").strip().lower() or "medium"
             subject = str(item.get("subject") or "").strip()
             prompt = str(item.get("follow_up_prompt") or "").strip()
             status = str(item.get("status") or "pending").strip().lower() or "pending"
+            prefix = f"[id={followup_id}] " if followup_id else ""
             if prompt:
-                lines.append(f"- ({priority}; {status}; due={due_at}) {prompt}")
+                lines.append(f"- {prefix}({priority}; {status}; due={due_at}) {prompt}")
             elif subject:
-                lines.append(f"- ({priority}; {status}; due={due_at}) {subject}")
+                lines.append(f"- {prefix}({priority}; {status}; due={due_at}) {subject}")
         if len(lines) == 1:
             return ""
         return truncate_text_to_budget("\n".join(lines), self._settings.context_budget_memory_tokens)
@@ -482,6 +484,7 @@ class AgentRuntime:
             store=self._store,
             embeddings=self._embeddings,
             workspace_memory_indexer=self._workspace_memory_indexer,
+            followups=self._followups,
             current_chat_id=lambda: chat_id,
             current_session_key=lambda: session_key,
         )

@@ -55,6 +55,8 @@ Drost currently ships with these built-in tools:
 - `session_status`
 - `deployer_status`
 - `deployer_request`
+- `followup_status`
+- `followup_update`
 - `file_read`
 - `file_write`
 - `shell_execute`
