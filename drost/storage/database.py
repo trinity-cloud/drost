@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import struct
 import threading
@@ -17,6 +18,11 @@ from drost.storage.keys import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_alias_key(value: str) -> str:
+    lowered = str(value or "").strip().casefold()
+    return re.sub(r"\s+", " ", lowered)
 
 
 class SQLiteStore:
@@ -130,6 +136,50 @@ class SQLiteStore:
               updated_at TEXT NOT NULL,
               chunk_count INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              title TEXT NOT NULL DEFAULT '',
+              entity_path TEXT NOT NULL DEFAULT '',
+              summary_path TEXT NOT NULL DEFAULT '',
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(entity_type, entity_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_aliases (
+              entity_type TEXT NOT NULL,
+              entity_id TEXT NOT NULL,
+              alias TEXT NOT NULL,
+              alias_normalized TEXT NOT NULL,
+              path TEXT NOT NULL DEFAULT '',
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(entity_type, entity_id, alias_normalized)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_aliases_normalized
+              ON memory_entity_aliases(alias_normalized);
+
+            CREATE TABLE IF NOT EXISTS memory_relations (
+              relation_id TEXT PRIMARY KEY,
+              from_entity_type TEXT NOT NULL,
+              from_entity_id TEXT NOT NULL,
+              relation_type TEXT NOT NULL,
+              to_entity_type TEXT NOT NULL,
+              to_entity_id TEXT NOT NULL,
+              relation_text TEXT NOT NULL,
+              confidence REAL,
+              path TEXT NOT NULL DEFAULT '',
+              line_start INTEGER NOT NULL DEFAULT 1,
+              line_end INTEGER NOT NULL DEFAULT 1,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_from
+              ON memory_relations(from_entity_type, from_entity_id, relation_type);
+
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_to
+              ON memory_relations(to_entity_type, to_entity_id, relation_type);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
               USING fts5(content, chunk_id UNINDEXED);
@@ -354,6 +404,21 @@ class SQLiteStore:
                     self._conn.execute("SELECT COUNT(*) AS n FROM memory_indexed_files").fetchone() or {"n": 0}
                 )["n"]
             )
+            entity_count = int(
+                (
+                    self._conn.execute("SELECT COUNT(*) AS n FROM memory_entities").fetchone() or {"n": 0}
+                )["n"]
+            )
+            alias_count = int(
+                (
+                    self._conn.execute("SELECT COUNT(*) AS n FROM memory_entity_aliases").fetchone() or {"n": 0}
+                )["n"]
+            )
+            relation_count = int(
+                (
+                    self._conn.execute("SELECT COUNT(*) AS n FROM memory_relations").fetchone() or {"n": 0}
+                )["n"]
+            )
         return {
             "vector_enabled": bool(self._vector_enabled),
             "vector_error": self._vector_error,
@@ -362,6 +427,9 @@ class SQLiteStore:
             "db_path": str(self.db_path),
             "source_counts": counts,
             "indexed_files": indexed_files,
+            "graph_entities": entity_count,
+            "graph_aliases": alias_count,
+            "graph_relations": relation_count,
         }
 
     @staticmethod
@@ -917,6 +985,149 @@ class SQLiteStore:
                   FROM memory_indexed_files
               ORDER BY path ASC
                 """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def replace_graph_index(
+        self,
+        *,
+        entities: list[dict[str, Any]],
+        aliases: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM memory_entities")
+            self._conn.execute("DELETE FROM memory_entity_aliases")
+            self._conn.execute("DELETE FROM memory_relations")
+
+            for entity in entities:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_entities(
+                      entity_type, entity_id, title, entity_path, summary_path, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(entity.get("entity_type") or "").strip(),
+                        str(entity.get("entity_id") or "").strip(),
+                        str(entity.get("title") or "").strip(),
+                        str(entity.get("entity_path") or "").strip(),
+                        str(entity.get("summary_path") or "").strip(),
+                        str(entity.get("updated_at") or self._utc_now()),
+                    ),
+                )
+
+            for alias in aliases:
+                alias_text = str(alias.get("alias") or "").strip()
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_entity_aliases(
+                      entity_type, entity_id, alias, alias_normalized, path, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(alias.get("entity_type") or "").strip(),
+                        str(alias.get("entity_id") or "").strip(),
+                        alias_text,
+                        _normalize_alias_key(alias_text),
+                        str(alias.get("path") or "").strip(),
+                        str(alias.get("updated_at") or self._utc_now()),
+                    ),
+                )
+
+            for relation in relations:
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_relations(
+                      relation_id, from_entity_type, from_entity_id, relation_type,
+                      to_entity_type, to_entity_id, relation_text, confidence,
+                      path, line_start, line_end, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(relation.get("relation_id") or "").strip(),
+                        str(relation.get("from_entity_type") or "").strip(),
+                        str(relation.get("from_entity_id") or "").strip(),
+                        str(relation.get("relation_type") or "").strip(),
+                        str(relation.get("to_entity_type") or "").strip(),
+                        str(relation.get("to_entity_id") or "").strip(),
+                        str(relation.get("relation_text") or "").strip(),
+                        relation.get("confidence"),
+                        str(relation.get("path") or "").strip(),
+                        max(1, int(relation.get("line_start") or 1)),
+                        max(1, int(relation.get("line_end") or relation.get("line_start") or 1)),
+                        str(relation.get("updated_at") or self._utc_now()),
+                    ),
+                )
+
+            self._conn.commit()
+
+    def list_memory_entities(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT entity_type, entity_id, title, entity_path, summary_path, updated_at
+                  FROM memory_entities
+              ORDER BY entity_type ASC, entity_id ASC
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_entity_by_alias(self, alias: str) -> dict[str, Any] | None:
+        normalized = _normalize_alias_key(alias)
+        if not normalized:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT e.entity_type,
+                       e.entity_id,
+                       e.title,
+                       e.entity_path,
+                       e.summary_path,
+                       e.updated_at,
+                       a.alias,
+                       a.path AS alias_path
+                  FROM memory_entity_aliases a
+                  JOIN memory_entities e
+                    ON e.entity_type = a.entity_type
+                   AND e.entity_id = a.entity_id
+                 WHERE a.alias_normalized = ?
+                 LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_entity_relations(self, entity_type: str, entity_id: str) -> list[dict[str, Any]]:
+        cleaned_type = str(entity_type or "").strip()
+        cleaned_id = str(entity_id or "").strip()
+        if not cleaned_type or not cleaned_id:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT relation_id,
+                       from_entity_type,
+                       from_entity_id,
+                       relation_type,
+                       to_entity_type,
+                       to_entity_id,
+                       relation_text,
+                       confidence,
+                       path,
+                       line_start,
+                       line_end,
+                       updated_at
+                  FROM memory_relations
+                 WHERE from_entity_type = ?
+                   AND from_entity_id = ?
+              ORDER BY updated_at DESC, relation_id ASC
+                """,
+                (cleaned_type, cleaned_id),
             ).fetchall()
         return [dict(row) for row in rows]
 

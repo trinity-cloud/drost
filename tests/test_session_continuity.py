@@ -110,7 +110,7 @@ async def test_session_continuity_manager_generates_and_persists_summary(tmp_pat
         store=store,
         sessions_dir=sessions,
         provider_getter=lambda: provider,
-        embed_document=lambda text, title=None: _embed_constant(text, title),
+        embed_document=_embed_constant,
         enabled=True,
         source_max_messages=50,
         source_max_chars=12_000,
@@ -179,6 +179,6 @@ async def test_session_continuity_schedule_skips_when_no_prior_messages(tmp_path
     store.close()
 
 
-async def _embed_constant(text: str, title: str | None = None) -> list[float]:
+async def _embed_constant(text: str, *, title: str | None = None) -> list[float]:
     _ = text, title
     return [0.25] * 64

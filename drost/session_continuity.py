@@ -57,7 +57,7 @@ class SessionContinuityManager:
         store: SQLiteStore,
         sessions_dir: Path,
         provider_getter: Callable[[], BaseProvider],
-        embed_document: Callable[[str, str | None], Awaitable[list[float]]] | None = None,
+        embed_document: Callable[..., Awaitable[list[float]]] | None = None,
         enabled: bool,
         auto_on_new: bool = True,
         source_max_messages: int = 120,
@@ -158,7 +158,7 @@ class SessionContinuityManager:
                     try:
                         embedding = await self._embed_document(
                             summary,
-                            f"continuity/{req.from_session_id}",
+                            title=f"continuity/{req.from_session_id}",
                         )
                     except Exception:
                         logger.warning("Continuity embedding failed; storing keyword-only continuity row", exc_info=True)
