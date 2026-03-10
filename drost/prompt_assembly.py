@@ -22,6 +22,11 @@ MEMORY_RECALL_GUIDANCE = """[Memory Recall]
 - Use memory_search to locate likely hits, then memory_get to inspect the exact source when needed.
 - If memory is thin or uncertain, say so plainly."""
 
+FOLLOW_UP_AWARENESS_GUIDANCE = """[Follow-Up Awareness]
+- Treat due follow-ups below as operational context for this turn.
+- If the user resolves one, acknowledge it and keep that resolution in mind.
+- Do not force an unrelated follow-up into the reply unless it materially helps with the user's current request."""
+
 RUNTIME_TOPOLOGY_GUIDANCE = """[Runtime Topology]
 - The runtime facts below are authoritative for this turn.
 - Do not call tools just to rediscover repo root, workspace root, launch mode, or health URL unless you have reason to think they changed."""
@@ -49,6 +54,7 @@ class PromptAssembler:
         *,
         base_prompt: str,
         memory_block: str = "",
+        follow_up_block: str = "",
         continuity_summary: str = "",
         history_summary: str = "",
         provider_name: str = "",
@@ -83,6 +89,9 @@ class PromptAssembler:
 
         if memory_block.strip():
             sections.append(memory_block.strip())
+        if follow_up_block.strip():
+            sections.append(FOLLOW_UP_AWARENESS_GUIDANCE)
+            sections.append(follow_up_block.strip())
 
         hints: list[str] = []
         if provider_name:

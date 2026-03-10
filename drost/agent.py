@@ -16,6 +16,7 @@ from drost.context_budget import (
     truncate_text_to_budget,
 )
 from drost.embeddings import EmbeddingService
+from drost.followups import FollowUpStore
 from drost.memory_capsule import MemoryCapsuleBuilder
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
@@ -59,6 +60,7 @@ class AgentRuntime:
             store=store,
             embeddings=embeddings,
         )
+        self._followups = FollowUpStore(settings.workspace_dir)
         self._memory_capsule_builder = MemoryCapsuleBuilder(settings)
         self._last_run: dict[str, Any] | None = None
 
@@ -108,6 +110,32 @@ class AgentRuntime:
                 continue
             lines.append(f"- ({label}) {snippet}")
 
+        if len(lines) == 1:
+            return ""
+        return truncate_text_to_budget("\n".join(lines), self._settings.context_budget_memory_tokens)
+
+    def _build_follow_up_block(self, *, chat_id: int) -> str:
+        if not self._settings.followups_enabled:
+            return ""
+        items = self._followups.list_relevant(
+            chat_id=chat_id,
+            limit=4,
+            lookahead_hours=self._settings.followup_prompt_lookahead_hours,
+        )
+        if not items:
+            return ""
+
+        lines = ["[Due Follow-Ups]"]
+        for item in items:
+            due_at = str(item.get("due_at") or "").strip()
+            priority = str(item.get("priority") or "medium").strip().lower() or "medium"
+            subject = str(item.get("subject") or "").strip()
+            prompt = str(item.get("follow_up_prompt") or "").strip()
+            status = str(item.get("status") or "pending").strip().lower() or "pending"
+            if prompt:
+                lines.append(f"- ({priority}; {status}; due={due_at}) {prompt}")
+            elif subject:
+                lines.append(f"- ({priority}; {status}; due={due_at}) {subject}")
         if len(lines) == 1:
             return ""
         return truncate_text_to_budget("\n".join(lines), self._settings.context_budget_memory_tokens)
@@ -397,6 +425,7 @@ class AgentRuntime:
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []
         memory_block = ""
+        follow_up_block = self._build_follow_up_block(chat_id=chat_id)
         continuity_summary = self._load_continuity_summary(session_key)
         if self._settings.memory_enabled and query_text:
             await self._workspace_memory_indexer.sync()
@@ -460,6 +489,7 @@ class AgentRuntime:
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,
             memory_block=memory_block,
+            follow_up_block=follow_up_block,
             continuity_summary="" if memory_block else continuity_summary,
             history_summary=history_summary,
             provider_name=provider.name,

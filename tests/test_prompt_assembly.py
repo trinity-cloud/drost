@@ -26,6 +26,7 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     prompt = assembler.assemble(
         base_prompt="Base prompt",
         memory_block="Memory block",
+        follow_up_block="[Due Follow-Ups]\n- (high; pending; due=2026-03-10T19:00:00Z) How did the CPAP fitting go?",
         history_summary="Summary block",
         provider_name="openai-codex",
         tool_names=["file_read", "memory_search", "web_search", "deployer_request", "deployer_status"],
@@ -38,6 +39,9 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "Extra workspace file" in prompt
     assert "Summary block" in prompt
     assert "Memory block" in prompt
+    assert "[Due Follow-Ups]" in prompt
+    assert "How did the CPAP fitting go?" in prompt
+    assert "[Follow-Up Awareness]" in prompt
     assert "openai-codex" in prompt
     assert "file_read" in prompt
     assert "memory_search" in prompt

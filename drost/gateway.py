@@ -10,6 +10,9 @@ from drost.agent import AgentRuntime
 from drost.channels import TelegramChannel
 from drost.config import Settings
 from drost.embeddings import EmbeddingService
+from drost.followups import FollowUpStore
+from drost.idle_heartbeat import IdleHeartbeatRunner
+from drost.idle_state import IdleStateStore
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
@@ -40,6 +43,8 @@ class Gateway:
         )
         self.providers = build_provider_registry(settings)
         self.embeddings = EmbeddingService(settings)
+        self.followups = FollowUpStore(settings.workspace_dir)
+        self.idle_state = IdleStateStore(settings.workspace_dir)
         self.agent = AgentRuntime(
             settings=settings,
             providers=self.providers,
@@ -55,6 +60,9 @@ class Gateway:
             interval_seconds=settings.memory_maintenance_interval_seconds,
             max_events_per_run=settings.memory_maintenance_max_events_per_run,
             entity_synthesis_enabled=settings.memory_entity_synthesis_enabled,
+            followups=self.followups,
+            followups_enabled=settings.followups_enabled,
+            followup_confidence_threshold=settings.followup_confidence_threshold,
         )
         self.session_continuity = SessionContinuityManager(
             store=self.store,
@@ -84,6 +92,17 @@ class Gateway:
         )
         self.telegram.set_message_handler(self._handle_telegram_message)
         self.telegram.set_new_session_handler(self._handle_new_session_transition)
+        self.idle_heartbeat = IdleHeartbeatRunner(
+            workspace_dir=settings.workspace_dir,
+            followups=self.followups,
+            idle_state=self.idle_state,
+            send_message=lambda chat_id, message: self.telegram.send(chat_id, message),
+            enabled=settings.idle_mode_enabled and settings.idle_heartbeat_enabled,
+            proactive_enabled=settings.proactive_surfacing_enabled,
+            interval_seconds=settings.idle_heartbeat_interval_seconds,
+            active_window_seconds=settings.idle_active_window_seconds,
+            proactive_cooldown_seconds=settings.proactive_followup_cooldown_seconds,
+        )
 
         self.app = FastAPI(title="Drost Gateway", version="0.1.0")
         self.app.state.gateway = self
@@ -97,10 +116,15 @@ class Gateway:
             return None
 
         chat_id = int(context.get("chat_id") or 0)
+        settings = getattr(self, "settings", None)
+        idle_mode_enabled = bool(getattr(settings, "idle_mode_enabled", False))
+        idle_state = getattr(self, "idle_state", None)
+        if chat_id > 0 and idle_mode_enabled and idle_state is not None:
+            idle_state.mark_user_message(chat_id=chat_id)
         session_id = context.get("session_id")
         status_callback = context.get("status_callback")
         answer_stream_callback = context.get("answer_stream_callback")
-        return await self.agent.respond(
+        reply = await self.agent.respond(
             chat_id=chat_id,
             text=text,
             session_id=(str(session_id).strip() if session_id is not None else None),
@@ -108,6 +132,9 @@ class Gateway:
             status_callback=status_callback if callable(status_callback) else None,
             answer_stream_callback=answer_stream_callback if callable(answer_stream_callback) else None,
         )
+        if chat_id > 0 and idle_mode_enabled and idle_state is not None:
+            idle_state.mark_assistant_message(chat_id=chat_id)
+        return reply
 
     async def _handle_new_session_transition(self, payload: dict[str, Any]) -> dict[str, Any]:
         from_session_key = str(payload.get("from_session_key") or "").strip()
@@ -134,6 +161,7 @@ class Gateway:
                 await self.agent.sync_memory_index()
             await self.memory_maintenance.start()
             await self.telegram.start(self.app)
+            await self.idle_heartbeat.start()
             logger.info(
                 "Drost gateway started (provider=%s db=%s)",
                 self.agent.active_provider,
@@ -142,6 +170,7 @@ class Gateway:
 
         @self.app.on_event("shutdown")
         async def shutdown() -> None:
+            await self.idle_heartbeat.stop()
             await self.telegram.stop()
             await self.session_continuity.shutdown()
             await self.memory_maintenance.stop()
@@ -185,6 +214,25 @@ class Gateway:
         @self.app.get("/v1/memory/maintenance/status")
         async def memory_maintenance_status() -> dict[str, Any]:
             return self.memory_maintenance.status()
+
+        @self.app.get("/v1/followups")
+        async def followups(chat_id: int | None = None) -> dict[str, Any]:
+            return {
+                "count": len(self.followups.list_followups(chat_id=chat_id)),
+                "items": self.followups.list_followups(chat_id=chat_id),
+            }
+
+        @self.app.get("/v1/idle/status")
+        async def idle_status() -> dict[str, Any]:
+            return self.idle_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+
+        @self.app.get("/v1/heartbeat/status")
+        async def heartbeat_status() -> dict[str, Any]:
+            return self.idle_heartbeat.status()
+
+        @self.app.post("/v1/heartbeat/run-once")
+        async def heartbeat_run_once() -> dict[str, Any]:
+            return {"ok": True, "result": await self.idle_heartbeat.run_once(reason="manual")}
 
         @self.app.get("/v1/memory/continuity/status")
         async def memory_continuity_status() -> dict[str, Any]:

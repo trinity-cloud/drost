@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     memory_continuity_inject_until_messages: int = 12
     memory_capsule_enabled: bool = True
     memory_capsule_search_limit: int = 18
+    followups_enabled: bool = True
+    followup_confidence_threshold: float = 0.80
+    followup_prompt_lookahead_hours: int = 72
+    idle_mode_enabled: bool = True
+    idle_active_window_seconds: int = 20 * 60
+    idle_heartbeat_enabled: bool = True
+    idle_heartbeat_interval_seconds: int = 1800
+    proactive_surfacing_enabled: bool = True
+    proactive_followup_cooldown_seconds: int = 6 * 60 * 60
 
     session_history_limit: int = 64
 
@@ -199,6 +208,10 @@ class Settings(BaseSettings):
         "memory_continuity_summary_max_chars",
         "memory_continuity_inject_until_messages",
         "memory_capsule_search_limit",
+        "followup_prompt_lookahead_hours",
+        "idle_active_window_seconds",
+        "idle_heartbeat_interval_seconds",
+        "proactive_followup_cooldown_seconds",
         "context_budget_total_tokens",
         "context_budget_system_tokens",
         "context_budget_history_tokens",
@@ -219,6 +232,14 @@ class Settings(BaseSettings):
         if float(value) <= 0:
             raise ValueError("value must be > 0")
         return float(value)
+
+    @field_validator("followup_confidence_threshold")
+    @classmethod
+    def validate_followup_confidence_threshold(cls, value: float) -> float:
+        threshold = float(value)
+        if threshold < 0.0 or threshold > 1.0:
+            raise ValueError("followup_confidence_threshold must be in [0, 1]")
+        return threshold
 
     @field_validator("history_compaction_trigger_ratio")
     @classmethod

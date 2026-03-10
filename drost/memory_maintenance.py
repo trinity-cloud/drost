@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from drost.entity_resolution import EntityResolver
+from drost.followups import FollowUpStore
 from drost.memory_files import MemoryFiles
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
 
@@ -40,6 +41,8 @@ _JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?|\n?```$", re.MULTILINE)
 class PendingEvent:
     file_name: str
     line: int
+    session_key: str
+    chat_id: int
     payload: dict[str, Any]
 
 
@@ -68,6 +71,9 @@ class MemoryMaintenanceRunner:
         interval_seconds: int = 1800,
         max_events_per_run: int = 200,
         entity_synthesis_enabled: bool = True,
+        followups: FollowUpStore | None = None,
+        followups_enabled: bool = True,
+        followup_confidence_threshold: float = 0.80,
     ) -> None:
         self._workspace_dir = Path(workspace_dir).expanduser()
         self._sessions_dir = Path(sessions_dir).expanduser()
@@ -78,6 +84,9 @@ class MemoryMaintenanceRunner:
         self._max_events_per_run = max(1, int(max_events_per_run))
         self._entity_synthesis_enabled = bool(entity_synthesis_enabled)
         self._memory_files = MemoryFiles(self._workspace_dir)
+        self._followups = followups or (FollowUpStore(self._workspace_dir) if followups_enabled else None)
+        self._followups_enabled = bool(followups_enabled)
+        self._followup_confidence_threshold = max(0.0, min(1.0, float(followup_confidence_threshold)))
 
         self._task: asyncio.Task[None] | None = None
         self._run_lock = asyncio.Lock()
@@ -88,6 +97,8 @@ class MemoryMaintenanceRunner:
             "interval_seconds": self._interval_seconds,
             "max_events_per_run": self._max_events_per_run,
             "entity_synthesis_enabled": self._entity_synthesis_enabled,
+            "followups_enabled": self._followups_enabled,
+            "followup_confidence_threshold": self._followup_confidence_threshold,
             "last_run_at": "",
             "last_success_at": "",
             "last_error": "",
@@ -149,6 +160,7 @@ class MemoryMaintenanceRunner:
                     "aliases_written": 0,
                     "facts_written": 0,
                     "relations_written": 0,
+                    "followups_written": 0,
                     "summaries_written": 0,
                     "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
                 }
@@ -182,6 +194,11 @@ class MemoryMaintenanceRunner:
                 payload.get("relations"),
                 resolver=resolver,
             )
+            followups_written, touched_followups = self._write_followups(
+                payload.get("follow_ups"),
+                resolver=resolver,
+                events=batch.events,
+            )
             touched_entities.update(relation_entities)
             summaries_written, touched_summaries = await self._synthesize_entities(
                 provider=provider,
@@ -190,7 +207,14 @@ class MemoryMaintenanceRunner:
             )
             touched_paths = {
                 str(path)
-                for path in [*touched_daily, *touched_aliases, *touched_facts, *touched_relations, *touched_summaries]
+                for path in [
+                    *touched_daily,
+                    *touched_aliases,
+                    *touched_facts,
+                    *touched_relations,
+                    *touched_followups,
+                    *touched_summaries,
+                ]
             }
 
             self._advance_state(state, batch=batch, processed=batch.events)
@@ -208,6 +232,7 @@ class MemoryMaintenanceRunner:
                 "aliases_written": aliases_written,
                 "facts_written": facts_written,
                 "relations_written": relations_written,
+                "followups_written": followups_written,
                 "summaries_written": summaries_written,
                 "touched_paths": sorted(touched_paths),
                 "sync_result": sync_result,
@@ -249,6 +274,8 @@ class MemoryMaintenanceRunner:
         session_files = sorted(self._sessions_dir.glob("*.jsonl"))
         for path in session_files:
             file_name = path.name
+            session_key = self._session_key_from_file_name(file_name)
+            chat_id = self._chat_id_from_session_key(session_key)
             try:
                 raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
             except Exception:
@@ -263,9 +290,21 @@ class MemoryMaintenanceRunner:
             scan_end[file_name] = len(raw_lines)
             total_entries[file_name] = 0
             if file_name.endswith(".full.jsonl"):
-                parsed = self._parse_full_lines(file_name=file_name, raw_lines=raw_lines, start_line=last_line + 1)
+                parsed = self._parse_full_lines(
+                    file_name=file_name,
+                    raw_lines=raw_lines,
+                    start_line=last_line + 1,
+                    session_key=session_key,
+                    chat_id=chat_id,
+                )
             else:
-                parsed = self._parse_main_lines(file_name=file_name, raw_lines=raw_lines, start_line=last_line + 1)
+                parsed = self._parse_main_lines(
+                    file_name=file_name,
+                    raw_lines=raw_lines,
+                    start_line=last_line + 1,
+                    session_key=session_key,
+                    chat_id=chat_id,
+                )
 
             for event in parsed:
                 total_entries[file_name] += 1
@@ -275,7 +314,15 @@ class MemoryMaintenanceRunner:
             events = events[: self._max_events_per_run]
         return PendingBatch(events=events, scan_end=scan_end, total_entries=total_entries)
 
-    def _parse_main_lines(self, *, file_name: str, raw_lines: list[str], start_line: int) -> list[PendingEvent]:
+    def _parse_main_lines(
+        self,
+        *,
+        file_name: str,
+        raw_lines: list[str],
+        start_line: int,
+        session_key: str,
+        chat_id: int,
+    ) -> list[PendingEvent]:
         out: list[PendingEvent] = []
         for idx in range(max(1, int(start_line)), len(raw_lines) + 1):
             raw = raw_lines[idx - 1].strip()
@@ -294,15 +341,33 @@ class MemoryMaintenanceRunner:
             payload = {
                 "source_file": file_name,
                 "line": idx,
+                "source_session_key": session_key,
+                "chat_id": chat_id,
                 "timestamp": str(parsed.get("timestamp") or ""),
                 "event_type": "chat_message",
                 "role": str(message.get("role") or ""),
                 "content": content,
             }
-            out.append(PendingEvent(file_name=file_name, line=idx, payload=payload))
+            out.append(
+                PendingEvent(
+                    file_name=file_name,
+                    line=idx,
+                    session_key=session_key,
+                    chat_id=chat_id,
+                    payload=payload,
+                )
+            )
         return out
 
-    def _parse_full_lines(self, *, file_name: str, raw_lines: list[str], start_line: int) -> list[PendingEvent]:
+    def _parse_full_lines(
+        self,
+        *,
+        file_name: str,
+        raw_lines: list[str],
+        start_line: int,
+        session_key: str,
+        chat_id: int,
+    ) -> list[PendingEvent]:
         out: list[PendingEvent] = []
         for idx in range(max(1, int(start_line)), len(raw_lines) + 1):
             raw = raw_lines[idx - 1].strip()
@@ -324,6 +389,8 @@ class MemoryMaintenanceRunner:
             payload: dict[str, Any] = {
                 "source_file": file_name,
                 "line": idx,
+                "source_session_key": session_key,
+                "chat_id": chat_id,
                 "timestamp": str(parsed.get("timestamp") or ""),
                 "event_type": "tool_trace",
                 "role": str(message.get("role") or ""),
@@ -351,7 +418,15 @@ class MemoryMaintenanceRunner:
                     for item in tool_results
                     if isinstance(item, dict)
                 ]
-            out.append(PendingEvent(file_name=file_name, line=idx, payload=payload))
+            out.append(
+                PendingEvent(
+                    file_name=file_name,
+                    line=idx,
+                    session_key=session_key,
+                    chat_id=chat_id,
+                    payload=payload,
+                )
+            )
         return out
 
     @staticmethod
@@ -399,11 +474,35 @@ class MemoryMaintenanceRunner:
             return cleaned
         return cleaned[:DEFAULT_TOOL_RESULT_CHAR_LIMIT].rstrip() + "\n[TRUNCATED]"
 
+    @staticmethod
+    def _session_key_from_file_name(file_name: str) -> str:
+        if file_name.endswith(".full.jsonl"):
+            stem = file_name[: -len(".full.jsonl")]
+        elif file_name.endswith(".jsonl"):
+            stem = file_name[: -len(".jsonl")]
+        else:
+            stem = file_name
+        parts = stem.split("_", 2)
+        if len(parts) == 3:
+            return f"{parts[0]}:{parts[1]}:{parts[2]}"
+        return stem
+
+    @staticmethod
+    def _chat_id_from_session_key(session_key: str) -> int:
+        raw = str(session_key or "")
+        if ":" in raw:
+            raw = raw.split(":", 2)[-1]
+        base, _, _ = raw.partition("__")
+        try:
+            return int(base)
+        except Exception:
+            return 0
+
     async def _extract(self, *, provider: BaseProvider, events: list[dict[str, Any]]) -> ChatResponse:
         system = (
             "You are Drost memory extraction. Output ONLY valid JSON. No markdown.\n\n"
             "Goal: convert fresh transcript events into durable memory.\n"
-            "Return an object with exactly five keys:\n"
+            "Return an object with exactly six keys:\n"
             '  \"daily_notes\": list of {\"date\": \"YYYY-MM-DD\", \"bullets\": [\"...\"]}\n'
             '  \"entities\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"summary_hint\": \"optional\"}\n'
             '  \"aliases\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"alias\": \"...\"}\n'
@@ -413,7 +512,12 @@ class MemoryMaintenanceRunner:
             '  \"relations\": list of {\"from_entity_type\": \"...\", \"from_entity_name\": \"...\", '
             '"relation_type\": \"...\", \"to_entity_type\": \"...\", \"to_entity_name\": \"...\", '
             '"statement\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
-            '"supersedes\": \"optional\"}\n\n'
+            '"supersedes\": \"optional\"}\n'
+            '  \"follow_ups\": list of {\"kind\": \"...\", \"subject\": \"...\", '
+            '"entity_refs\": [\"entity_type/entity_name\"], \"source\": \"file:line\", \"source_session_key\": \"optional\", '
+            '"source_excerpt\": \"...\", \"follow_up_prompt\": \"...\", \"due_at\": \"ISO-8601 UTC\", '
+            '"not_before\": \"optional ISO-8601 UTC\", \"priority\": \"high|medium|low\", \"confidence\": 0.0, '
+            '"notes\": \"optional\"}\n\n'
             "Rules:\n"
             "- Extract only useful durable information.\n"
             "- Daily notes should capture meaningful recent context, decisions, and work.\n"
@@ -421,6 +525,9 @@ class MemoryMaintenanceRunner:
             "- Entity names should be human-readable, not slugified ids.\n"
             "- Aliases should only be written when they add useful alternate surfaces.\n"
             "- Relations should be typed and concrete.\n"
+            "- Follow-ups should only be included when there is a concrete future check-in or obligation.\n"
+            "- Follow-up prompts should be natural, concise, and specific.\n"
+            "- Do not create vague social check-ins with no concrete reason.\n"
             "- Do not include secrets, tokens, passwords, or API keys.\n"
             "- Prefer these entity types when possible: "
             + ", ".join(DEFAULT_ENTITY_TYPES)
@@ -458,6 +565,7 @@ class MemoryMaintenanceRunner:
         payload.setdefault("aliases", [])
         payload.setdefault("facts", [])
         payload.setdefault("relations", [])
+        payload.setdefault("follow_ups", [])
         return payload
 
     def _write_daily_notes(self, daily_notes: Any) -> tuple[int, set[Path]]:
@@ -614,6 +722,90 @@ class MemoryMaintenanceRunner:
                 touched.add(result.path)
                 entities.add(EntityRef(entity_type=result.from_entity_type, entity_id=result.from_entity_id))
         return count, touched, entities
+
+    @staticmethod
+    def _resolve_entity_ref_value(value: Any, *, resolver: EntityResolver) -> str | None:
+        cleaned = str(value or "").strip()
+        if not cleaned or "/" not in cleaned:
+            return None
+        entity_type, entity_name = cleaned.split("/", 1)
+        resolved = resolver.resolve(entity_type=entity_type, entity_name=entity_name)
+        if resolved is None:
+            return None
+        return f"{resolved.entity_type}/{resolved.entity_id}"
+
+    def _write_followups(
+        self,
+        follow_ups: Any,
+        *,
+        resolver: EntityResolver,
+        events: list[PendingEvent],
+    ) -> tuple[int, set[Path]]:
+        if not self._followups_enabled or self._followups is None or not isinstance(follow_ups, list):
+            return 0, set()
+
+        source_lookup = {
+            f"{event.file_name}:{event.line}": {
+                "session_key": event.session_key,
+                "chat_id": event.chat_id,
+            }
+            for event in events
+        }
+        count = 0
+        touched: set[Path] = set()
+        for item in follow_ups:
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject") or "").strip()
+            prompt = str(item.get("follow_up_prompt") or "").strip()
+            due_at = str(item.get("due_at") or "").strip()
+            source = str(item.get("source") or "").strip()
+            source_meta = source_lookup.get(source, {})
+            source_session_key = str(item.get("source_session_key") or source_meta.get("session_key") or "").strip()
+            chat_id = int(item.get("chat_id") or source_meta.get("chat_id") or 0)
+            if not source_session_key:
+                continue
+            if chat_id <= 0:
+                chat_id = self._chat_id_from_session_key(source_session_key)
+            if chat_id <= 0 or not subject or not prompt or not due_at:
+                continue
+            try:
+                confidence = float(item["confidence"]) if item.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+            if confidence is not None and confidence < self._followup_confidence_threshold:
+                continue
+
+            entity_refs: list[str] = []
+            for raw_ref in item.get("entity_refs") or []:
+                resolved_ref = self._resolve_entity_ref_value(raw_ref, resolver=resolver)
+                if resolved_ref and resolved_ref not in entity_refs:
+                    entity_refs.append(resolved_ref)
+
+            try:
+                _, created = self._followups.upsert_extracted_followup(
+                    chat_id=chat_id,
+                    source_session_key=source_session_key,
+                    kind=str(item.get("kind") or "check_in").strip() or "check_in",
+                    subject=subject,
+                    entity_refs=entity_refs,
+                    source_excerpt=str(item.get("source_excerpt") or "").strip(),
+                    follow_up_prompt=prompt,
+                    due_at=due_at,
+                    not_before=str(item.get("not_before") or "").strip() or None,
+                    priority=str(item.get("priority") or "medium").strip() or "medium",
+                    confidence=confidence,
+                    notes=str(item.get("notes") or "").strip() or None,
+                    source=source or None,
+                )
+            except Exception:
+                logger.debug("Skipping invalid follow-up payload", exc_info=True)
+                continue
+
+            touched.add(self._followups.followups_path)
+            if created:
+                count += 1
+        return count, touched
 
     async def _synthesize_entities(
         self,

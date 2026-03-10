@@ -303,3 +303,71 @@ async def test_memory_maintenance_resolves_aliases_and_writes_relations(tmp_path
     assert "relations_md" in synthesis_payload
     assert "owned and directed by Migel" in synthesis_payload["relations_md"]
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_extracts_followups_with_session_provenance(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    session_store = SessionJSONLStore(store_path=sessions)
+
+    session_key = session_key_for_telegram_chat(8271705169, "s_2026-03-09_10-00-00")
+    session_store.append_user_assistant(
+        session_key=session_key,
+        user_text="I have a CPAP fitting appointment tomorrow at 11am. Check in with me after.",
+        assistant_text="Noted. I will remember to check in after the appointment.",
+    )
+
+    provider = ExtractionProvider(
+        content=json.dumps(
+            {
+                "daily_notes": [],
+                "entities": [{"entity_type": "people", "entity_name": "Migel"}],
+                "aliases": [],
+                "facts": [],
+                "relations": [],
+                "follow_ups": [
+                    {
+                        "kind": "check_in",
+                        "subject": "CPAP fitting appointment",
+                        "entity_refs": ["people/Migel"],
+                        "source": f"{session_key}.jsonl:1",
+                        "source_session_key": session_key,
+                        "source_excerpt": "CPAP fitting appointment tomorrow at 11am",
+                        "follow_up_prompt": "How did the CPAP fitting go?",
+                        "due_at": "2026-03-10T19:00:00Z",
+                        "not_before": "2026-03-10T17:00:00Z",
+                        "priority": "high",
+                        "confidence": 0.96,
+                    }
+                ],
+            }
+        )
+    )
+
+    store = SQLiteStore(db_path=tmp_path / "drost.sqlite3", vector_dimensions=64)
+
+    async def _sync_index() -> dict[str, int]:
+        return {"indexed": 0, "skipped": 0, "removed": 0}
+
+    runner = MemoryMaintenanceRunner(
+        workspace_dir=workspace,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        sync_memory_index=_sync_index,
+        enabled=True,
+        interval_seconds=1800,
+        max_events_per_run=200,
+    )
+
+    result = await runner.run_once(reason="test")
+
+    followups_path = workspace / "memory" / "follow-ups.json"
+    payload = json.loads(followups_path.read_text(encoding="utf-8"))
+    assert result["followups_written"] == 1
+    assert payload["items"][0]["chat_id"] == 8271705169
+    assert payload["items"][0]["source_session_key"] == session_key
+    assert payload["items"][0]["entity_refs"] == ["people/migel"]
+
+    store.close()

@@ -70,8 +70,10 @@ Drost currently ships with these built-in tools:
 - daily memory files
 - entity fact files
 - entity summary synthesis
+- structured follow-up objects under `~/.drost/memory/follow-ups.json`
 - session continuity handoff on `/new`
 - prompt-time memory capsule built from ranked memory sources
+- idle-mode heartbeat runner for bounded proactive follow-up surfacing
 
 ### Observability
 
@@ -81,6 +83,8 @@ Drost currently ships with these built-in tools:
 - tool traces
 - memory maintenance status endpoint
 - continuity status endpoint
+- follow-up listing endpoint
+- idle-state and heartbeat status endpoints
 
 ## Architecture
 
@@ -95,6 +99,7 @@ Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
                                  +-> Workspace Memory Files
                                  +-> Background Memory Maintenance
                                  +-> Session Continuity Manager
+                                 +-> Idle Heartbeat Runner
 ```
 
 At runtime, a typical turn looks like this:
@@ -153,6 +158,15 @@ DROST_AGENT_MAX_TOOL_CALLS_PER_RUN=100
 DROST_AGENT_MAX_ITERATIONS=100
 ```
 
+New proactive-memory flags:
+
+```env
+DROST_FOLLOWUPS_ENABLED=true
+DROST_IDLE_MODE_ENABLED=true
+DROST_IDLE_HEARTBEAT_ENABLED=true
+DROST_PROACTIVE_SURFACING_ENABLED=true
+```
+
 ### 3. Run
 
 ```bash
@@ -170,6 +184,13 @@ The gateway starts on `http://0.0.0.0:8766` by default.
 For local health validation, Drost derives:
 
 - `http://127.0.0.1:8766/health`
+
+Additional runtime inspection endpoints:
+
+- `GET /v1/followups`
+- `GET /v1/idle/status`
+- `GET /v1/heartbeat/status`
+- `POST /v1/heartbeat/run-once`
 
 ## Deployer
 
