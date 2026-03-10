@@ -26,6 +26,14 @@ def _normalize_alias(value: str) -> str:
     return re.sub(r"\s+", " ", lowered)
 
 
+def slugify_memory_key(value: str) -> str:
+    return _slug(value)
+
+
+def normalize_alias_value(value: str) -> str:
+    return _normalize_alias(value)
+
+
 def _next_fact_id(existing: str, *, entity_type: str, entity_id: str) -> str:
     pattern = re.compile(r"\[id:([a-z0-9_-]+/[a-z0-9_-]+)/(\d{4})\]")
     max_n = 0

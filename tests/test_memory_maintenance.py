@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from drost.memory_files import MemoryFiles
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import (
     BaseProvider,
@@ -201,3 +202,101 @@ async def test_memory_maintenance_parse_failure_does_not_advance_state(tmp_path:
 
     assert "error" in result
     assert state["files"] == {}
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_resolves_aliases_and_writes_relations(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    session_store = SessionJSONLStore(store_path=sessions)
+    memory = MemoryFiles(workspace)
+    memory.append_entity_alias(entity_type="projects", entity_id="drost", alias="the repo")
+
+    session_key = session_key_for_telegram_chat(123, "s_2026-03-08_08-00-00")
+    session_store.append_user_assistant(
+        session_key=session_key,
+        user_text="Remember that the repo should use the deployer by default.",
+        assistant_text="Understood. I will store that for Drost.",
+    )
+
+    provider = ExtractionProvider(
+        content=[
+            json.dumps(
+                {
+                    "daily_notes": [],
+                    "entities": [
+                        {"entity_type": "projects", "entity_name": "Drost"},
+                        {"entity_type": "people", "entity_name": "Migel"},
+                    ],
+                    "aliases": [
+                        {
+                            "entity_type": "projects",
+                            "entity_name": "Drost",
+                            "alias": "/Users/migel/drost",
+                        }
+                    ],
+                    "facts": [
+                        {
+                            "entity_type": "projects",
+                            "entity_name": "the repo",
+                            "kind": "decision",
+                            "fact": "Drost should use the deployer as the default startup path.",
+                            "date": "2026-03-08",
+                            "confidence": 0.95,
+                        }
+                    ],
+                    "relations": [
+                        {
+                            "from_entity_type": "projects",
+                            "from_entity_name": "the repo",
+                            "relation_type": "owned_by",
+                            "to_entity_type": "people",
+                            "to_entity_name": "Migel",
+                            "statement": "Drost is owned and directed by Migel.",
+                            "date": "2026-03-08",
+                            "confidence": 0.99,
+                        }
+                    ],
+                }
+            ),
+            "# Drost\n\nDrost should use the deployer as the default startup path.",
+        ]
+    )
+
+    store = SQLiteStore(db_path=tmp_path / "drost.sqlite3", vector_dimensions=64)
+    sync_calls: list[str] = []
+
+    async def _sync_index() -> dict[str, int]:
+        sync_calls.append("sync")
+        return {"indexed": 3, "skipped": 0, "removed": 0}
+
+    runner = MemoryMaintenanceRunner(
+        workspace_dir=workspace,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        sync_memory_index=_sync_index,
+        enabled=True,
+        interval_seconds=1800,
+        max_events_per_run=200,
+    )
+
+    result = await runner.run_once(reason="test")
+
+    alias_path = workspace / "memory" / "entities" / "projects" / "drost" / "aliases.md"
+    fact_path = workspace / "memory" / "entities" / "projects" / "drost" / "items.md"
+    relation_path = workspace / "memory" / "entities" / "projects" / "drost" / "relations.md"
+
+    assert result["aliases_written"] == 1
+    assert result["facts_written"] == 1
+    assert result["relations_written"] == 1
+    assert sync_calls == ["sync"]
+    assert alias_path.exists()
+    assert fact_path.exists()
+    assert relation_path.exists()
+    assert "/Users/migel/drost" in alias_path.read_text(encoding="utf-8")
+    assert "default startup path" in fact_path.read_text(encoding="utf-8")
+    relation_text = relation_path.read_text(encoding="utf-8")
+    assert "[to:people/migel]" in relation_text
+    assert "Drost is owned and directed by Migel." in relation_text
+    store.close()

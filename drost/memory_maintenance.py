@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from drost.entity_resolution import EntityResolver
 from drost.memory_files import MemoryFiles
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
 
@@ -22,14 +23,14 @@ DEFAULT_TOOL_RESULT_CHAR_LIMIT = 4_000
 DEFAULT_ENTITY_TYPES = (
     "people",
     "projects",
-    "organizations",
-    "places",
-    "devices",
-    "accounts",
+    "repos",
+    "providers",
+    "models",
+    "tools",
+    "workflows",
     "preferences",
-    "routines",
-    "goals",
-    "artifacts",
+    "constraints",
+    "channels",
 )
 
 _JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?|\n?```$", re.MULTILINE)
@@ -145,7 +146,9 @@ class MemoryMaintenanceRunner:
                     "reason": reason,
                     "new_events": 0,
                     "daily_notes_written": 0,
+                    "aliases_written": 0,
                     "facts_written": 0,
+                    "relations_written": 0,
                     "summaries_written": 0,
                     "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
                 }
@@ -167,14 +170,28 @@ class MemoryMaintenanceRunner:
                 self._save_state(state)
                 return dict(self._last_status["last_result"])
 
+            resolver = EntityResolver(self._workspace_dir)
+            self._register_entities(payload.get("entities"), resolver=resolver)
             daily_written, touched_daily = self._write_daily_notes(payload.get("daily_notes"))
-            facts_written, touched_facts, touched_entities = self._write_facts(payload.get("facts"))
+            aliases_written, touched_aliases = self._write_aliases(payload.get("aliases"), resolver=resolver)
+            facts_written, touched_facts, touched_entities = self._write_facts(
+                payload.get("facts"),
+                resolver=resolver,
+            )
+            relations_written, touched_relations, relation_entities = self._write_relations(
+                payload.get("relations"),
+                resolver=resolver,
+            )
+            touched_entities.update(relation_entities)
             summaries_written, touched_summaries = await self._synthesize_entities(
                 provider=provider,
                 entities=touched_entities,
                 state=state,
             )
-            touched_paths = {str(path) for path in [*touched_daily, *touched_facts, *touched_summaries]}
+            touched_paths = {
+                str(path)
+                for path in [*touched_daily, *touched_aliases, *touched_facts, *touched_relations, *touched_summaries]
+            }
 
             self._advance_state(state, batch=batch, processed=batch.events)
             state["last_run_at"] = started_at
@@ -188,7 +205,9 @@ class MemoryMaintenanceRunner:
                 "provider": provider.name,
                 "new_events": len(batch.events),
                 "daily_notes_written": daily_written,
+                "aliases_written": aliases_written,
                 "facts_written": facts_written,
+                "relations_written": relations_written,
                 "summaries_written": summaries_written,
                 "touched_paths": sorted(touched_paths),
                 "sync_result": sync_result,
@@ -384,15 +403,24 @@ class MemoryMaintenanceRunner:
         system = (
             "You are Drost memory extraction. Output ONLY valid JSON. No markdown.\n\n"
             "Goal: convert fresh transcript events into durable memory.\n"
-            "Return an object with exactly two keys:\n"
+            "Return an object with exactly five keys:\n"
             '  \"daily_notes\": list of {\"date\": \"YYYY-MM-DD\", \"bullets\": [\"...\"]}\n'
-            '  \"facts\": list of {\"entity_type\": \"...\", \"entity_id\": \"...\", \"kind\": \"...\", '
+            '  \"entities\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"summary_hint\": \"optional\"}\n'
+            '  \"aliases\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"alias\": \"...\"}\n'
+            '  \"facts\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"kind\": \"...\", '
             '"fact\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
+            '"supersedes\": \"optional\"}\n'
+            '  \"relations\": list of {\"from_entity_type\": \"...\", \"from_entity_name\": \"...\", '
+            '"relation_type\": \"...\", \"to_entity_type\": \"...\", \"to_entity_name\": \"...\", '
+            '"statement\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
             '"supersedes\": \"optional\"}\n\n'
             "Rules:\n"
             "- Extract only useful durable information.\n"
             "- Daily notes should capture meaningful recent context, decisions, and work.\n"
             "- Facts should be atomic and plain-language.\n"
+            "- Entity names should be human-readable, not slugified ids.\n"
+            "- Aliases should only be written when they add useful alternate surfaces.\n"
+            "- Relations should be typed and concrete.\n"
             "- Do not include secrets, tokens, passwords, or API keys.\n"
             "- Prefer these entity types when possible: "
             + ", ".join(DEFAULT_ENTITY_TYPES)
@@ -426,7 +454,10 @@ class MemoryMaintenanceRunner:
         if not isinstance(payload, dict):
             return None
         payload.setdefault("daily_notes", [])
+        payload.setdefault("entities", [])
+        payload.setdefault("aliases", [])
         payload.setdefault("facts", [])
+        payload.setdefault("relations", [])
         return payload
 
     def _write_daily_notes(self, daily_notes: Any) -> tuple[int, set[Path]]:
@@ -450,7 +481,55 @@ class MemoryMaintenanceRunner:
                 touched.add(path)
         return count, touched
 
-    def _write_facts(self, facts: Any) -> tuple[int, set[Path], set[EntityRef]]:
+    @staticmethod
+    def _resolve_item_name(item: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _register_entities(self, entities: Any, *, resolver: EntityResolver) -> None:
+        if not isinstance(entities, list):
+            return
+        for item in entities:
+            if not isinstance(item, dict):
+                continue
+            entity_type = str(item.get("entity_type") or "").strip()
+            entity_name = self._resolve_item_name(item, "entity_name", "entity_id")
+            resolved = resolver.resolve(entity_type=entity_type, entity_name=entity_name)
+            if resolved is not None:
+                resolver.register_alias(resolved, entity_name)
+
+    def _write_aliases(self, aliases: Any, *, resolver: EntityResolver) -> tuple[int, set[Path]]:
+        if not isinstance(aliases, list):
+            return 0, set()
+        count = 0
+        touched: set[Path] = set()
+        for item in aliases:
+            if not isinstance(item, dict):
+                continue
+            entity_type = str(item.get("entity_type") or "").strip()
+            entity_name = self._resolve_item_name(item, "entity_name", "entity_id")
+            alias = str(item.get("alias") or "").strip()
+            resolved = resolver.resolve(entity_type=entity_type, entity_name=entity_name)
+            if resolved is None or not alias:
+                continue
+            result = self._memory_files.append_entity_alias(
+                entity_type=resolved.entity_type,
+                entity_id=resolved.entity_id,
+                alias=alias,
+            )
+            resolver.register_alias(
+                EntityRef(entity_type=resolved.entity_type, entity_id=resolved.entity_id),
+                alias,
+            )
+            if result.created:
+                count += 1
+                touched.add(result.path)
+        return count, touched
+
+    def _write_facts(self, facts: Any, *, resolver: EntityResolver) -> tuple[int, set[Path], set[EntityRef]]:
         if not isinstance(facts, list):
             return 0, set(), set()
         count = 0
@@ -460,17 +539,18 @@ class MemoryMaintenanceRunner:
             if not isinstance(item, dict):
                 continue
             entity_type = str(item.get("entity_type") or "").strip()
-            entity_id = str(item.get("entity_id") or "").strip()
+            entity_name = self._resolve_item_name(item, "entity_name", "entity_id")
             fact_text = str(item.get("fact") or "").strip()
-            if not entity_type or not entity_id or not fact_text:
+            resolved = resolver.resolve(entity_type=entity_type, entity_name=entity_name)
+            if resolved is None or not fact_text:
                 continue
             try:
                 confidence = float(item["confidence"]) if item.get("confidence") is not None else None
             except Exception:
                 confidence = None
             result = self._memory_files.append_entity_fact(
-                entity_type=entity_type,
-                entity_id=entity_id,
+                entity_type=resolved.entity_type,
+                entity_id=resolved.entity_id,
                 fact=fact_text,
                 kind=str(item.get("kind") or "fact").strip() or "fact",
                 fact_date=str(item.get("date") or "").strip() or None,
@@ -482,6 +562,57 @@ class MemoryMaintenanceRunner:
                 count += 1
                 touched.add(result.path)
                 entities.add(EntityRef(entity_type=result.entity_type, entity_id=result.entity_id))
+        return count, touched, entities
+
+    def _write_relations(
+        self,
+        relations: Any,
+        *,
+        resolver: EntityResolver,
+    ) -> tuple[int, set[Path], set[EntityRef]]:
+        if not isinstance(relations, list):
+            return 0, set(), set()
+        count = 0
+        touched: set[Path] = set()
+        entities: set[EntityRef] = set()
+        for item in relations:
+            if not isinstance(item, dict):
+                continue
+            from_entity_type = str(item.get("from_entity_type") or "").strip()
+            from_entity_name = self._resolve_item_name(item, "from_entity_name", "from_entity_id")
+            to_entity_type = str(item.get("to_entity_type") or "").strip()
+            to_entity_name = self._resolve_item_name(item, "to_entity_name", "to_entity_id")
+            relation_type = str(item.get("relation_type") or "").strip()
+            statement = str(item.get("statement") or item.get("fact") or "").strip()
+            if not from_entity_type or not to_entity_type or not relation_type or not statement:
+                continue
+
+            from_resolved = resolver.resolve(entity_type=from_entity_type, entity_name=from_entity_name)
+            to_resolved = resolver.resolve(entity_type=to_entity_type, entity_name=to_entity_name)
+            if from_resolved is None or to_resolved is None:
+                continue
+
+            try:
+                confidence = float(item["confidence"]) if item.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+
+            result = self._memory_files.append_entity_relation(
+                from_entity_type=from_resolved.entity_type,
+                from_entity_id=from_resolved.entity_id,
+                relation_type=relation_type,
+                to_entity_type=to_resolved.entity_type,
+                to_entity_id=to_resolved.entity_id,
+                statement=statement,
+                relation_date=str(item.get("date") or "").strip() or None,
+                confidence=confidence,
+                source=str(item.get("source") or "").strip() or None,
+                supersedes=str(item.get("supersedes") or "").strip() or None,
+            )
+            if result.created:
+                count += 1
+                touched.add(result.path)
+                entities.add(EntityRef(entity_type=result.from_entity_type, entity_id=result.from_entity_id))
         return count, touched, entities
 
     async def _synthesize_entities(
