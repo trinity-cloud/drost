@@ -95,13 +95,14 @@ Drost’s current architecture is intentionally simple:
 ```text
 Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
                                  |
+                                 +-> Loop Manager
+                                      +-> Maintenance Loop
+                                      +-> Heartbeat Loop
                                  +-> Tool Registry
                                  +-> SQLite Store
                                  +-> JSONL Session Logs
                                  +-> Workspace Memory Files
-                                 +-> Background Memory Maintenance
                                  +-> Session Continuity Manager
-                                 +-> Idle Heartbeat Runner
 ```
 
 At runtime, a typical turn looks like this:
@@ -193,6 +194,7 @@ Additional runtime inspection endpoints:
 - `GET /v1/idle/status`
 - `GET /v1/heartbeat/status`
 - `POST /v1/heartbeat/run-once`
+- `GET /v1/loops/status`
 
 ## Deployer
 

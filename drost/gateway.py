@@ -13,6 +13,8 @@ from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
 from drost.idle_heartbeat import IdleHeartbeatRunner
 from drost.idle_state import IdleStateStore
+from drost.loop_manager import LoopManager
+from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
@@ -104,6 +106,27 @@ class Gateway:
             active_window_seconds=settings.idle_active_window_seconds,
             proactive_cooldown_seconds=settings.proactive_followup_cooldown_seconds,
         )
+        self.loop_manager = LoopManager()
+        self.loop_manager.register(
+            ManagedRunnerLoop(
+                name="maintenance_loop",
+                priority=LoopPriority.LOW,
+                visibility=LoopVisibility.BACKGROUND,
+                start_fn=self.memory_maintenance.start,
+                stop_fn=self.memory_maintenance.stop,
+                status_fn=self.memory_maintenance.status,
+            )
+        )
+        self.loop_manager.register(
+            ManagedRunnerLoop(
+                name="heartbeat_loop",
+                priority=LoopPriority.NORMAL,
+                visibility=LoopVisibility.BACKGROUND,
+                start_fn=self.idle_heartbeat.start,
+                stop_fn=self.idle_heartbeat.stop,
+                status_fn=self.idle_heartbeat.status,
+            )
+        )
 
         self.app = FastAPI(title="Drost Gateway", version="0.1.0")
         self.app.state.gateway = self
@@ -160,21 +183,23 @@ class Gateway:
         async def startup() -> None:
             if self.settings.memory_enabled:
                 await self.agent.sync_memory_index()
-            await self.memory_maintenance.start()
             await self.telegram.start(self.app)
-            await self.idle_heartbeat.start()
+            await self.loop_manager.start()
             logger.info(
-                "Drost gateway started (provider=%s db=%s)",
+                "Drost gateway started (provider=%s db=%s loops=%s)",
                 self.agent.active_provider,
                 self.settings.sqlite_path,
+                ",".join(self.loop_manager.names()),
             )
 
         @self.app.on_event("shutdown")
         async def shutdown() -> None:
-            await self.idle_heartbeat.stop()
+            try:
+                await self.loop_manager.stop()
+            except Exception:
+                logger.warning("Loop manager shutdown reported errors", exc_info=True)
             await self.telegram.stop()
             await self.session_continuity.shutdown()
-            await self.memory_maintenance.stop()
             await self.agent.close()
             self.store.close()
             logger.info("Drost gateway stopped")
@@ -215,6 +240,10 @@ class Gateway:
         @self.app.get("/v1/memory/maintenance/status")
         async def memory_maintenance_status() -> dict[str, Any]:
             return self.memory_maintenance.status()
+
+        @self.app.get("/v1/loops/status")
+        async def loops_status() -> dict[str, Any]:
+            return self.loop_manager.status()
 
         @self.app.get("/v1/followups")
         async def followups(chat_id: int | None = None) -> dict[str, Any]:
