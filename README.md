@@ -75,7 +75,7 @@ Drost currently ships with these built-in tools:
 - structured follow-up objects under `~/.drost/memory/follow-ups.json`
 - session continuity handoff on `/new`
 - prompt-time memory capsule built from ranked memory sources
-- idle-mode heartbeat runner for bounded proactive follow-up surfacing
+- `HEARTBEAT.md`-aware idle-mode heartbeat runner for bounded proactive follow-up surfacing
 
 ### Observability
 

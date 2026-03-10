@@ -97,6 +97,7 @@ class Gateway:
             followups=self.followups,
             idle_state=self.idle_state,
             send_message=lambda chat_id, message: self.telegram.send(chat_id, message),
+            provider_getter=self.providers.get,
             enabled=settings.idle_mode_enabled and settings.idle_heartbeat_enabled,
             proactive_enabled=settings.proactive_surfacing_enabled,
             interval_seconds=settings.idle_heartbeat_interval_seconds,
