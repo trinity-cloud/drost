@@ -56,6 +56,9 @@ class IdleHeartbeatRunner:
         enabled: bool,
         proactive_enabled: bool,
         event_bus: LoopEventBus | None = None,
+        background_policy: Callable[[str], dict[str, Any]] | None = None,
+        begin_proactive_action: Callable[..., dict[str, Any]] | None = None,
+        finish_proactive_action: Callable[..., None] | None = None,
         provider_getter: Callable[[], BaseProvider] | None = None,
         interval_seconds: int = 1800,
         active_window_seconds: int = 20 * 60,
@@ -67,6 +70,9 @@ class IdleHeartbeatRunner:
         self._idle_state = idle_state
         self._send_message = send_message
         self._event_bus = event_bus
+        self._background_policy = background_policy
+        self._begin_proactive_action = begin_proactive_action
+        self._finish_proactive_action = finish_proactive_action
         self._provider_getter = provider_getter
         self._workspace_loader = WorkspaceLoader(self._workspace_dir)
         self._enabled = bool(enabled)
@@ -94,6 +100,7 @@ class IdleHeartbeatRunner:
             "last_result": {},
             "event_driven": self._event_bus is not None,
             "last_trigger_event": "",
+            "last_policy_reason": "",
         }
 
     async def start(self) -> None:
@@ -206,6 +213,15 @@ class IdleHeartbeatRunner:
         async with self._run_lock:
             started_at = now or datetime.now(UTC)
             self._last_status["last_run_at"] = started_at.isoformat()
+            if self._background_policy is not None:
+                policy = self._background_policy("heartbeat_loop")
+                self._last_status["last_policy_reason"] = str(policy.get("reason") or "")
+                if not bool(policy.get("allowed")):
+                    result = self._record_result(
+                        {"reason": reason, "decision": "noop", "why": str(policy.get("reason") or "policy_blocked")}
+                    )
+                    self._emit_heartbeat_decision(result)
+                    return result
             state = self._idle_state.refresh(
                 active_window_seconds=self._active_window_seconds,
                 now=started_at,
@@ -315,6 +331,26 @@ class IdleHeartbeatRunner:
                 return result
 
             try:
+                claim: dict[str, Any] = {"allowed": True, "reason": "local"}
+                if self._begin_proactive_action is not None:
+                    claim = self._begin_proactive_action(
+                        owner="heartbeat_loop",
+                        chat_id=chat_id,
+                        session_key=str(state.get("active_session_key") or ""),
+                        now=started_at,
+                    )
+                if not bool(claim.get("allowed")):
+                    result = self._record_result(
+                        {
+                            "reason": reason,
+                            "decision": "noop",
+                            "why": str(claim.get("reason") or "policy_blocked"),
+                            "chat_id": chat_id,
+                            "follow_up_id": str(followup.get("id") or ""),
+                        }
+                    )
+                    self._emit_heartbeat_decision(result)
+                    return result
                 await self._send_message(chat_id, message)
                 updated = self._followups.mark_surfaced(
                     str(followup.get("id") or ""),
@@ -354,6 +390,9 @@ class IdleHeartbeatRunner:
                 )
                 self._emit_heartbeat_decision(result)
                 return result
+            finally:
+                if self._finish_proactive_action is not None:
+                    self._finish_proactive_action(owner="heartbeat_loop", reason="completed")
 
     async def _decide(
         self,

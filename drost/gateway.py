@@ -51,6 +51,10 @@ class Gateway:
         self.followups = FollowUpStore(settings.workspace_dir)
         self.loop_events = LoopEventBus()
         self.shared_mind_state = SharedMindState(settings.workspace_dir)
+        self.loop_manager = LoopManager(
+            shared_mind_state=self.shared_mind_state,
+            active_window_seconds=settings.idle_active_window_seconds,
+        )
         self.idle_state = IdleStateStore(shared_mind_state=self.shared_mind_state)
         self.agent = AgentRuntime(
             settings=settings,
@@ -66,6 +70,7 @@ class Gateway:
             sync_memory_index=self.agent.sync_memory_index,
             enabled=settings.memory_enabled and settings.memory_maintenance_enabled,
             event_bus=self.loop_events,
+            policy_gate=self.loop_manager.background_policy,
             interval_seconds=settings.memory_maintenance_interval_seconds,
             max_events_per_run=settings.memory_maintenance_max_events_per_run,
             entity_synthesis_enabled=settings.memory_entity_synthesis_enabled,
@@ -108,6 +113,9 @@ class Gateway:
             idle_state=self.idle_state,
             send_message=lambda chat_id, message: self.telegram.send(chat_id, message),
             event_bus=self.loop_events,
+            background_policy=self.loop_manager.background_policy,
+            begin_proactive_action=self.loop_manager.begin_proactive_action,
+            finish_proactive_action=self.loop_manager.finish_proactive_action,
             provider_getter=self.providers.get,
             enabled=settings.idle_mode_enabled and settings.idle_heartbeat_enabled,
             proactive_enabled=settings.proactive_surfacing_enabled,
@@ -116,7 +124,6 @@ class Gateway:
             proactive_cooldown_seconds=settings.proactive_followup_cooldown_seconds,
         )
         self.conversation_loop = ConversationLoop(event_bus=self.loop_events)
-        self.loop_manager = LoopManager()
         self.loop_manager.register(self.conversation_loop)
         self.loop_manager.register(
             ManagedRunnerLoop(

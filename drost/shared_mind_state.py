@@ -134,6 +134,35 @@ class SharedMindState:
         self._save()
         return self.snapshot()
 
+    def proactive_gate(
+        self,
+        *,
+        active_window_seconds: int,
+        chat_id: int,
+        session_key: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        state = self.status(active_window_seconds=active_window_seconds, now=now)
+        health = state.get("health") if isinstance(state.get("health"), dict) else {}
+        if bool(health.get("degraded")):
+            return {"allowed": False, "reason": "degraded_mode", "state": state}
+
+        focus = state.get("focus") if isinstance(state.get("focus"), dict) else {}
+        focus_chat_id = int(focus.get("chat_id") or 0)
+        focus_session_key = str(focus.get("session_key") or "").strip()
+        target_session_key = str(session_key or "").strip()
+        if focus_chat_id > 0 and int(chat_id) > 0 and focus_chat_id != int(chat_id):
+            return {"allowed": False, "reason": "focus_mismatch", "state": state}
+        if target_session_key and focus_session_key and target_session_key != focus_session_key:
+            return {"allowed": False, "reason": "session_mismatch", "state": state}
+
+        mode = str(state.get("mode") or "active")
+        if mode == "active":
+            return {"allowed": False, "reason": "active_mode", "state": state}
+        if mode == "cooldown":
+            return {"allowed": False, "reason": "cooldown", "state": state}
+        return {"allowed": True, "reason": "idle", "state": state}
+
     def to_idle_view(self, *, active_window_seconds: int, now: datetime | None = None) -> dict[str, Any]:
         state = self.status(active_window_seconds=active_window_seconds, now=now)
         focus = dict(state.get("focus") or {})

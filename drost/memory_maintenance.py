@@ -70,6 +70,7 @@ class MemoryMaintenanceRunner:
         sync_memory_index: Callable[[], Awaitable[dict[str, int]]],
         enabled: bool,
         event_bus: LoopEventBus | None = None,
+        policy_gate: Callable[[str], dict[str, Any]] | None = None,
         interval_seconds: int = 1800,
         max_events_per_run: int = 200,
         entity_synthesis_enabled: bool = True,
@@ -83,6 +84,7 @@ class MemoryMaintenanceRunner:
         self._sync_memory_index = sync_memory_index
         self._enabled = bool(enabled)
         self._event_bus = event_bus
+        self._policy_gate = policy_gate
         self._interval_seconds = max(1, int(interval_seconds))
         self._max_events_per_run = max(1, int(max_events_per_run))
         self._entity_synthesis_enabled = bool(entity_synthesis_enabled)
@@ -111,6 +113,7 @@ class MemoryMaintenanceRunner:
             "last_result": {},
             "event_driven": self._event_bus is not None,
             "last_trigger_event": "",
+            "last_policy_reason": "",
         }
 
     async def start(self) -> None:
@@ -203,6 +206,26 @@ class MemoryMaintenanceRunner:
         async with self._run_lock:
             started_at = self._utc_now()
             self._last_status["last_run_at"] = started_at
+
+            if self._policy_gate is not None:
+                policy = self._policy_gate("maintenance_loop")
+                self._last_status["last_policy_reason"] = str(policy.get("reason") or "")
+                if not bool(policy.get("allowed")):
+                    result = {
+                        "reason": reason,
+                        "new_events": 0,
+                        "daily_notes_written": 0,
+                        "aliases_written": 0,
+                        "facts_written": 0,
+                        "relations_written": 0,
+                        "followups_written": 0,
+                        "summaries_written": 0,
+                        "policy_blocked": str(policy.get("reason") or "policy_blocked"),
+                        "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
+                    }
+                    self._last_status["last_result"] = result
+                    self._last_status["last_error"] = ""
+                    return result
 
             state = self._load_state()
             batch = self._collect_pending_batch(state)

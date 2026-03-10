@@ -312,6 +312,47 @@ async def test_idle_heartbeat_wakes_on_followup_created_event(tmp_path: Path) ->
     assert status["event_counts"]["proactive_surface_sent"] == 1
 
 
+@pytest.mark.asyncio
+async def test_idle_heartbeat_respects_central_background_policy(tmp_path: Path) -> None:
+    followups = FollowUpStore(tmp_path)
+    idle_state = IdleStateStore(tmp_path)
+    now = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
+    sent: list[tuple[int, str]] = []
+
+    followups.upsert_extracted_followup(
+        chat_id=8271705169,
+        source_session_key="main:telegram:8271705169__s_2026-03-09_10-00-00",
+        kind="check_in",
+        subject="Policy-gated item",
+        entity_refs=["projects/drost"],
+        source_excerpt="Check after deploy",
+        follow_up_prompt="Has the deploy path been stable?",
+        due_at=(now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        priority="medium",
+        confidence=0.9,
+    )
+    idle_state.mark_user_message(chat_id=8271705169, at=now - timedelta(hours=2))
+
+    runner = IdleHeartbeatRunner(
+        workspace_dir=tmp_path,
+        followups=followups,
+        idle_state=idle_state,
+        send_message=lambda chat_id, message: _record_send(sent, chat_id, message),
+        background_policy=lambda loop_name: {"allowed": False, "reason": "degraded_mode"},
+        enabled=True,
+        proactive_enabled=True,
+        interval_seconds=1800,
+        active_window_seconds=20 * 60,
+        proactive_cooldown_seconds=3600,
+    )
+
+    result = await runner.run_once(reason="manual", now=now)
+
+    assert result["decision"] == "noop"
+    assert result["why"] == "degraded_mode"
+    assert sent == []
+
+
 async def _record_send(log: list[tuple[int, str]], chat_id: int, message: str) -> Any:
     log.append((chat_id, message))
     return {"ok": True}
