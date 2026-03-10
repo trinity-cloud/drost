@@ -133,7 +133,7 @@ A normal turn looks like this:
 ### 1. Install
 
 ```bash
-cd /Users/migel/drost
+cd /Users/<user>/drost
 uv sync --extra dev
 ```
 
@@ -237,7 +237,7 @@ This is where code and repo-local runtime configuration live:
 
 Local development default:
 
-- `/Users/migel/drost`
+- `/Users/<user>/drost`
 
 ### Agent Workspace
 
