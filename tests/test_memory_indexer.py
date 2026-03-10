@@ -24,7 +24,7 @@ def test_workspace_memory_indexer_indexes_workspace_files(tmp_path: Path) -> Non
     entity_dir = workspace / "memory" / "entities" / "projects" / "drost"
     entity_dir.mkdir(parents=True, exist_ok=True)
     (entity_dir / "aliases.md").write_text(
-        "# Aliases\n\n- Drost\n- /Users/migel/drost\n",
+        "# Aliases\n\n- Drost\n- /Users/migel/drost\n- the repo\n",
         encoding="utf-8",
     )
     (entity_dir / "relations.md").write_text(
@@ -53,7 +53,7 @@ def test_workspace_memory_indexer_indexes_workspace_files(tmp_path: Path) -> Non
     result = asyncio.run(indexer.sync())
     assert result["indexed"] == 5
     assert result["graph_entities"] == 1
-    assert result["graph_aliases"] == 2
+    assert result["graph_aliases"] == 3
     assert result["graph_relations"] == 1
     indexed = store.list_indexed_files()
     assert {row["path"] for row in indexed} == {
@@ -75,6 +75,11 @@ def test_workspace_memory_indexer_indexes_workspace_files(tmp_path: Path) -> Non
     assert alias_hit["entity_type"] == "projects"
     assert alias_hit["entity_id"] == "drost"
 
+    alias_hits = store.find_entities_in_text_by_alias("How is the repo connected to Migel?", limit=2)
+    assert alias_hits
+    assert alias_hits[0]["entity_type"] == "projects"
+    assert alias_hits[0]["entity_id"] == "drost"
+
     entities = store.list_memory_entities()
     assert entities == [
         {
@@ -92,6 +97,11 @@ def test_workspace_memory_indexer_indexes_workspace_files(tmp_path: Path) -> Non
     assert relations[0]["relation_type"] == "owned_by"
     assert relations[0]["to_entity_type"] == "people"
     assert relations[0]["to_entity_id"] == "migel"
+
+    neighbors = store.list_entity_neighbors("projects", "drost", limit=2)
+    assert len(neighbors) == 1
+    assert neighbors[0]["relation"]["relation_type"] == "owned_by"
+    assert neighbors[0]["related_summary"] is None
 
     relation_query = "Who owns Drost?"
     relation_embedding = asyncio.run(embeddings.embed_query(relation_query))

@@ -13,6 +13,7 @@ _SOURCE_ORDER = [
     "session_continuity",
     "daily_memory",
     "entity_summary",
+    "entity_relation",
     "entity_item",
     "transcript_message",
     "transcript_tool",
@@ -22,6 +23,7 @@ _SOURCE_LIMITS = {
     "session_continuity": 1,
     "daily_memory": 2,
     "entity_summary": 2,
+    "entity_relation": 3,
     "entity_item": 1,
     "transcript_message": 2,
     "transcript_tool": 1,
@@ -31,6 +33,7 @@ _SOURCE_BOOST = {
     "session_continuity": 0.0045,
     "daily_memory": 0.0040,
     "entity_summary": 0.0035,
+    "entity_relation": 0.0032,
     "entity_item": 0.0025,
     "transcript_message": 0.0010,
     "transcript_tool": 0.0008,
@@ -40,9 +43,27 @@ _SECTION_LABELS = {
     "session_continuity": "[Session Continuity]",
     "daily_memory": "[Relevant Daily Memory]",
     "entity_summary": "[Relevant Entity Summaries]",
+    "entity_relation": "[Relevant Relationships]",
     "entity_item": "[Relevant Atomic Facts]",
     "transcript_message": "[Relevant Transcript Recall]",
     "transcript_tool": "[Relevant Tool Recall]",
+}
+
+_RELATION_QUERY_TOKENS = {
+    "owner",
+    "owned",
+    "owns",
+    "who",
+    "how",
+    "connected",
+    "connection",
+    "depends",
+    "dependency",
+    "dependencies",
+    "uses",
+    "with",
+    "related",
+    "relationship",
 }
 
 
@@ -114,6 +135,7 @@ class MemoryCapsuleBuilder:
         tokens = self._tokenize(query_text)
         ranked: list[_RankedCandidate] = []
         continuity_loaded = bool(str(continuity_summary or "").strip())
+        relationship_query = self._is_relationship_query(tokens)
 
         if continuity_loaded:
             ranked.append(
@@ -146,6 +168,8 @@ class MemoryCapsuleBuilder:
             base = float(raw.get("fused_score") or raw.get("score") or 0.0)
             lexical = self._lexical_overlap(tokens, self._candidate_text(raw))
             score = base + _SOURCE_BOOST.get(source_kind, 0.0) + (lexical * 0.006)
+            if relationship_query and source_kind == "entity_relation":
+                score += 0.008
             ranked.append(
                 _RankedCandidate(
                     row=raw,
@@ -190,8 +214,12 @@ class MemoryCapsuleBuilder:
         add_from("session_continuity")
         add_from("daily_memory")
         add_from("entity_summary")
+        add_from("entity_relation")
 
-        primary_count = sum(counts[kind] for kind in ("workspace_memory", "session_continuity", "daily_memory", "entity_summary"))
+        primary_count = sum(
+            counts[kind]
+            for kind in ("workspace_memory", "session_continuity", "daily_memory", "entity_summary", "entity_relation")
+        )
         if primary_count < 3:
             add_from("entity_item", require_overlap=True)
         if primary_count < 3 or not selected:
@@ -220,6 +248,10 @@ class MemoryCapsuleBuilder:
     def _tokenize(text: str) -> set[str]:
         return {token for token in re.findall(r"[a-z0-9_]{3,}", str(text or "").lower()) if token}
 
+    @staticmethod
+    def _is_relationship_query(query_tokens: set[str]) -> bool:
+        return any(token in _RELATION_QUERY_TOKENS for token in query_tokens)
+
     @classmethod
     def _lexical_overlap(cls, query_tokens: set[str], text: str) -> float:
         if not query_tokens:
@@ -244,6 +276,11 @@ class MemoryCapsuleBuilder:
 
     @staticmethod
     def _dedupe_key(row: dict[str, Any], source_kind: str) -> tuple[str, str]:
+        if source_kind == "entity_relation":
+            relation_id = str(row.get("derived_from") or "").strip()
+            path = str(row.get("path") or "").strip()
+            line_start = int(row.get("line_start") or 1)
+            return source_kind, relation_id or f"{path}:{line_start}"
         path = str(row.get("path") or "").strip()
         title = str(row.get("title") or "").strip()
         identifier = str(row.get("id") or "").strip()

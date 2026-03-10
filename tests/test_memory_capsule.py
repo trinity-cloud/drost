@@ -115,3 +115,58 @@ def test_memory_capsule_falls_back_to_transcript_when_high_order_memory_is_weak(
 
     assert "[Relevant Transcript Recall]" in capsule
     assert "cutting tech exposure" in capsule
+
+
+def test_memory_capsule_includes_relationships_for_relation_queries(tmp_path: Path) -> None:
+    settings = Settings(
+        workspace_dir=tmp_path,
+        context_budget_memory_tokens=8_000,
+        memory_capsule_enabled=True,
+        memory_capsule_search_limit=18,
+    )
+    builder = MemoryCapsuleBuilder(settings)
+
+    candidates = [
+        {
+            "id": 31,
+            "source_kind": "entity_summary",
+            "title": "projects/drost",
+            "path": "memory/entities/projects/drost/summary.md",
+            "snippet": "Drost is an AI agent runtime with durable memory and a deployer control plane.",
+            "line_start": 1,
+            "line_end": 4,
+            "fused_score": 0.020,
+        },
+        {
+            "id": 0,
+            "source_kind": "entity_relation",
+            "title": "projects/drost",
+            "path": "memory/entities/projects/drost/relations.md",
+            "snippet": "Drost is owned and directed by Migel.",
+            "content": "Drost is owned and directed by Migel.",
+            "line_start": 3,
+            "line_end": 4,
+            "derived_from": "projects/drost/relations/0001",
+            "fused_score": 0.028,
+        },
+        {
+            "id": 32,
+            "source_kind": "entity_summary",
+            "title": "people/migel",
+            "path": "memory/entities/people/migel/summary.md",
+            "snippet": "Migel owns and directs the Drost project.",
+            "line_start": 1,
+            "line_end": 3,
+            "fused_score": 0.019,
+        },
+    ]
+
+    capsule = builder.build(
+        query_text="Who owns Drost and how are they connected?",
+        candidates=candidates,
+        continuity_summary="",
+    )
+
+    assert "[Relevant Relationships]" in capsule
+    assert "owned and directed by Migel" in capsule
+    assert "[Relevant Entity Summaries]" in capsule

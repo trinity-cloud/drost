@@ -25,6 +25,23 @@ def _normalize_alias_key(value: str) -> str:
     return re.sub(r"\s+", " ", lowered)
 
 
+def _alias_present_in_text(alias_normalized: str, normalized_text: str) -> bool:
+    if not alias_normalized or not normalized_text:
+        return False
+    if " " in alias_normalized or "/" in alias_normalized or ":" in alias_normalized:
+        return alias_normalized in normalized_text
+    return re.search(rf"(?<![a-z0-9_]){re.escape(alias_normalized)}(?![a-z0-9_])", normalized_text) is not None
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 class SQLiteStore:
     """SQLite persistence for sessions + memory (with sqlite-vec acceleration)."""
 
@@ -1076,6 +1093,48 @@ class SQLiteStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_memory_chunks_by_path(self, path: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        cleaned = str(path or "").strip()
+        if not cleaned:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, session_key, role, content, created_at,
+                       source_kind, path, line_start, line_end, title, updated_at, derived_from, content_hash
+                  FROM memory_chunks
+                 WHERE path = ?
+              ORDER BY line_start ASC, id ASC
+                 LIMIT ?
+                """,
+                (cleaned, max(1, int(limit))),
+            ).fetchall()
+        return [self._row_to_memory_result(row) for row in rows]
+
+    def get_entity_summary_memory(self, entity_type: str, entity_id: str) -> dict[str, Any] | None:
+        cleaned_type = str(entity_type or "").strip()
+        cleaned_id = str(entity_id or "").strip()
+        if not cleaned_type or not cleaned_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT summary_path
+                  FROM memory_entities
+                 WHERE entity_type = ?
+                   AND entity_id = ?
+                 LIMIT 1
+                """,
+                (cleaned_type, cleaned_id),
+            ).fetchone()
+        if row is None:
+            return None
+        summary_path = str(row["summary_path"] or "").strip()
+        if not summary_path:
+            return None
+        rows = self.get_memory_chunks_by_path(summary_path, limit=1)
+        return rows[0] if rows else None
+
     def find_entity_by_alias(self, alias: str) -> dict[str, Any] | None:
         normalized = _normalize_alias_key(alias)
         if not normalized:
@@ -1101,6 +1160,49 @@ class SQLiteStore:
                 (normalized,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def find_entities_in_text_by_alias(self, text: str, *, limit: int = 2) -> list[dict[str, Any]]:
+        normalized_text = _normalize_alias_key(text)
+        if not normalized_text:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT e.entity_type,
+                       e.entity_id,
+                       e.title,
+                       e.entity_path,
+                       e.summary_path,
+                       e.updated_at,
+                       a.alias,
+                       a.alias_normalized,
+                       a.path AS alias_path
+                  FROM memory_entity_aliases a
+                  JOIN memory_entities e
+                    ON e.entity_type = a.entity_type
+                   AND e.entity_id = a.entity_id
+              ORDER BY length(a.alias_normalized) DESC, a.alias_normalized ASC
+                """
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            alias_normalized = str(row["alias_normalized"] or "").strip()
+            if not alias_normalized:
+                continue
+            if not _alias_present_in_text(alias_normalized, normalized_text):
+                continue
+            key = (str(row["entity_type"] or ""), str(row["entity_id"] or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            payload = dict(row)
+            payload["alias_match_length"] = len(alias_normalized)
+            out.append(payload)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
 
     def list_entity_relations(self, entity_type: str, entity_id: str) -> list[dict[str, Any]]:
         cleaned_type = str(entity_type or "").strip()
@@ -1130,6 +1232,40 @@ class SQLiteStore:
                 (cleaned_type, cleaned_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_entity_neighbors(
+        self,
+        entity_type: str,
+        entity_id: str,
+        *,
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        relations = self.list_entity_relations(entity_type, entity_id)
+        if not relations:
+            return []
+
+        ranked = sorted(
+            relations,
+            key=lambda row: (
+                -(_coerce_float(row.get("confidence")) or 0.0),
+                str(row.get("updated_at") or ""),
+                str(row.get("relation_id") or ""),
+            ),
+            reverse=True,
+        )
+        out: list[dict[str, Any]] = []
+        for row in ranked[: max(1, int(limit))]:
+            related_summary = self.get_entity_summary_memory(
+                str(row.get("to_entity_type") or ""),
+                str(row.get("to_entity_id") or ""),
+            )
+            out.append(
+                {
+                    "relation": row,
+                    "related_summary": related_summary,
+                }
+            )
+        return out
 
     def remove_indexed_file(self, path: str) -> None:
         cleaned_path = str(path or "").strip()

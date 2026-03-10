@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,8 @@ from drost.storage import (
 from drost.tools import build_default_registry
 
 logger = logging.getLogger(__name__)
+
+_ENTITY_PATH_RE = re.compile(r"memory/entities/([^/]+)/([^/]+)/")
 
 SYSTEM_PROMPT = (
     "You are a personal AI agent running inside Drost. "
@@ -118,6 +121,117 @@ class AgentRuntime:
         if not continuity:
             return ""
         return str(continuity.get("summary") or "").strip()
+
+    @staticmethod
+    def _extract_entity_ref(row: dict[str, Any]) -> tuple[str, str] | None:
+        title = str(row.get("title") or "").strip()
+        if "/" in title:
+            parts = title.split("/", 1)
+            entity_type = parts[0].strip()
+            entity_id = parts[1].strip()
+            if entity_type and entity_id:
+                return entity_type, entity_id
+
+        path = str(row.get("path") or "").strip()
+        match = _ENTITY_PATH_RE.search(path)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        return None
+
+    def _gather_graph_candidates(
+        self,
+        *,
+        query_text: str,
+        memories: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        graph_candidates: list[dict[str, Any]] = []
+        seen_paths: set[str] = {
+            str(row.get("path") or "").strip()
+            for row in memories
+            if isinstance(row, dict) and str(row.get("path") or "").strip()
+        }
+
+        primary_entities: list[tuple[str, str]] = []
+        seen_entities: set[tuple[str, str]] = set()
+
+        for row in self._store.find_entities_in_text_by_alias(query_text, limit=2):
+            key = (str(row.get("entity_type") or ""), str(row.get("entity_id") or ""))
+            if key[0] and key[1] and key not in seen_entities:
+                primary_entities.append(key)
+                seen_entities.add(key)
+
+        for row in memories:
+            if len(primary_entities) >= 2:
+                break
+            if not isinstance(row, dict):
+                continue
+            source_kind = str(row.get("source_kind") or "").strip()
+            if source_kind not in {"entity_summary", "entity_item", "entity_relation", "entity_alias"}:
+                continue
+            key = self._extract_entity_ref(row)
+            if key is None or key in seen_entities:
+                continue
+            primary_entities.append(key)
+            seen_entities.add(key)
+
+        neighbors_loaded = 0
+        for entity_type, entity_id in primary_entities[:2]:
+            summary_row = self._store.get_entity_summary_memory(entity_type, entity_id)
+            if summary_row is not None:
+                summary_path = str(summary_row.get("path") or "").strip()
+                if summary_path and summary_path not in seen_paths:
+                    graph_candidates.append(
+                        {
+                            **summary_row,
+                            "fused_score": float(summary_row.get("score") or 0.04),
+                            "graph_seed": "entity_summary",
+                        }
+                    )
+                    seen_paths.add(summary_path)
+
+            for neighbor in self._store.list_entity_neighbors(entity_type, entity_id, limit=4):
+                if neighbors_loaded >= 4:
+                    break
+                relation = neighbor.get("relation")
+                if not isinstance(relation, dict):
+                    continue
+                relation_path = str(relation.get("path") or "").strip()
+                graph_candidates.append(
+                    {
+                        "id": 0,
+                        "session_key": "",
+                        "role": "memory",
+                        "content": str(relation.get("relation_text") or "").strip(),
+                        "created_at": str(relation.get("updated_at") or ""),
+                        "source_kind": "entity_relation",
+                        "path": relation_path,
+                        "line_start": int(relation.get("line_start") or 1),
+                        "line_end": int(relation.get("line_end") or relation.get("line_start") or 1),
+                        "title": f"{relation.get('from_entity_type')}/{relation.get('from_entity_id')}",
+                        "updated_at": str(relation.get("updated_at") or ""),
+                        "derived_from": str(relation.get("relation_id") or ""),
+                        "content_hash": "",
+                        "snippet": str(relation.get("relation_text") or "").strip(),
+                        "fused_score": 0.03 + max(0.0, float(relation.get("confidence") or 0.0)) * 0.01,
+                    }
+                )
+                neighbors_loaded += 1
+                related_summary = neighbor.get("related_summary")
+                if isinstance(related_summary, dict):
+                    related_path = str(related_summary.get("path") or "").strip()
+                    if related_path and related_path not in seen_paths:
+                        graph_candidates.append(
+                            {
+                                **related_summary,
+                                "fused_score": 0.02,
+                                "graph_seed": "neighbor_summary",
+                            }
+                        )
+                        seen_paths.add(related_path)
+            if neighbors_loaded >= 4:
+                break
+
+        return graph_candidates
 
     async def _summarize_history(self, provider_name: str, history_rows: list[dict[str, Any]]) -> str:
         if not history_rows:
@@ -295,6 +409,12 @@ class AgentRuntime:
                     int(self._settings.memory_capsule_search_limit),
                 ),
             )
+            graph_candidates = self._gather_graph_candidates(
+                query_text=query_text,
+                memories=memories,
+            )
+            if graph_candidates:
+                memories = memories + graph_candidates
             memory_block = self._memory_capsule_builder.build(
                 query_text=query_text,
                 candidates=memories,
