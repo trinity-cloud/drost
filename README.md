@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="drost.png" alt="Drost" width="400">
+  <img src="docs/assets/drost.png" alt="Drost" width="400">
 </p>
 
 <h1 align="center">Drost</h1>
