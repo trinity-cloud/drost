@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import pytest
 
+from drost.loop_events import LoopEventBus
 from drost.memory_files import MemoryFiles
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import (
@@ -71,6 +72,17 @@ class ExtractionProvider(BaseProvider):
         _ = messages, system, tools, max_tokens, temperature, stop_sequences
         if False:
             yield StreamDelta(content="")
+
+
+async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.5) -> None:
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    assert predicate()
 
 
 @pytest.mark.asyncio
@@ -371,3 +383,64 @@ async def test_memory_maintenance_extracts_followups_with_session_provenance(tmp
     assert payload["items"][0]["entity_refs"] == ["people/migel"]
 
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_wakes_on_assistant_turn_completed_event(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    session_store = SessionJSONLStore(store_path=sessions)
+    session_key = session_key_for_telegram_chat(456, "s_2026-03-10_10-00-00")
+    bus = LoopEventBus()
+
+    provider = ExtractionProvider(
+        content=json.dumps(
+            {
+                "daily_notes": [
+                    {
+                        "date": "2026-03-10",
+                        "bullets": ["Recorded an event-driven maintenance wake-up."],
+                    }
+                ],
+                "facts": [],
+            }
+        )
+    )
+
+    async def _sync_index() -> dict[str, int]:
+        return {"indexed": 1, "skipped": 0, "removed": 0}
+
+    runner = MemoryMaintenanceRunner(
+        workspace_dir=workspace,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        sync_memory_index=_sync_index,
+        enabled=True,
+        event_bus=bus,
+        interval_seconds=3600,
+        max_events_per_run=200,
+    )
+
+    await runner.start()
+    try:
+        session_store.append_user_assistant(
+            session_key=session_key,
+            user_text="Remember that maintenance should wake from the event bus.",
+            assistant_text="Understood. I will wake maintenance from assistant completion events.",
+        )
+        bus.emit(
+            "assistant_turn_completed",
+            scope={"chat_id": 456, "session_key": session_key},
+            payload={"provider": "fake-extraction"},
+        )
+
+        daily_path = workspace / "memory" / "daily" / "2026-03-10.md"
+        await _wait_until(lambda: daily_path.exists())
+        assert "event-driven maintenance wake-up" in daily_path.read_text(encoding="utf-8")
+    finally:
+        await runner.stop()
+
+    status = bus.status()
+    assert status["event_counts"]["assistant_turn_completed"] == 1
+    assert status["event_counts"]["memory_maintenance_completed"] == 1

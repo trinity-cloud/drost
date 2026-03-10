@@ -14,6 +14,7 @@ from typing import Any
 
 from drost.entity_resolution import EntityResolver
 from drost.followups import FollowUpStore
+from drost.loop_events import EventSubscription, LoopEventBus
 from drost.memory_files import MemoryFiles
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
 
@@ -68,6 +69,7 @@ class MemoryMaintenanceRunner:
         provider_getter: Callable[[], BaseProvider],
         sync_memory_index: Callable[[], Awaitable[dict[str, int]]],
         enabled: bool,
+        event_bus: LoopEventBus | None = None,
         interval_seconds: int = 1800,
         max_events_per_run: int = 200,
         entity_synthesis_enabled: bool = True,
@@ -80,6 +82,7 @@ class MemoryMaintenanceRunner:
         self._provider_getter = provider_getter
         self._sync_memory_index = sync_memory_index
         self._enabled = bool(enabled)
+        self._event_bus = event_bus
         self._interval_seconds = max(1, int(interval_seconds))
         self._max_events_per_run = max(1, int(max_events_per_run))
         self._entity_synthesis_enabled = bool(entity_synthesis_enabled)
@@ -89,6 +92,9 @@ class MemoryMaintenanceRunner:
         self._followup_confidence_threshold = max(0.0, min(1.0, float(followup_confidence_threshold)))
 
         self._task: asyncio.Task[None] | None = None
+        self._event_listener_task: asyncio.Task[None] | None = None
+        self._event_subscription: EventSubscription | None = None
+        self._trigger_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=16)
         self._run_lock = asyncio.Lock()
         self._running = False
         self._last_status: dict[str, Any] = {
@@ -103,6 +109,8 @@ class MemoryMaintenanceRunner:
             "last_success_at": "",
             "last_error": "",
             "last_result": {},
+            "event_driven": self._event_bus is not None,
+            "last_trigger_event": "",
         }
 
     async def start(self) -> None:
@@ -110,6 +118,12 @@ class MemoryMaintenanceRunner:
             return
         self._running = True
         self._last_status["running"] = True
+        if self._event_bus is not None and self._event_subscription is None:
+            self._event_subscription = self._event_bus.subscribe(
+                name="maintenance_loop",
+                event_types={"assistant_turn_completed"},
+            )
+            self._event_listener_task = asyncio.create_task(self._listen_for_events())
         self._task = asyncio.create_task(self._loop())
         asyncio.create_task(self.run_once(reason="startup"))
         logger.info(
@@ -122,22 +136,65 @@ class MemoryMaintenanceRunner:
         self._running = False
         self._last_status["running"] = False
         if self._task is None:
+            if self._event_listener_task is not None:
+                self._event_listener_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._event_listener_task
+                self._event_listener_task = None
+            if self._event_subscription is not None:
+                self._event_bus and self._event_bus.unsubscribe(self._event_subscription.name)
+                self._event_subscription = None
             return
         self._task.cancel()
         with suppress(asyncio.CancelledError):
             await self._task
         self._task = None
+        if self._event_listener_task is not None:
+            self._event_listener_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._event_listener_task
+            self._event_listener_task = None
+        if self._event_subscription is not None:
+            self._event_bus and self._event_bus.unsubscribe(self._event_subscription.name)
+            self._event_subscription = None
         logger.info("Memory maintenance runner stopped")
 
     async def _loop(self) -> None:
         while self._running:
             try:
-                await asyncio.sleep(self._interval_seconds)
-                await self.run_once(reason="scheduled")
+                trigger_reason = await self._next_trigger_reason()
+                await self.run_once(reason=trigger_reason)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("Memory maintenance loop error")
+
+    async def _listen_for_events(self) -> None:
+        subscription = self._event_subscription
+        if subscription is None:
+            return
+        while self._running and subscription.active:
+            try:
+                event = await subscription.get()
+            except asyncio.CancelledError:
+                break
+            self._last_status["last_trigger_event"] = event.type
+            self._enqueue_trigger(f"event:{event.type}")
+
+    async def _next_trigger_reason(self) -> str:
+        try:
+            return await asyncio.wait_for(self._trigger_queue.get(), timeout=self._interval_seconds)
+        except TimeoutError:
+            return "scheduled"
+
+    def _enqueue_trigger(self, reason: str) -> None:
+        try:
+            self._trigger_queue.put_nowait(str(reason or "event"))
+        except asyncio.QueueFull:
+            with suppress(asyncio.QueueEmpty):
+                self._trigger_queue.get_nowait()
+            with suppress(asyncio.QueueFull):
+                self._trigger_queue.put_nowait(str(reason or "event"))
 
     def status(self) -> dict[str, Any]:
         return dict(self._last_status)
@@ -194,7 +251,7 @@ class MemoryMaintenanceRunner:
                 payload.get("relations"),
                 resolver=resolver,
             )
-            followups_written, touched_followups = self._write_followups(
+            followups_written, touched_followups, followup_events = self._write_followups(
                 payload.get("follow_ups"),
                 resolver=resolver,
                 events=batch.events,
@@ -240,6 +297,11 @@ class MemoryMaintenanceRunner:
             self._last_status["last_result"] = result
             self._last_status["last_error"] = ""
             self._last_status["last_success_at"] = started_at
+            self._emit_maintenance_events(
+                reason=reason,
+                result=result,
+                followup_events=followup_events,
+            )
             return result
 
     @staticmethod
@@ -740,9 +802,9 @@ class MemoryMaintenanceRunner:
         *,
         resolver: EntityResolver,
         events: list[PendingEvent],
-    ) -> tuple[int, set[Path]]:
+    ) -> tuple[int, set[Path], list[dict[str, Any]]]:
         if not self._followups_enabled or self._followups is None or not isinstance(follow_ups, list):
-            return 0, set()
+            return 0, set(), []
 
         source_lookup = {
             f"{event.file_name}:{event.line}": {
@@ -753,6 +815,7 @@ class MemoryMaintenanceRunner:
         }
         count = 0
         touched: set[Path] = set()
+        event_rows: list[dict[str, Any]] = []
         for item in follow_ups:
             if not isinstance(item, dict):
                 continue
@@ -783,7 +846,7 @@ class MemoryMaintenanceRunner:
                     entity_refs.append(resolved_ref)
 
             try:
-                _, created = self._followups.upsert_extracted_followup(
+                stored, created = self._followups.upsert_extracted_followup(
                     chat_id=chat_id,
                     source_session_key=source_session_key,
                     kind=str(item.get("kind") or "check_in").strip() or "check_in",
@@ -803,9 +866,56 @@ class MemoryMaintenanceRunner:
                 continue
 
             touched.add(self._followups.followups_path)
+            event_rows.append(
+                {
+                    "event_type": "followup_created" if created else "followup_updated",
+                    "follow_up_id": str(stored.get("id") or ""),
+                    "chat_id": int(stored.get("chat_id") or chat_id),
+                    "session_key": str(stored.get("source_session_key") or source_session_key),
+                    "status": str(stored.get("status") or "pending"),
+                    "subject": str(stored.get("subject") or subject),
+                }
+            )
             if created:
                 count += 1
-        return count, touched
+        return count, touched, event_rows
+
+    def _emit_maintenance_events(
+        self,
+        *,
+        reason: str,
+        result: dict[str, Any],
+        followup_events: list[dict[str, Any]],
+    ) -> None:
+        if self._event_bus is None:
+            return
+        self._event_bus.emit(
+            "memory_maintenance_completed",
+            payload={
+                "reason": reason,
+                "new_events": int(result.get("new_events") or 0),
+                "daily_notes_written": int(result.get("daily_notes_written") or 0),
+                "aliases_written": int(result.get("aliases_written") or 0),
+                "facts_written": int(result.get("facts_written") or 0),
+                "relations_written": int(result.get("relations_written") or 0),
+                "followups_written": int(result.get("followups_written") or 0),
+                "summaries_written": int(result.get("summaries_written") or 0),
+            },
+        )
+        for item in followup_events:
+            self._event_bus.emit(
+                str(item.get("event_type") or "followup_updated"),
+                scope={
+                    "chat_id": int(item.get("chat_id") or 0),
+                    "session_key": str(item.get("session_key") or ""),
+                },
+                payload={
+                    "follow_up_id": str(item.get("follow_up_id") or ""),
+                    "status": str(item.get("status") or ""),
+                    "subject": str(item.get("subject") or ""),
+                    "source": "memory_maintenance",
+                },
+            )
 
     async def _synthesize_entities(
         self,

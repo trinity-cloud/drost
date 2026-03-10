@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from drost.loop_events import LoopEventBus
 from drost.providers import (
     BaseProvider,
     ChatResponse,
@@ -288,6 +289,52 @@ async def test_session_continuity_includes_graph_context_when_aliases_match(tmp_
     assert "[Graph Context]" in prompt
     assert "Drost deploys through the deployer control plane" in prompt
     assert "owned_by people/migel" in prompt
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_session_continuity_emits_continuity_written_event(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+
+    store = SQLiteStore(db_path=tmp_path / "drost.sqlite3", vector_dimensions=64)
+    from_key = session_key_for_telegram_chat(777, "s_2026-03-10_08-00-00")
+    to_key = session_key_for_telegram_chat(777, "s_2026-03-10_09-00-00")
+    store.append_message(from_key, "user", "Carry over the deployer cleanup work.")
+    store.append_message(from_key, "assistant", "I will hand that context into the next session.")
+
+    provider = ContinuityProvider(
+        "## Session Continuity\n### Core Objective\nCarry over deployer cleanup.\n### Decisions And Constraints\n- Keep the control plane external.\n### Work Completed\n- Identified the cleanup.\n### Open Threads\n- Finish the cleanup.\n### Suggested Next Actions\n- Continue the deployer work."
+    )
+    bus = LoopEventBus()
+    manager = SessionContinuityManager(
+        store=store,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        embed_document=_embed_constant,
+        event_bus=bus,
+        enabled=True,
+    )
+
+    result = await manager.schedule(
+        ContinuityJobRequest(
+            chat_id=777,
+            from_session_id="s_2026-03-10_08-00-00",
+            from_session_key=from_key,
+            to_session_id="s_2026-03-10_09-00-00",
+            to_session_key=to_key,
+        )
+    )
+    await manager.wait_for_idle()
+
+    assert result["queued"] is True
+    status = bus.status()
+    assert status["event_counts"]["continuity_written"] == 1
+    event = status["recent_events"][-1]
+    assert event["type"] == "continuity_written"
+    assert event["scope"]["chat_id"] == 777
+    assert event["scope"]["session_key"] == to_key
     store.close()
 
 

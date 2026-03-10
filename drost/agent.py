@@ -17,6 +17,7 @@ from drost.context_budget import (
 )
 from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
+from drost.loop_events import LoopEventBus
 from drost.memory_capsule import MemoryCapsuleBuilder
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
@@ -47,6 +48,7 @@ class AgentRuntime:
         providers: ProviderRegistry,
         store: SQLiteStore,
         embeddings: EmbeddingService,
+        event_bus: LoopEventBus | None = None,
     ) -> None:
         self._settings = settings
         self._providers = providers
@@ -63,6 +65,7 @@ class AgentRuntime:
         self._followups = FollowUpStore(settings.workspace_dir)
         self._memory_capsule_builder = MemoryCapsuleBuilder(settings)
         self._last_run: dict[str, Any] | None = None
+        self._event_bus = event_bus
 
     @property
     def active_provider(self) -> str:
@@ -596,6 +599,23 @@ class AgentRuntime:
                 role="assistant",
                 content=assistant_text,
                 embedding=assistant_embedding,
+            )
+
+        if self._event_bus is not None:
+            self._event_bus.emit(
+                "assistant_turn_completed",
+                scope={
+                    "chat_id": int(chat_id),
+                    "session_key": session_key,
+                },
+                payload={
+                    "provider": provider.name,
+                    "model": provider.model,
+                    "text_chars": len(assistant_text),
+                    "iterations": int((self._last_run or {}).get("iterations", 0)),
+                    "tool_calls": int((self._last_run or {}).get("tool_calls", 0)),
+                    "has_media": bool(normalized_media),
+                },
             )
 
         return assistant_text

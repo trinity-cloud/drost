@@ -12,6 +12,7 @@ from typing import Any
 
 from drost.followups import FollowUpStore
 from drost.idle_state import IdleStateStore
+from drost.loop_events import EventSubscription, LoopEventBus
 from drost.providers import BaseProvider, Message, MessageRole
 from drost.workspace_loader import WorkspaceLoader
 
@@ -54,6 +55,7 @@ class IdleHeartbeatRunner:
         send_message: Callable[[int, str], Awaitable[Any]],
         enabled: bool,
         proactive_enabled: bool,
+        event_bus: LoopEventBus | None = None,
         provider_getter: Callable[[], BaseProvider] | None = None,
         interval_seconds: int = 1800,
         active_window_seconds: int = 20 * 60,
@@ -64,6 +66,7 @@ class IdleHeartbeatRunner:
         self._followups = followups
         self._idle_state = idle_state
         self._send_message = send_message
+        self._event_bus = event_bus
         self._provider_getter = provider_getter
         self._workspace_loader = WorkspaceLoader(self._workspace_dir)
         self._enabled = bool(enabled)
@@ -73,6 +76,9 @@ class IdleHeartbeatRunner:
         self._proactive_cooldown_seconds = max(60, int(proactive_cooldown_seconds))
         self._max_due_items = max(1, int(max_due_items))
         self._task: asyncio.Task[None] | None = None
+        self._event_listener_task: asyncio.Task[None] | None = None
+        self._event_subscription: EventSubscription | None = None
+        self._trigger_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=16)
         self._run_lock = asyncio.Lock()
         self._running = False
         self._last_status: dict[str, Any] = {
@@ -86,6 +92,8 @@ class IdleHeartbeatRunner:
             "last_run_at": "",
             "last_error": "",
             "last_result": {},
+            "event_driven": self._event_bus is not None,
+            "last_trigger_event": "",
         }
 
     async def start(self) -> None:
@@ -93,6 +101,18 @@ class IdleHeartbeatRunner:
             return
         self._running = True
         self._last_status["running"] = True
+        if self._event_bus is not None and self._event_subscription is None:
+            self._event_subscription = self._event_bus.subscribe(
+                name="heartbeat_loop",
+                event_types={
+                    "assistant_turn_completed",
+                    "followup_created",
+                    "followup_updated",
+                    "continuity_written",
+                    "session_switched",
+                },
+            )
+            self._event_listener_task = asyncio.create_task(self._listen_for_events())
         self._task = asyncio.create_task(self._loop())
         asyncio.create_task(self.run_once(reason="startup"))
         logger.info(
@@ -106,23 +126,66 @@ class IdleHeartbeatRunner:
         self._running = False
         self._last_status["running"] = False
         if self._task is None:
+            if self._event_listener_task is not None:
+                self._event_listener_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._event_listener_task
+                self._event_listener_task = None
+            if self._event_subscription is not None:
+                self._event_bus and self._event_bus.unsubscribe(self._event_subscription.name)
+                self._event_subscription = None
             return
         self._task.cancel()
         with suppress(asyncio.CancelledError):
             await self._task
         self._task = None
+        if self._event_listener_task is not None:
+            self._event_listener_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._event_listener_task
+            self._event_listener_task = None
+        if self._event_subscription is not None:
+            self._event_bus and self._event_bus.unsubscribe(self._event_subscription.name)
+            self._event_subscription = None
         logger.info("Idle heartbeat runner stopped")
 
     async def _loop(self) -> None:
-        tick_seconds = min(60, self._interval_seconds)
         while self._running:
             try:
-                await asyncio.sleep(tick_seconds)
-                await self.run_once(reason="tick")
+                trigger_reason = await self._next_trigger_reason()
+                await self.run_once(reason=trigger_reason)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("Idle heartbeat loop error")
+
+    async def _listen_for_events(self) -> None:
+        subscription = self._event_subscription
+        if subscription is None:
+            return
+        while self._running and subscription.active:
+            try:
+                event = await subscription.get()
+            except asyncio.CancelledError:
+                break
+            self._last_status["last_trigger_event"] = event.type
+            self._enqueue_trigger(f"event:{event.type}")
+
+    async def _next_trigger_reason(self) -> str:
+        tick_seconds = min(60, self._interval_seconds)
+        try:
+            return await asyncio.wait_for(self._trigger_queue.get(), timeout=tick_seconds)
+        except TimeoutError:
+            return "tick"
+
+    def _enqueue_trigger(self, reason: str) -> None:
+        try:
+            self._trigger_queue.put_nowait(str(reason or "event"))
+        except asyncio.QueueFull:
+            with suppress(asyncio.QueueEmpty):
+                self._trigger_queue.get_nowait()
+            with suppress(asyncio.QueueFull):
+                self._trigger_queue.put_nowait(str(reason or "event"))
 
     def status(self) -> dict[str, Any]:
         state = self._idle_state.status(active_window_seconds=self._active_window_seconds)
@@ -152,28 +215,38 @@ class IdleHeartbeatRunner:
             last_heartbeat_at = _parse_time(state.get("last_heartbeat_at"))
 
             if mode == "active":
-                return self._record_result({"reason": reason, "decision": "noop", "why": "active_mode", "chat_id": chat_id})
+                result = self._record_result(
+                    {"reason": reason, "decision": "noop", "why": "active_mode", "chat_id": chat_id}
+                )
+                self._emit_heartbeat_decision(result)
+                return result
 
             if reason == "tick" and last_heartbeat_at is not None:
                 elapsed = (started_at - last_heartbeat_at).total_seconds()
                 if elapsed < self._interval_seconds and not bool(state.get("mode_changed")):
-                    return self._record_result(
+                    result = self._record_result(
                         {"reason": reason, "decision": "noop", "why": "interval_not_elapsed", "chat_id": chat_id}
                     )
+                    self._emit_heartbeat_decision(result)
+                    return result
 
             self._idle_state.note_heartbeat(at=started_at)
 
             if chat_id <= 0:
-                return self._record_result({"reason": reason, "decision": "noop", "why": "no_active_chat"})
+                result = self._record_result({"reason": reason, "decision": "noop", "why": "no_active_chat"})
+                self._emit_heartbeat_decision(result)
+                return result
 
             due_items = self._followups.list_due(now=started_at, chat_id=chat_id, limit=self._max_due_items)
             if not due_items:
-                return self._record_result(
+                result = self._record_result(
                     {"reason": reason, "decision": "noop", "why": "no_due_followups", "chat_id": chat_id}
                 )
+                self._emit_heartbeat_decision(result)
+                return result
 
             if not self._proactive_enabled:
-                return self._record_result(
+                result = self._record_result(
                     {
                         "reason": reason,
                         "decision": "noop",
@@ -182,6 +255,8 @@ class IdleHeartbeatRunner:
                         "due_followup_ids": [str(item.get("id") or "") for item in due_items],
                     }
                 )
+                self._emit_heartbeat_decision(result)
+                return result
 
             decision = await self._decide(
                 due_items=due_items,
@@ -195,7 +270,9 @@ class IdleHeartbeatRunner:
             followup = self._resolve_followup(decision.get("follow_up_id"), due_items)
             action = str(decision.get("decision") or "noop")
             if action == "noop":
-                return self._record_result(decision)
+                result = self._record_result(decision)
+                self._emit_heartbeat_decision(result)
+                return result
 
             if followup is None:
                 fallback = self._deterministic_decision(due_items=due_items)
@@ -205,8 +282,11 @@ class IdleHeartbeatRunner:
                 action = str(decision.get("decision") or "noop")
 
             if action == "mark_expired":
-                self._followups.expire(str(followup.get("id") or ""))
-                return self._record_result(decision)
+                updated = self._followups.expire(str(followup.get("id") or "")) or followup
+                self._emit_followup_updated(updated, source="heartbeat_expired")
+                result = self._record_result(decision)
+                self._emit_heartbeat_decision(result)
+                return result
 
             if action == "snooze_follow_up":
                 snooze_until = _parse_time(decision.get("snooze_until"))
@@ -214,12 +294,15 @@ class IdleHeartbeatRunner:
                     fallback_until = started_at + timedelta(seconds=self._proactive_cooldown_seconds)
                     snooze_until = fallback_until
                     decision["snooze_until"] = _dump_time(snooze_until)
-                self._followups.snooze(str(followup.get("id") or ""), until=snooze_until)
-                return self._record_result(decision)
+                updated = self._followups.snooze(str(followup.get("id") or ""), until=snooze_until) or followup
+                self._emit_followup_updated(updated, source="heartbeat_snoozed")
+                result = self._record_result(decision)
+                self._emit_heartbeat_decision(result)
+                return result
 
             message = str(decision.get("message") or followup.get("follow_up_prompt") or "").strip()
             if not message:
-                return self._record_result(
+                result = self._record_result(
                     {
                         "reason": reason,
                         "decision": "noop",
@@ -228,14 +311,16 @@ class IdleHeartbeatRunner:
                         "follow_up_id": str(followup.get("id") or ""),
                     }
                 )
+                self._emit_heartbeat_decision(result)
+                return result
 
             try:
                 await self._send_message(chat_id, message)
-                self._followups.mark_surfaced(
+                updated = self._followups.mark_surfaced(
                     str(followup.get("id") or ""),
                     surfaced_at=started_at,
                     suppress_for_seconds=self._proactive_cooldown_seconds,
-                )
+                ) or followup
                 self._idle_state.note_proactive_surface(
                     chat_id=chat_id,
                     at=started_at,
@@ -244,11 +329,20 @@ class IdleHeartbeatRunner:
                 decision["decision"] = "surface_follow_up"
                 decision["follow_up_id"] = str(followup.get("id") or "")
                 decision["message"] = message
-                return self._record_result(decision)
+                self._emit_followup_updated(updated, source="heartbeat_surfaced")
+                self._emit_proactive_surface(
+                    chat_id=chat_id,
+                    follow_up_id=str(followup.get("id") or ""),
+                    session_key=str(state.get("active_session_key") or ""),
+                    message=message,
+                )
+                result = self._record_result(decision)
+                self._emit_heartbeat_decision(result)
+                return result
             except Exception as exc:
                 logger.warning("Idle heartbeat proactive send failed", exc_info=True)
                 self._last_status["last_error"] = str(exc)
-                return self._record_result(
+                result = self._record_result(
                     {
                         "reason": reason,
                         "decision": "noop",
@@ -258,6 +352,8 @@ class IdleHeartbeatRunner:
                         "error": str(exc),
                     }
                 )
+                self._emit_heartbeat_decision(result)
+                return result
 
     async def _decide(
         self,
@@ -421,6 +517,58 @@ class IdleHeartbeatRunner:
         self._last_status["last_result"] = result
         self._last_status["last_error"] = str(result.get("error") or "")
         return result
+
+    def _emit_heartbeat_decision(self, result: dict[str, Any]) -> None:
+        if self._event_bus is None:
+            return
+        current_state = self._idle_state.status(active_window_seconds=self._active_window_seconds)
+        self._event_bus.emit(
+            "heartbeat_decision_made",
+            scope={
+                "chat_id": int(result.get("chat_id") or 0),
+                "session_key": str(current_state.get("active_session_key") or ""),
+            },
+            payload=dict(result),
+        )
+
+    def _emit_followup_updated(self, followup: dict[str, Any], *, source: str) -> None:
+        if self._event_bus is None:
+            return
+        self._event_bus.emit(
+            "followup_updated",
+            scope={
+                "chat_id": int(followup.get("chat_id") or 0),
+                "session_key": str(followup.get("source_session_key") or ""),
+            },
+            payload={
+                "follow_up_id": str(followup.get("id") or ""),
+                "status": str(followup.get("status") or ""),
+                "subject": str(followup.get("subject") or ""),
+                "source": source,
+            },
+        )
+
+    def _emit_proactive_surface(
+        self,
+        *,
+        chat_id: int,
+        follow_up_id: str,
+        session_key: str,
+        message: str,
+    ) -> None:
+        if self._event_bus is None:
+            return
+        self._event_bus.emit(
+            "proactive_surface_sent",
+            scope={
+                "chat_id": int(chat_id),
+                "session_key": str(session_key or ""),
+            },
+            payload={
+                "follow_up_id": str(follow_up_id or ""),
+                "message": str(message or ""),
+            },
+        )
 
 
 def _parse_time(value: str | None) -> datetime | None:

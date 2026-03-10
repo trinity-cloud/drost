@@ -9,6 +9,7 @@ import pytest
 from drost.followups import FollowUpStore
 from drost.idle_heartbeat import IdleHeartbeatRunner
 from drost.idle_state import IdleStateStore
+from drost.loop_events import LoopEventBus
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole, StreamDelta
 
 
@@ -57,6 +58,17 @@ class HeartbeatProvider(BaseProvider):
         _ = messages, system, tools, max_tokens, temperature, stop_sequences
         if False:
             yield StreamDelta(content="")
+
+
+async def _wait_until(predicate, *, timeout: float = 1.5) -> None:
+    import asyncio
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    assert predicate()
 
 
 @pytest.mark.asyncio
@@ -246,6 +258,58 @@ async def test_idle_heartbeat_respects_provider_surface_decision(tmp_path: Path)
     items = {row["id"]: row for row in followups.list_followups(chat_id=8271705169)}
     assert items[first["id"]]["status"] == "pending"
     assert items[second["id"]]["status"] == "surfaced"
+
+
+@pytest.mark.asyncio
+async def test_idle_heartbeat_wakes_on_followup_created_event(tmp_path: Path) -> None:
+    followups = FollowUpStore(tmp_path)
+    idle_state = IdleStateStore(tmp_path)
+    bus = LoopEventBus()
+    now = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
+    sent: list[tuple[int, str]] = []
+
+    idle_state.mark_user_message(chat_id=8271705169, at=now - timedelta(hours=2))
+    runner = IdleHeartbeatRunner(
+        workspace_dir=tmp_path,
+        followups=followups,
+        idle_state=idle_state,
+        send_message=lambda chat_id, message: _record_send(sent, chat_id, message),
+        event_bus=bus,
+        enabled=True,
+        proactive_enabled=True,
+        interval_seconds=3600,
+        active_window_seconds=20 * 60,
+        proactive_cooldown_seconds=3600,
+    )
+
+    await runner.start()
+    try:
+        item, _ = followups.upsert_extracted_followup(
+            chat_id=8271705169,
+            source_session_key="main:telegram:8271705169__s_2026-03-09_10-00-00",
+            kind="check_in",
+            subject="CPAP fitting appointment",
+            entity_refs=["people/migel"],
+            source_excerpt="CPAP fitting appointment tomorrow at 11am",
+            follow_up_prompt="How did the CPAP fitting go?",
+            due_at=(now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            priority="high",
+            confidence=0.95,
+        )
+        bus.emit(
+            "followup_created",
+            scope={"chat_id": 8271705169, "session_key": str(item.get("source_session_key") or "")},
+            payload={"follow_up_id": str(item.get("id") or "")},
+        )
+        await _wait_until(lambda: len(sent) == 1)
+    finally:
+        await runner.stop()
+
+    assert sent == [(8271705169, "How did the CPAP fitting go?")]
+    status = bus.status()
+    assert status["event_counts"]["followup_created"] == 1
+    assert status["event_counts"]["heartbeat_decision_made"] >= 1
+    assert status["event_counts"]["proactive_surface_sent"] == 1
 
 
 async def _record_send(log: list[tuple[int, str]], chat_id: int, message: str) -> Any:

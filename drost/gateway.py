@@ -9,10 +9,12 @@ from pydantic import BaseModel
 from drost.agent import AgentRuntime
 from drost.channels import TelegramChannel
 from drost.config import Settings
+from drost.conversation_loop import ConversationLoop
 from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
 from drost.idle_heartbeat import IdleHeartbeatRunner
 from drost.idle_state import IdleStateStore
+from drost.loop_events import LoopEventBus
 from drost.loop_manager import LoopManager
 from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
@@ -47,6 +49,7 @@ class Gateway:
         self.providers = build_provider_registry(settings)
         self.embeddings = EmbeddingService(settings)
         self.followups = FollowUpStore(settings.workspace_dir)
+        self.loop_events = LoopEventBus()
         self.shared_mind_state = SharedMindState(settings.workspace_dir)
         self.idle_state = IdleStateStore(shared_mind_state=self.shared_mind_state)
         self.agent = AgentRuntime(
@@ -54,6 +57,7 @@ class Gateway:
             providers=self.providers,
             store=self.store,
             embeddings=self.embeddings,
+            event_bus=self.loop_events,
         )
         self.memory_maintenance = MemoryMaintenanceRunner(
             workspace_dir=settings.workspace_dir,
@@ -61,6 +65,7 @@ class Gateway:
             provider_getter=self.providers.get,
             sync_memory_index=self.agent.sync_memory_index,
             enabled=settings.memory_enabled and settings.memory_maintenance_enabled,
+            event_bus=self.loop_events,
             interval_seconds=settings.memory_maintenance_interval_seconds,
             max_events_per_run=settings.memory_maintenance_max_events_per_run,
             entity_synthesis_enabled=settings.memory_entity_synthesis_enabled,
@@ -73,6 +78,7 @@ class Gateway:
             sessions_dir=settings.workspace_dir / "sessions",
             provider_getter=self.providers.get,
             embed_document=self.embeddings.embed_document,
+            event_bus=self.loop_events,
             enabled=settings.memory_continuity_enabled,
             auto_on_new=settings.memory_continuity_auto_on_new,
             source_max_messages=settings.memory_continuity_source_max_messages,
@@ -101,6 +107,7 @@ class Gateway:
             followups=self.followups,
             idle_state=self.idle_state,
             send_message=lambda chat_id, message: self.telegram.send(chat_id, message),
+            event_bus=self.loop_events,
             provider_getter=self.providers.get,
             enabled=settings.idle_mode_enabled and settings.idle_heartbeat_enabled,
             proactive_enabled=settings.proactive_surfacing_enabled,
@@ -108,7 +115,19 @@ class Gateway:
             active_window_seconds=settings.idle_active_window_seconds,
             proactive_cooldown_seconds=settings.proactive_followup_cooldown_seconds,
         )
+        self.conversation_loop = ConversationLoop(event_bus=self.loop_events)
         self.loop_manager = LoopManager()
+        self.loop_manager.register(self.conversation_loop)
+        self.loop_manager.register(
+            ManagedRunnerLoop(
+                name="continuity_worker",
+                priority=LoopPriority.LOW,
+                visibility=LoopVisibility.BACKGROUND,
+                start_fn=self._noop_start,
+                stop_fn=self.session_continuity.shutdown,
+                status_fn=self.session_continuity.status,
+            )
+        )
         self.loop_manager.register(
             ManagedRunnerLoop(
                 name="maintenance_loop",
@@ -141,6 +160,9 @@ class Gateway:
         except Exception:
             logger.debug("Failed to sync loop state into shared mind state", exc_info=True)
 
+    async def _noop_start(self) -> None:
+        return None
+
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()
         media = context.get("media") if isinstance(context.get("media"), list) else None
@@ -151,6 +173,7 @@ class Gateway:
         settings = getattr(self, "settings", None)
         idle_mode_enabled = bool(getattr(settings, "idle_mode_enabled", False))
         idle_state = getattr(self, "idle_state", None)
+        loop_events = getattr(self, "loop_events", None)
         session_key_before = ""
         if chat_id > 0 and hasattr(self, "store"):
             try:
@@ -159,6 +182,19 @@ class Gateway:
                 session_key_before = ""
         if chat_id > 0 and idle_mode_enabled and idle_state is not None:
             idle_state.mark_user_message(chat_id=chat_id, session_key=session_key_before or None)
+        if chat_id > 0 and loop_events is not None:
+            loop_events.emit(
+                "user_message_received",
+                scope={
+                    "chat_id": int(chat_id),
+                    "session_key": session_key_before,
+                },
+                payload={
+                    "channel": "telegram",
+                    "has_media": bool(media),
+                    "text_chars": len(text),
+                },
+            )
         session_id = context.get("session_id")
         status_callback = context.get("status_callback")
         answer_stream_callback = context.get("answer_stream_callback")
@@ -188,7 +224,7 @@ class Gateway:
         chat_id = int(payload.get("chat_id") or 0)
         if not from_session_key or not to_session_key:
             return {"queued": False, "message": "Continuity skipped (invalid session transition)."}
-        return await self.session_continuity.schedule(
+        result = await self.session_continuity.schedule(
             ContinuityJobRequest(
                 chat_id=chat_id,
                 from_session_id=from_session_id,
@@ -197,6 +233,21 @@ class Gateway:
                 to_session_key=to_session_key,
             )
         )
+        loop_events = getattr(self, "loop_events", None)
+        if loop_events is not None:
+            loop_events.emit(
+                "session_switched",
+                scope={
+                    "chat_id": int(chat_id),
+                    "session_key": to_session_key,
+                },
+                payload={
+                    "from_session_key": from_session_key,
+                    "to_session_key": to_session_key,
+                    "queued": bool(result.get("queued")),
+                },
+            )
+        return result
 
     def _mount_lifecycle(self) -> None:
         @self.app.on_event("startup")
@@ -221,7 +272,6 @@ class Gateway:
                 logger.warning("Loop manager shutdown reported errors", exc_info=True)
             self._sync_shared_mind_state()
             await self.telegram.stop()
-            await self.session_continuity.shutdown()
             await self.agent.close()
             self.store.close()
             logger.info("Drost gateway stopped")
@@ -268,6 +318,10 @@ class Gateway:
             status = self.loop_manager.status()
             self._sync_shared_mind_state()
             return status
+
+        @self.app.get("/v1/events/status")
+        async def events_status() -> dict[str, Any]:
+            return self.loop_events.status()
 
         @self.app.get("/v1/followups")
         async def followups(chat_id: int | None = None) -> dict[str, Any]:
@@ -329,6 +383,7 @@ class Gateway:
         async def chat(payload: ChatRequest) -> dict[str, Any]:
             chat_id = int(payload.chat_id)
             session_key_before = ""
+            loop_events = getattr(self, "loop_events", None)
             if chat_id > 0:
                 try:
                     session_key_before = str(self.store.current_session_key(chat_id) or "").strip()
@@ -336,6 +391,19 @@ class Gateway:
                     session_key_before = ""
                 if self.settings.idle_mode_enabled:
                     self.idle_state.mark_user_message(chat_id=chat_id, session_key=session_key_before or None)
+                if loop_events is not None:
+                    loop_events.emit(
+                        "user_message_received",
+                        scope={
+                            "chat_id": int(chat_id),
+                            "session_key": session_key_before,
+                        },
+                        payload={
+                            "channel": "api",
+                            "has_media": bool(payload.media),
+                            "text_chars": len(str(payload.text or "")),
+                        },
+                    )
             response = await self.agent.respond(
                 chat_id=chat_id,
                 text=str(payload.text or ""),

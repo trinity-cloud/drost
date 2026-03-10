@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from drost.loop_events import LoopEventBus
 from drost.providers import BaseProvider, Message, MessageRole
 from drost.storage import SQLiteStore, session_key_to_filename
 
@@ -58,6 +59,7 @@ class SessionContinuityManager:
         sessions_dir: Path,
         provider_getter: Callable[[], BaseProvider],
         embed_document: Callable[..., Awaitable[list[float]]] | None = None,
+        event_bus: LoopEventBus | None = None,
         enabled: bool,
         auto_on_new: bool = True,
         source_max_messages: int = 120,
@@ -70,6 +72,7 @@ class SessionContinuityManager:
         self._sessions_dir = Path(sessions_dir).expanduser()
         self._provider_getter = provider_getter
         self._embed_document = embed_document
+        self._event_bus = event_bus
         self._enabled = bool(enabled)
         self._auto_on_new = bool(auto_on_new)
         self._source_max_messages = max(10, int(source_max_messages))
@@ -169,6 +172,21 @@ class SessionContinuityManager:
                     summary=summary[: self._summary_max_chars],
                     embedding=embedding,
                 )
+                if self._event_bus is not None:
+                    self._event_bus.emit(
+                        "continuity_written",
+                        scope={
+                            "chat_id": int(req.chat_id),
+                            "session_key": req.to_session_key,
+                        },
+                        payload={
+                            "from_session_key": req.from_session_key,
+                            "to_session_key": req.to_session_key,
+                            "from_session_id": req.from_session_id,
+                            "to_session_id": req.to_session_id,
+                            "summary_chars": len(summary[: self._summary_max_chars]),
+                        },
+                    )
                 self._completed_jobs += 1
                 self._last_completed_at = datetime.now(UTC).isoformat()
                 logger.info(

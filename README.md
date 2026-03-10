@@ -88,6 +88,7 @@ Drost currently ships with these built-in tools:
 - follow-up listing endpoint
 - idle-state and heartbeat status endpoints
 - shared mind-state status endpoint
+- loop-event bus status endpoint
 
 ## Architecture
 
@@ -97,7 +98,10 @@ Drost’s current architecture is intentionally simple:
 Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
                                  |
                                  +-> Loop Manager
-                                 +-> Shared Mind State
+                                      +-> Conversation Loop
+                                      +-> Shared Mind State
+                                      +-> Loop Event Bus
+                                      +-> Continuity Worker
                                       +-> Maintenance Loop
                                       +-> Heartbeat Loop
                                  +-> Tool Registry
@@ -214,6 +218,7 @@ Additional runtime inspection endpoints:
 - `POST /v1/heartbeat/run-once`
 - `GET /v1/loops/status`
 - `GET /v1/mind/status`
+- `GET /v1/events/status`
 
 ## Deployer
 
