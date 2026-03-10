@@ -179,6 +179,118 @@ async def test_session_continuity_schedule_skips_when_no_prior_messages(tmp_path
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_session_continuity_includes_graph_context_when_aliases_match(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+
+    store = SQLiteStore(db_path=tmp_path / "drost.sqlite3", vector_dimensions=64)
+    session_store = SessionJSONLStore(store_path=sessions)
+
+    from_key = session_key_for_telegram_chat(321, "s_2026-03-08_10-00-00")
+    to_key = session_key_for_telegram_chat(321, "s_2026-03-08_11-00-00")
+    store.append_message(from_key, "user", "We need to tighten deploy safety for the repo.")
+    store.append_message(from_key, "assistant", "Understood. I will keep the deploy path coherent.")
+    session_store.append_full_messages(
+        session_key=from_key,
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content="Checking deploy state",
+                tool_calls=[ToolCall(id="call-1", name="deployer_status", arguments={})],
+            ),
+            Message(role=MessageRole.TOOL, tool_results=[ToolResult(tool_call_id="call-1", content="healthy")]),
+        ],
+    )
+
+    updated_at = "2026-03-08T10:00:00+00:00"
+    store.replace_indexed_file(
+        path="memory/entities/projects/drost/summary.md",
+        source_kind="entity_summary",
+        title="projects/drost",
+        file_hash="summary-hash",
+        updated_at=updated_at,
+        chunks=[
+            {
+                "title": "projects/drost",
+                "content": "Drost deploys through the deployer control plane and is owned by Migel.",
+                "line_start": 1,
+                "line_end": 2,
+                "created_at": updated_at,
+                "derived_from": "",
+                "embedding": [0.25] * 64,
+            }
+        ],
+    )
+    store.replace_graph_index(
+        entities=[
+            {
+                "entity_type": "projects",
+                "entity_id": "drost",
+                "title": "projects/drost",
+                "entity_path": "memory/entities/projects/drost",
+                "summary_path": "memory/entities/projects/drost/summary.md",
+                "updated_at": updated_at,
+            }
+        ],
+        aliases=[
+            {
+                "entity_type": "projects",
+                "entity_id": "drost",
+                "alias": "the repo",
+                "path": "memory/entities/projects/drost/aliases.md",
+                "updated_at": updated_at,
+            }
+        ],
+        relations=[
+            {
+                "relation_id": "projects/drost/relations/0001",
+                "from_entity_type": "projects",
+                "from_entity_id": "drost",
+                "relation_type": "owned_by",
+                "to_entity_type": "people",
+                "to_entity_id": "migel",
+                "relation_text": "Drost is owned and directed by Migel.",
+                "confidence": 0.99,
+                "path": "memory/entities/projects/drost/relations.md",
+                "line_start": 1,
+                "line_end": 2,
+                "updated_at": updated_at,
+            }
+        ],
+    )
+
+    provider = ContinuityProvider(
+        "## Session Continuity\n### Core Objective\nKeep deploy safety coherent.\n### Decisions And Constraints\n- Use the deployer.\n### Work Completed\n- Reviewed deploy state.\n### Open Threads\n- Tighten rollback validation.\n### Suggested Next Actions\n- Improve deploy canaries."
+    )
+    manager = SessionContinuityManager(
+        store=store,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        embed_document=_embed_constant,
+        enabled=True,
+    )
+
+    result = await manager.schedule(
+        ContinuityJobRequest(
+            chat_id=321,
+            from_session_id="s_2026-03-08_10-00-00",
+            from_session_key=from_key,
+            to_session_id="s_2026-03-08_11-00-00",
+            to_session_key=to_key,
+        )
+    )
+    await manager.wait_for_idle()
+
+    assert result["queued"] is True
+    prompt = str(provider.calls[0]["messages"][0].content or "")
+    assert "[Graph Context]" in prompt
+    assert "Drost deploys through the deployer control plane" in prompt
+    assert "owned_by people/migel" in prompt
+    store.close()
+
+
 async def _embed_constant(text: str, *, title: str | None = None) -> list[float]:
     _ = text, title
     return [0.25] * 64

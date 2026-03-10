@@ -299,4 +299,7 @@ async def test_memory_maintenance_resolves_aliases_and_writes_relations(tmp_path
     relation_text = relation_path.read_text(encoding="utf-8")
     assert "[to:people/migel]" in relation_text
     assert "Drost is owned and directed by Migel." in relation_text
+    synthesis_payload = json.loads(str(provider.message_calls[1][0].content or ""))
+    assert "relations_md" in synthesis_payload
+    assert "owned and directed by Migel" in synthesis_payload["relations_md"]
     store.close()

@@ -202,6 +202,7 @@ class SessionContinuityManager:
 
         transcript = self._format_messages(history)
         tool_artifacts = self._load_tool_artifacts(req.from_session_key)
+        graph_context = self._load_graph_context(transcript=transcript, tool_artifacts=tool_artifacts)
 
         sections = [
             f"Source session: {req.from_session_id}",
@@ -210,6 +211,8 @@ class SessionContinuityManager:
         ]
         if tool_artifacts:
             sections.extend(["[Tool Artifacts]", tool_artifacts])
+        if graph_context:
+            sections.extend(["[Graph Context]", graph_context])
         prompt = "\n\n".join(section for section in sections if section).strip()
         if len(prompt) > self._source_max_chars:
             prompt = prompt[-self._source_max_chars :]
@@ -221,6 +224,49 @@ class SessionContinuityManager:
             max_tokens=self._summary_max_tokens,
         )
         return str(response.message.content or "").strip()[: self._summary_max_chars]
+
+    def _load_graph_context(self, *, transcript: str, tool_artifacts: str) -> str:
+        source_text = "\n".join(part for part in [transcript, tool_artifacts] if part).strip()
+        if not source_text:
+            return ""
+
+        matched_entities = self._store.find_entities_in_text_by_alias(source_text, limit=2)
+        if not matched_entities:
+            return ""
+
+        lines: list[str] = []
+        relation_budget = 4
+        for entity in matched_entities:
+            entity_type = str(entity.get("entity_type") or "").strip()
+            entity_id = str(entity.get("entity_id") or "").strip()
+            title = str(entity.get("title") or f"{entity_type}/{entity_id}").strip()
+            summary_row = self._store.get_entity_summary_memory(entity_type, entity_id)
+            if summary_row is not None:
+                summary_text = str(summary_row.get("content") or summary_row.get("snippet") or "").strip()
+                if summary_text:
+                    lines.append(f"### {title}")
+                    lines.append(summary_text)
+
+            if relation_budget <= 0:
+                continue
+            neighbors = self._store.list_entity_neighbors(entity_type, entity_id, limit=relation_budget)
+            for neighbor in neighbors:
+                relation = neighbor.get("relation")
+                if not isinstance(relation, dict):
+                    continue
+                relation_text = str(relation.get("relation_text") or "").strip()
+                if not relation_text:
+                    continue
+                relation_type = str(relation.get("relation_type") or "").strip()
+                to_ref = (
+                    f"{relation.get('to_entity_type')}/{relation.get('to_entity_id')}"
+                )
+                lines.append(f"- {title} {relation_type} {to_ref}: {relation_text}")
+                relation_budget -= 1
+                if relation_budget <= 0:
+                    break
+
+        return "\n".join(line for line in lines if line).strip()
 
     def _load_tool_artifacts(self, session_key: str) -> str:
         path = self._sessions_dir / f"{session_key_to_filename(session_key)}.full.jsonl"

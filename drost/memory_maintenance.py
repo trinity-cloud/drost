@@ -642,15 +642,25 @@ class MemoryMaintenanceRunner:
                 continue
 
             summary_path = self._memory_files.entity_summary_path(entity.entity_type, entity.entity_id)
+            aliases_path = self._memory_files.entity_aliases_path(entity.entity_type, entity.entity_id)
+            relations_path = self._memory_files.entity_relations_path(entity.entity_type, entity.entity_id)
             prior_summary = ""
             if summary_path.exists():
                 prior_summary = summary_path.read_text(encoding="utf-8", errors="replace")
+            aliases_text = ""
+            if aliases_path.exists():
+                aliases_text = aliases_path.read_text(encoding="utf-8", errors="replace")
+            relations_text = ""
+            if relations_path.exists():
+                relations_text = relations_path.read_text(encoding="utf-8", errors="replace")
 
             content = await self._generate_entity_summary(
                 provider=provider,
                 entity_type=entity.entity_type,
                 entity_id=entity.entity_id,
                 items_text=items_text,
+                aliases_text=aliases_text,
+                relations_text=relations_text,
                 prior_summary=prior_summary,
             )
             if not content:
@@ -676,6 +686,8 @@ class MemoryMaintenanceRunner:
         entity_type: str,
         entity_id: str,
         items_text: str,
+        aliases_text: str,
+        relations_text: str,
         prior_summary: str,
     ) -> str:
         system = (
@@ -683,6 +695,7 @@ class MemoryMaintenanceRunner:
             "Keep it concise, current, and high-signal.\n"
             "Do not use code fences.\n"
             "Do not dump the raw fact list back verbatim.\n"
+            "Use relationship context when it materially clarifies what this entity is, how it is used, or who it is connected to.\n"
         )
         user = json.dumps(
             {
@@ -690,6 +703,8 @@ class MemoryMaintenanceRunner:
                 "entity_id": entity_id,
                 "prior_summary": prior_summary,
                 "items_md": items_text[-12000:],
+                "aliases_md": aliases_text[-4000:],
+                "relations_md": relations_text[-8000:],
             },
             ensure_ascii=False,
         )
