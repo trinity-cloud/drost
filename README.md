@@ -1,54 +1,60 @@
 # Drost
 
-Drost is an open-source personal AI agent for trusted, owner-operated environments.
+Drost is an open-source personal AI agent runtime for trusted, owner-operated environments.
 
-It is intentionally stripped down: one gateway, one messaging channel, three providers, a real tool-using loop, multimodal input, persistent sessions, and memory that compounds over time.
+It is built around a simple idea: an agent should not just chat. It should run continuously, use tools, remember across sessions, see images, follow up later, and stay inspectable while it does all of that.
 
-Drost is not a chatbot wrapper. It is an agent runtime.
+Drost is intentionally narrow:
+
+- one gateway
+- one messaging channel
+- three model providers
+- real persistent memory
+- a supervised runtime with a deployer control plane
+
+That constraint is the point. Drost is a productized personal agent, not a generic framework and not a thin chat wrapper over an API.
 
 ## Why Drost
 
-Most open-source "agents" are one of two things:
+Most open-source agent projects fall into one of two buckets:
 
-- a thin chat UI over a model API
-- a framework that gives you abstractions but not a finished personal agent
+- orchestration frameworks that still leave you to build the actual agent
+- chat shells that call themselves agents but never really develop continuity, memory, or operational shape
 
 Drost takes a different position:
 
-- Telegram-native conversational interface
-- real iterative tool execution (`LLM -> tools -> LLM`)
-- persistent sessions with continuity across `/new`
-- durable memory on disk, not just prompt stuffing
-- vision support across all providers
-- self-hosted workspace under `~/.drost`
-- strong observability through JSONL transcripts and run traces
+- Telegram-native by default
+- iterative tool use, not single-shot prompting
+- durable workspace and memory under `~/.drost`
+- supervised runtime by default
+- explicit observability through JSONL traces, loop status, and operator endpoints
+- proactive follow-up and idle-time behavior, not just reactive replies
 
-If you want an agent that actually runs, remembers, sees, and acts, this is what Drost is for.
+If you want a personal agent that actually runs, remembers, and can be operated like a real system, that is what Drost is for.
 
-## What Ships Today
+## What Drost Does
 
-### Core runtime
+### Core Runtime
 
 - FastAPI gateway
 - Telegram channel with polling or webhook mode
-- iterative agent loop with tool calling
+- iterative agent loop (`LLM -> tools -> LLM`)
 - timestamped sessions and session switching
-- live Telegram progress updates via one edited working message
-- multimodal image + text turns
+- streaming and working-message updates in Telegram
+- vision turns with text + image in one request
 - Telegram media-group album bundling
+- supervised default startup via the deployer
 
 ### Providers
 
 - `openai-codex`
-  - OpenAI Codex OAuth / Responses API flow
+  - OAuth / Responses API flow
 - `anthropic`
   - API key or Claude Code setup-token flow
 - `xai`
   - OpenAI-compatible Responses API
 
-### Tooling
-
-Drost currently ships with these built-in tools:
+### Built-In Tools
 
 - `memory_search`
 - `memory_get`
@@ -66,89 +72,61 @@ Drost currently ships with these built-in tools:
 ### Memory
 
 - SQLite-backed memory store
-- `sqlite-vec` acceleration with fallback search path
+- `sqlite-vec` acceleration with brute-force fallback
 - Gemini embeddings via `gemini-embedding-001` at full `3072` dimensions
-- transcript-to-memory background extraction
+- transcript-to-memory extraction
 - daily memory files
-- entity fact files
-- entity summary synthesis
-- structured follow-up objects under `~/.drost/memory/follow-ups.json`
-- session continuity handoff on `/new`
-- prompt-time memory capsule built from ranked memory sources
-- `HEARTBEAT.md`-aware idle-mode heartbeat runner for bounded proactive follow-up surfacing
+- entity facts, aliases, relations, and summaries
+- session continuity on `/new`
+- prompt-time memory capsule before each turn
+- proactive follow-up tracking and idle heartbeat review
+
+### Runtime Intelligence
+
+- shared mind state under `~/.drost/state/shared-mind-state.json`
+- managed loop runtime
+- loop event bus
+- centralized proactive gating and degraded-mode policy
+- graph-lite memory relationships
 
 ### Observability
 
-- per-session JSONL transcript files
-- full JSONL traces including tool calls and tool results
-- run traces
-- tool traces
-- memory maintenance status endpoint
-- continuity status endpoint
-- follow-up listing endpoint
-- idle-state and heartbeat status endpoints
-- shared mind-state status endpoint
-- loop-event bus status endpoint
+- per-session JSONL transcripts
+- full JSONL traces with tool calls and tool results
+- run and tool traces
+- loop-manager status surface
+- shared mind-state status
+- event bus status
+- memory maintenance and continuity status
 
 ## Architecture
-
-Drost’s current architecture is intentionally simple:
 
 ```text
 Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
                                  |
                                  +-> Loop Manager
                                       +-> Conversation Loop
-                                      +-> Shared Mind State
-                                      +-> Loop Event Bus
+                                      +-> Heartbeat Loop
                                       +-> Continuity Worker
                                       +-> Maintenance Loop
-                                      +-> Heartbeat Loop
+                                      +-> Shared Mind State
+                                      +-> Loop Event Bus
                                  +-> Tool Registry
                                  +-> SQLite Store
-                                 +-> JSONL Session Logs
                                  +-> Workspace Memory Files
-                                 +-> Session Continuity Manager
+                                 +-> Session JSONL Logs
+                                 +-> Deployer Control Plane
 ```
 
-At runtime, a typical turn looks like this:
+A normal turn looks like this:
 
 1. Load workspace context from `~/.drost`
-2. Retrieve relevant memory and build a prompt-time memory capsule
+2. Retrieve relevant memory and assemble a prompt-time capsule
 3. Run the agent loop
 4. Execute tools as needed
-5. Persist transcript + traces
+5. Persist transcript and traces
 6. Let maintenance compound durable memory in the background
-
-## Runtime Topology
-
-Drost injects explicit runtime topology into the agent prompt on every turn.
-
-That includes:
-
-- repo root
-- workspace root
-- gateway health URL
-- launch mode
-- start command
-
-The goal is to stop wasting tool calls on rediscovering obvious runtime facts like `pwd`, repo location, or local health endpoints.
-
-## Shared Mind State
-
-Drost now keeps authoritative runtime state under:
-
-- `~/.drost/state/shared-mind-state.json`
-
-That snapshot is the shared runtime surface for:
-
-- active vs idle vs cooldown mode
-- current conversational focus
-- loop status snapshots
-- proactive cooldown timing
-- last heartbeat and recent activity markers
-
-The older idle-state shape is migrated forward automatically on startup.
+7. Let the heartbeat and follow-up system react when the user is idle
 
 ## Quick Start
 
@@ -161,13 +139,13 @@ uv sync --extra dev
 
 ### 2. Configure
 
-Create your `.env` in the repo root:
+Create `.env` in the repo root:
 
 ```bash
 cp .env.example .env
 ```
 
-Minimal practical setup:
+Minimum useful config:
 
 ```env
 DROST_TELEGRAM_BOT_TOKEN=...
@@ -176,14 +154,14 @@ GEMINI_API_KEY=...
 DROST_DEFAULT_PROVIDER=openai-codex
 ```
 
-Optional but recommended runtime tuning:
+Recommended runtime tuning:
 
 ```env
 DROST_AGENT_MAX_TOOL_CALLS_PER_RUN=100
 DROST_AGENT_MAX_ITERATIONS=100
 ```
 
-New proactive-memory flags:
+Recommended proactive-memory flags:
 
 ```env
 DROST_FOLLOWUPS_ENABLED=true
@@ -202,205 +180,91 @@ This is the default supervised mode:
 
 - `drost` starts the deployer
 - the deployer starts `drost-gateway`
-- deploy and restart actions flow through the deployer queue
+- restart / deploy / rollback actions go through the deployer control plane
 
-The gateway starts on `http://0.0.0.0:8766` by default.
-
-For local health validation, Drost derives:
-
-- `http://127.0.0.1:8766/health`
-
-Additional runtime inspection endpoints:
-
-- `GET /v1/followups`
-- `GET /v1/idle/status`
-- `GET /v1/heartbeat/status`
-- `POST /v1/heartbeat/run-once`
-- `GET /v1/loops/status`
-- `GET /v1/mind/status`
-- `GET /v1/events/status`
-
-`GET /v1/loops/status` is now the consolidated operator view. It includes:
-
-- loop-manager policy state
-- loop health summary
-- per-loop status
-- current mode/focus/activity/health from shared mind state
-- event counts and recent event tail
-
-## Deployer
-
-Drost now ships these entry points:
+Direct raw gateway mode is still available for debugging:
 
 ```bash
-uv run drost
 uv run drost-gateway
-uv run drost-deployer --help
 ```
 
-Use them like this:
+### 4. Check Health
 
-- `uv run drost`
-  - default operator mode
-  - starts the deployer control plane
-- `uv run drost-gateway`
-  - direct raw gateway mode
-  - for debugging and emergency bypass only
-- `uv run drost-deployer`
-  - explicit control-plane CLI
-
-Current scope:
-
-- deployer config loading
-- external state bootstrap under `~/.drost/deployer`
-- status file
-- known-good record
-- append-only event log
-- file-backed request queue under `~/.drost/deployer/requests/`
-- subprocess child supervision
-- operator commands for `start`, `stop`, `restart`, foreground `run`, `healthcheck`, `promote`, `deploy`, and `rollback`
-- queued request commands for `request restart`, `request deploy`, and `request rollback`
-- health-gated candidate deployment
-- known-good commit tracking outside the repo checkout
-- automatic rollback to the last known-good commit when candidate validation fails
-- degraded-mode fallback when rollback cannot recover the runtime
-- Drost-side explicit deployer tools instead of ad hoc shell restart/deploy flows
-
-### Sample config
-
-A sample deployer config is included at:
-
-- `examples/deployer.config.toml`
-
-The active runtime config is written to:
-
-- `~/.drost/deployer/config.toml`
-
-You can inspect the resolved config at any time:
+Default local health endpoint:
 
 ```bash
-uv run drost-deployer config
+curl http://127.0.0.1:8766/health
 ```
 
-### Recommended local operator flow
+## Run Modes
 
-1. Start Drost under the deployer:
+### Default Operator Mode
 
 ```bash
 uv run drost
 ```
 
-2. In another shell, inspect status:
+Use this for normal operation.
+
+### Direct Gateway Mode
+
+```bash
+uv run drost-gateway
+```
+
+Use this only for debugging or bypassing the deployer.
+
+### Explicit Deployer CLI
 
 ```bash
 uv run drost-deployer status
-```
-
-3. Once the runtime is healthy, promote the current commit to known-good:
-
-```bash
-uv run drost-deployer promote
-```
-
-4. Queue deploy-affecting actions instead of improvising shell restarts:
-
-```bash
-uv run drost-deployer request restart --reason "reload runtime"
-uv run drost-deployer request deploy HEAD --reason "candidate self-edit"
-uv run drost-deployer request rollback --reason "operator rollback"
-```
-
-5. Inspect queue and events while the service loop is running:
-
-```bash
 uv run drost-deployer requests
 uv run drost-deployer events --limit 20
 ```
 
-### Manual recovery
+## Workspace Model
 
-If deployer state goes degraded, use this sequence:
+Drost has two roots.
 
-1. Inspect deployer state:
+### Repo Root
 
-```bash
-uv run drost-deployer status
-uv run drost-deployer events --limit 50
-```
-
-2. Check the current repo checkout:
-
-```bash
-git rev-parse HEAD
-cat ~/.drost/deployer/known_good.json
-```
-
-3. Force rollback to the known-good commit:
-
-```bash
-uv run drost-deployer rollback
-```
-
-4. If needed, force a specific target:
-
-```bash
-uv run drost-deployer rollback --to-ref <commit-or-ref>
-```
-
-### Local rollout test
-
-Minimal manual acceptance path:
-
-1. Start `uv run drost`
-2. Wait for `uv run drost-deployer status` to report `state=healthy`
-3. Run `uv run drost-deployer promote`
-4. Make and commit a safe code change
-5. Run `uv run drost-deployer request deploy HEAD --reason "manual rollout test"`
-6. Confirm status returns to `healthy`
-7. Inspect `~/.drost/deployer/events.jsonl`
-
-Broken-candidate test:
-
-1. Commit an intentionally bad candidate
-2. Queue `uv run drost-deployer request deploy HEAD --reason "rollback test"`
-3. Confirm deployer rolls back automatically to the last known-good commit
-4. Confirm the rollback is visible in `status.json` and `events.jsonl`
-
-## Where Things Live
-
-This is important because Drost has two different roots.
-
-### Repo root
-
-This is where code and runtime config live.
+This is where code and repo-local runtime configuration live:
 
 - `.env`
 - `README.md`
 - `drost/`
 - `tests/`
 
-Current local development default:
+Local development default:
 
 - `/Users/migel/drost`
 
-### Agent workspace
+### Agent Workspace
 
-This is where the agent’s persistent runtime state lives.
-
-Default:
+This is where the agent’s persistent runtime state lives:
 
 - `~/.drost`
 
-This directory is automatically created on startup. It contains the agent’s workspace, memory, sessions, traces, and attachments.
+It is created automatically on startup.
 
-## Workspace Layout
+This directory contains:
 
-On first boot, Drost seeds missing workspace files from in-repo templates.
+- workspace identity and behavior files
+- memory files
+- sessions
+- traces
+- attachments
+- state snapshots
+- deployer state
+
+## Seeded Workspace
+
+On first boot, Drost seeds missing files from in-repo templates.
 
 Seeded files:
 
 - `AGENTS.md`
-- `BOOTSTRAP.md` for brand-new workspaces only
+- `BOOTSTRAP.md`
 - `SOUL.md`
 - `IDENTITY.md`
 - `USER.md`
@@ -419,7 +283,165 @@ Generated directories:
 
 Existing files are never overwritten.
 
-## Provider Setup
+## Memory Model
+
+Drost memory is layered.
+
+### 1. Raw Session Logs
+
+Per-session JSONL transcripts live under:
+
+- `~/.drost/sessions/<session>.jsonl`
+- `~/.drost/sessions/<session>.full.jsonl`
+
+These are the raw conversational and debugging records.
+
+### 2. Durable Workspace Memory
+
+Drost compounds memory into Markdown under `~/.drost`:
+
+- `MEMORY.md`
+- `memory/daily/YYYY-MM-DD.md`
+- `memory/entities/<type>/<id>/items.md`
+- `memory/entities/<type>/<id>/aliases.md`
+- `memory/entities/<type>/<id>/relations.md`
+- `memory/entities/<type>/<id>/summary.md`
+
+These are the long-lived human-readable memory substrate.
+
+### 3. Unified Derived Index
+
+SQLite indexes:
+
+- transcript messages
+- workspace memory files
+- continuity summaries
+
+Embedding defaults:
+
+- `DROST_MEMORY_EMBEDDING_PROVIDER=gemini`
+- `DROST_MEMORY_EMBEDDING_MODEL=gemini-embedding-001`
+- `DROST_MEMORY_EMBEDDING_DIMENSIONS=3072`
+
+Vector behavior:
+
+- attempts to load `sqlite-vec` automatically
+- accepts explicit extension path via `DROST_SQVECTOR_EXTENSION_PATH`
+- falls back to brute-force cosine search if unavailable
+
+When embedding dimensions change, Drost rebuilds the derived vector lane automatically.
+
+### 4. Session Continuity
+
+On `/new`, Drost can summarize the previous session and inject the carryover into early turns of the new one.
+
+Continuity is also indexed as a searchable memory source.
+
+### 5. Prompt-Time Memory Capsule
+
+Before each turn, Drost builds a bounded memory capsule from ranked sources.
+
+It prefers:
+
+- `MEMORY.md`
+- continuity
+- recent daily memory
+- entity summaries
+- transcript snippets only when higher-order memory is weak
+
+### 6. Follow-Ups And Idle Consciousness
+
+Drost can extract concrete follow-ups into:
+
+- `~/.drost/memory/follow-ups.json`
+
+While the user is idle, the heartbeat loop can:
+
+- review due follow-ups
+- decide whether to surface one
+- snooze or expire one
+- stay conservative when uncertain
+
+This is bounded and policy-gated by the managed runtime.
+
+## Runtime State
+
+Authoritative runtime state lives at:
+
+- `~/.drost/state/shared-mind-state.json`
+
+It tracks:
+
+- active / idle / cooldown mode
+- current conversational focus
+- recent activity timestamps
+- proactive cooldown
+- loop snapshots
+- runtime health
+
+## Loop Runtime
+
+Drost now runs as a managed multi-loop runtime with four registered loops:
+
+- `conversation_loop`
+- `heartbeat_loop`
+- `continuity_worker`
+- `maintenance_loop`
+
+The loop manager owns:
+
+- startup and shutdown ordering
+- centralized degraded-mode state
+- proactive-send gating
+- proactive single-flight ownership
+- aggregated loop health and counters
+
+The event bus carries bounded in-process events such as:
+
+- `user_message_received`
+- `assistant_turn_completed`
+- `session_switched`
+- `memory_maintenance_completed`
+- `followup_created`
+- `followup_updated`
+- `continuity_written`
+- `heartbeat_decision_made`
+- `proactive_surface_sent`
+
+## Deployer
+
+Drost ships with a built-in local deployer control plane.
+
+It currently provides:
+
+- subprocess supervision
+- health checks
+- restart
+- deploy
+- rollback
+- known-good tracking
+- degraded-mode fallback
+- file-backed request queue
+
+Operator commands:
+
+```bash
+uv run drost-deployer status
+uv run drost-deployer promote
+uv run drost-deployer request restart --reason "reload runtime"
+uv run drost-deployer request deploy HEAD --reason "candidate self-edit"
+uv run drost-deployer request rollback --reason "operator rollback"
+```
+
+Active config is written to:
+
+- `~/.drost/deployer/config.toml`
+
+Sample config lives at:
+
+- `examples/deployer.config.toml`
+
+## Providers
 
 ### `openai-codex`
 
@@ -428,18 +450,16 @@ If `DROST_OPENAI_API_KEY` is unset, Drost reads Codex OAuth tokens from:
 - `~/.codex/auth.json`
 - or `CODEX_HOME/auth.json`
 
-It automatically refreshes them when needed.
-
 ### `anthropic`
 
 Set:
 
 - `DROST_ANTHROPIC_TOKEN`
 
-Supported token types:
+Supported forms:
 
-- standard API keys (`sk-ant-...`)
-- Claude Code setup-token / OAuth-style tokens (`sk-ant-oat...`)
+- standard API key
+- Claude Code setup-token / OAuth-style token
 
 ### `xai`
 
@@ -464,9 +484,9 @@ Optional:
 - `DROST_TELEGRAM_WEBHOOK_PATH`
 - `DROST_TELEGRAM_WEBHOOK_SECRET`
 
-If webhook URL is not configured, Drost uses Telegram polling.
+If no webhook URL is configured, Drost falls back to polling.
 
-### Telegram commands
+Telegram commands:
 
 - `/new [title]`
 - `/sessions`
@@ -476,147 +496,64 @@ If webhook URL is not configured, Drost uses Telegram polling.
 
 ## Vision
 
-Drost supports image + text turns across all three providers.
+Drost supports multimodal image + text turns across all three providers.
 
-Current behavior:
+Current supported inputs:
 
-- send a photo with a caption to Telegram
-- send an image document with a caption
-- send a media-group album
-- Drost bundles the images into a single multimodal turn
+- Telegram photo with caption
+- image document with caption
+- media-group album
 
-Providers with vision support in Drost:
+## Operator Surfaces
 
-- `openai-codex`
-- `anthropic`
-- `xai`
-
-## Memory Model
-
-Drost’s memory system now has multiple layers.
-
-### 1. Raw session logs
-
-Per-session JSONL files live under:
-
-- `~/.drost/sessions/<session>.jsonl`
-- `~/.drost/sessions/<session>.full.jsonl`
-
-These are the source of truth for conversation/debug history.
-
-### 2. Durable workspace memory
-
-Drost compounds memory into Markdown files under `~/.drost`:
-
-- `MEMORY.md`
-- `memory/daily/YYYY-MM-DD.md`
-- `memory/entities/<type>/<id>/items.md`
-- `memory/entities/<type>/<id>/summary.md`
-
-These files are human-readable, editable, and treated as durable memory substrate.
-
-### 3. Unified index
-
-SQLite acts as the derived memory index over:
-
-- transcript messages
-- workspace memory files
-- continuity summaries
-
-Embedding defaults:
-
-- `GEMINI_API_KEY`
-- `DROST_MEMORY_EMBEDDING_PROVIDER=gemini`
-- `DROST_MEMORY_EMBEDDING_MODEL=gemini-embedding-001`
-- `DROST_MEMORY_EMBEDDING_DIMENSIONS=3072`
-
-Vector mode:
-
-- attempts to load `sqlite-vec` automatically
-- optional explicit extension path via `DROST_SQVECTOR_EXTENSION_PATH`
-- falls back to brute-force cosine search if the vector extension is unavailable
-
-When embedding dimensions change, Drost rebuilds the derived vector lane automatically. Incompatible old embedding blobs are cleared so keyword search still works and new turns repopulate semantic memory.
-
-## Memory Maintenance
-
-Background memory maintenance is enabled by default.
-
-Key settings:
-
-- `DROST_MEMORY_MAINTENANCE_ENABLED=true`
-- `DROST_MEMORY_MAINTENANCE_INTERVAL_SECONDS=1800`
-- `DROST_MEMORY_MAINTENANCE_MAX_EVENTS_PER_RUN=200`
-- `DROST_MEMORY_ENTITY_SYNTHESIS_ENABLED=true`
-
-What it does:
-
-- runs once shortly after startup
-- then runs on the configured interval
-- reads new JSONL transcript lines incrementally
-- writes daily notes
-- writes durable atomic facts into entity folders
-- synthesizes touched entity summaries
-- reindexes the updated memory files
-- stores cursor state in `~/.drost/state/memory-maintenance.json`
-
-## Session Continuity
-
-Drost now carries context across `/new`.
-
-Key settings:
-
-- `DROST_MEMORY_CONTINUITY_ENABLED=true`
-- `DROST_MEMORY_CONTINUITY_AUTO_ON_NEW=true`
-
-Behavior:
-
-- `/new` creates the new session immediately
-- Drost summarizes the prior session in the background
-- the continuity summary is stored as an internal session artifact
-- early turns in the new session get that continuity injected into the prompt
-- continuity is also indexed as a searchable memory source
-
-## Prompt-Time Memory Capsule
-
-Before each turn, Drost assembles a bounded memory capsule from ranked memory results.
-
-The capsule prefers:
-
-- `MEMORY.md`
-- session continuity
-- recent daily memory
-- entity summaries
-- transcript snippets only when higher-order memory is weak
-
-This is what makes Drost feel less like “a model with tools” and more like “an agent with working memory.”
-
-## Traces And Debuggability
-
-When `DROST_TRACE_ENABLED=true` (default), Drost writes:
-
-- `~/.drost/traces/runs.jsonl`
-- `~/.drost/traces/tools.jsonl`
-
-This makes agent behavior inspectable instead of opaque.
-
-## HTTP API
-
-Current gateway endpoints:
+Primary runtime endpoints:
 
 - `GET /health`
 - `GET /v1/providers`
 - `POST /v1/providers/select`
 - `GET /v1/sessions/{chat_id}`
-- `GET /v1/memory/status`
-- `GET /v1/memory/maintenance/status`
-- `GET /v1/memory/continuity/status`
-- `POST /v1/memory/maintenance/run-once`
-- `GET /v1/memory/search?query=...&limit=...`
-- `GET /v1/runs/last`
 - `POST /v1/chat`
 
-## Deployment Model
+Memory and runtime endpoints:
+
+- `GET /v1/memory/status`
+- `GET /v1/memory/search?query=...&limit=...`
+- `GET /v1/memory/maintenance/status`
+- `POST /v1/memory/maintenance/run-once`
+- `GET /v1/memory/continuity/status`
+- `GET /v1/followups`
+- `GET /v1/idle/status`
+- `GET /v1/heartbeat/status`
+- `POST /v1/heartbeat/run-once`
+- `GET /v1/mind/status`
+- `GET /v1/events/status`
+- `GET /v1/loops/status`
+- `GET /v1/runs/last`
+
+`GET /v1/loops/status` is the consolidated operator surface. It includes:
+
+- loop-manager policy state
+- loop health summary
+- failed-loop list
+- per-loop runtime details
+- current mode / focus / activity / health
+- event counts and recent event tail
+- subscriber summary
+
+## Observability
+
+Drost is designed to be inspectable.
+
+When tracing is enabled, it writes:
+
+- `~/.drost/sessions/*.jsonl`
+- `~/.drost/sessions/*.full.jsonl`
+- `~/.drost/traces/runs.jsonl`
+- `~/.drost/traces/tools.jsonl`
+
+This gives you both user/assistant transcripts and the full tool-level execution record.
+
+## Trust Model
 
 Drost is built for trusted, self-hosted, single-owner use.
 
@@ -624,32 +561,36 @@ Current assumptions:
 
 - file tools can read and write across the host filesystem
 - shell execution is not sandboxed
-- the agent is intended to run under the owner’s control, not as a multi-tenant hosted service
+- the runtime is operated by the owner, not exposed as a multi-tenant hosted service
 
-That is deliberate. Drost optimizes for capability and simplicity in personal deployment, not for untrusted-user isolation.
+That is deliberate. Drost optimizes for capability and operational simplicity in personal deployment, not for untrusted-user isolation.
 
 ## Project Status
 
-Drost is currently alpha software.
+Drost is alpha software.
 
-What is already strong:
+Already strong:
 
-- agent loop
+- iterative agent loop
 - Telegram UX
 - provider support
-- vision
-- sessions
+- multimodal vision
+- persistent sessions
 - transcript logging
-- memory foundation
+- compounding memory
 - continuity
-- prompt-time recall
+- proactive follow-up substrate
+- supervised runtime and deployer
+- managed multi-loop runtime
 
-What is still evolving:
+Still evolving:
 
 - memory quality tuning
-- graph-lite relationship memory
-- richer personality compounding
-- broader channels and tool surface
+- stronger deploy validation than `/health` alone
+- richer graph memory quality
+- broader channels
+- broader tool surface
+- further background cognition beyond the current heartbeat / maintenance model
 
 ## License
 
