@@ -87,6 +87,7 @@ Drost currently ships with these built-in tools:
 - continuity status endpoint
 - follow-up listing endpoint
 - idle-state and heartbeat status endpoints
+- shared mind-state status endpoint
 
 ## Architecture
 
@@ -96,6 +97,7 @@ Drost’s current architecture is intentionally simple:
 Telegram <-> FastAPI Gateway <-> Agent Runtime <-> Provider
                                  |
                                  +-> Loop Manager
+                                 +-> Shared Mind State
                                       +-> Maintenance Loop
                                       +-> Heartbeat Loop
                                  +-> Tool Registry
@@ -127,6 +129,22 @@ That includes:
 - start command
 
 The goal is to stop wasting tool calls on rediscovering obvious runtime facts like `pwd`, repo location, or local health endpoints.
+
+## Shared Mind State
+
+Drost now keeps authoritative runtime state under:
+
+- `~/.drost/state/shared-mind-state.json`
+
+That snapshot is the shared runtime surface for:
+
+- active vs idle vs cooldown mode
+- current conversational focus
+- loop status snapshots
+- proactive cooldown timing
+- last heartbeat and recent activity markers
+
+The older idle-state shape is migrated forward automatically on startup.
 
 ## Quick Start
 
@@ -195,6 +213,7 @@ Additional runtime inspection endpoints:
 - `GET /v1/heartbeat/status`
 - `POST /v1/heartbeat/run-once`
 - `GET /v1/loops/status`
+- `GET /v1/mind/status`
 
 ## Deployer
 

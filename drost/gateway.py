@@ -18,6 +18,7 @@ from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
+from drost.shared_mind_state import SharedMindState
 from drost.storage import SQLiteStore
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,8 @@ class Gateway:
         self.providers = build_provider_registry(settings)
         self.embeddings = EmbeddingService(settings)
         self.followups = FollowUpStore(settings.workspace_dir)
-        self.idle_state = IdleStateStore(settings.workspace_dir)
+        self.shared_mind_state = SharedMindState(settings.workspace_dir)
+        self.idle_state = IdleStateStore(shared_mind_state=self.shared_mind_state)
         self.agent = AgentRuntime(
             settings=settings,
             providers=self.providers,
@@ -133,6 +135,12 @@ class Gateway:
         self._mount_routes()
         self._mount_lifecycle()
 
+    def _sync_shared_mind_state(self) -> None:
+        try:
+            self.shared_mind_state.set_loop_states(self.loop_manager.status().get("loops", {}))
+        except Exception:
+            logger.debug("Failed to sync loop state into shared mind state", exc_info=True)
+
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()
         media = context.get("media") if isinstance(context.get("media"), list) else None
@@ -143,8 +151,14 @@ class Gateway:
         settings = getattr(self, "settings", None)
         idle_mode_enabled = bool(getattr(settings, "idle_mode_enabled", False))
         idle_state = getattr(self, "idle_state", None)
+        session_key_before = ""
+        if chat_id > 0 and hasattr(self, "store"):
+            try:
+                session_key_before = str(self.store.current_session_key(chat_id) or "").strip()
+            except Exception:
+                session_key_before = ""
         if chat_id > 0 and idle_mode_enabled and idle_state is not None:
-            idle_state.mark_user_message(chat_id=chat_id)
+            idle_state.mark_user_message(chat_id=chat_id, session_key=session_key_before or None)
         session_id = context.get("session_id")
         status_callback = context.get("status_callback")
         answer_stream_callback = context.get("answer_stream_callback")
@@ -156,8 +170,14 @@ class Gateway:
             status_callback=status_callback if callable(status_callback) else None,
             answer_stream_callback=answer_stream_callback if callable(answer_stream_callback) else None,
         )
+        session_key_after = session_key_before
+        if chat_id > 0 and hasattr(self, "store"):
+            try:
+                session_key_after = str(self.store.current_session_key(chat_id) or "").strip()
+            except Exception:
+                session_key_after = session_key_before
         if chat_id > 0 and idle_mode_enabled and idle_state is not None:
-            idle_state.mark_assistant_message(chat_id=chat_id)
+            idle_state.mark_assistant_message(chat_id=chat_id, session_key=session_key_after or None)
         return reply
 
     async def _handle_new_session_transition(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -185,6 +205,7 @@ class Gateway:
                 await self.agent.sync_memory_index()
             await self.telegram.start(self.app)
             await self.loop_manager.start()
+            self._sync_shared_mind_state()
             logger.info(
                 "Drost gateway started (provider=%s db=%s loops=%s)",
                 self.agent.active_provider,
@@ -198,6 +219,7 @@ class Gateway:
                 await self.loop_manager.stop()
             except Exception:
                 logger.warning("Loop manager shutdown reported errors", exc_info=True)
+            self._sync_shared_mind_state()
             await self.telegram.stop()
             await self.session_continuity.shutdown()
             await self.agent.close()
@@ -243,7 +265,9 @@ class Gateway:
 
         @self.app.get("/v1/loops/status")
         async def loops_status() -> dict[str, Any]:
-            return self.loop_manager.status()
+            status = self.loop_manager.status()
+            self._sync_shared_mind_state()
+            return status
 
         @self.app.get("/v1/followups")
         async def followups(chat_id: int | None = None) -> dict[str, Any]:
@@ -255,6 +279,11 @@ class Gateway:
         @self.app.get("/v1/idle/status")
         async def idle_status() -> dict[str, Any]:
             return self.idle_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+
+        @self.app.get("/v1/mind/status")
+        async def mind_status() -> dict[str, Any]:
+            self._sync_shared_mind_state()
+            return self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
 
         @self.app.get("/v1/heartbeat/status")
         async def heartbeat_status() -> dict[str, Any]:
@@ -298,12 +327,27 @@ class Gateway:
 
         @self.app.post("/v1/chat")
         async def chat(payload: ChatRequest) -> dict[str, Any]:
+            chat_id = int(payload.chat_id)
+            session_key_before = ""
+            if chat_id > 0:
+                try:
+                    session_key_before = str(self.store.current_session_key(chat_id) or "").strip()
+                except Exception:
+                    session_key_before = ""
+                if self.settings.idle_mode_enabled:
+                    self.idle_state.mark_user_message(chat_id=chat_id, session_key=session_key_before or None)
             response = await self.agent.respond(
-                chat_id=int(payload.chat_id),
+                chat_id=chat_id,
                 text=str(payload.text or ""),
                 media=payload.media,
                 session_id=payload.session_id,
             )
+            if chat_id > 0 and self.settings.idle_mode_enabled:
+                try:
+                    session_key_after = str(self.store.current_session_key(chat_id) or "").strip()
+                except Exception:
+                    session_key_after = session_key_before
+                self.idle_state.mark_assistant_message(chat_id=chat_id, session_key=session_key_after or None)
             return {"reply": response, "provider": self.agent.active_provider}
 
 
