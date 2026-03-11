@@ -11,6 +11,7 @@ from drost.channels import TelegramChannel
 from drost.cognitive_artifacts import CognitiveArtifactStore
 from drost.config import Settings
 from drost.conversation_loop import ConversationLoop
+from drost.drive_loop import DriveLoop
 from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
 from drost.idle_heartbeat import IdleHeartbeatRunner
@@ -138,6 +139,15 @@ class Gateway:
             policy_gate=self.loop_manager.background_policy,
             artifact_store=self.cognitive_artifacts,
         )
+        self.drive_loop = DriveLoop(
+            workspace_dir=settings.workspace_dir,
+            provider_getter=self.providers.get,
+            shared_mind_state=self.shared_mind_state,
+            followups=self.followups,
+            artifact_store=self.cognitive_artifacts,
+            event_bus=self.loop_events,
+            policy_gate=self.loop_manager.background_policy,
+        )
         self.conversation_loop = ConversationLoop(event_bus=self.loop_events)
         self.loop_manager.register(self.conversation_loop)
         self.loop_manager.register(
@@ -161,6 +171,7 @@ class Gateway:
             )
         )
         self.loop_manager.register(self.reflection_loop)
+        self.loop_manager.register(self.drive_loop)
         self.loop_manager.register(
             ManagedRunnerLoop(
                 name="heartbeat_loop",

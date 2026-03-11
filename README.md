@@ -75,8 +75,8 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
                             ├── Agent Loop (LLM → tools → LLM, checklist contract)
                             ├── Memory (6 layers: logs → files → entities → index → continuity → capsule)
                             ├── 12 Built-in Tools (memory, files, shell, web, deployer, follow-ups)
-                            ├── Loop Manager (conversation, heartbeat, continuity, maintenance)
-                            ├── Shared Mind State (active / idle / cooldown)
+                            ├── Loop Manager (conversation, reflection, drive, heartbeat, continuity, maintenance)
+                            ├── Shared Mind State (active / idle / cooldown, agenda, attention)
                             └── Deployer (subprocess supervisor, health checks, deploy, rollback)
 ```
 
@@ -104,7 +104,7 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
 
 Drost is **alpha** — daily-drivable, actively developed, not yet stable.
 
-The core works well: agent loop, memory, Telegram UX, multi-provider, vision, sessions, follow-ups, deployer. Memory quality, graph depth, and tool surface are still evolving.
+The core works well: agent loop, multi-loop runtime, memory, Telegram UX, multi-provider, vision, sessions, follow-ups, deployer. Memory quality, graph depth, and tool surface are still evolving.
 
 ## License
 
