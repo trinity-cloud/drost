@@ -6,11 +6,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from drost.cognitive_artifacts import CognitiveArtifactStore
+
 
 class SharedMindState:
     def __init__(self, workspace_dir: str | Path) -> None:
         self._workspace_dir = Path(workspace_dir).expanduser()
+        self._cognitive_artifacts = CognitiveArtifactStore(self._workspace_dir)
+        self._cognitive_artifacts.ensure_layout()
         self._state = self._load_initial_state()
+        self._refresh_cognitive_summary()
         self._save()
 
     @property
@@ -50,6 +55,7 @@ class SharedMindState:
         self._state["mode"] = next_mode
         self._state["mode_changed"] = previous_mode != next_mode
         self._state["updated_at"] = _dump_time(moment)
+        self._refresh_cognitive_summary()
         self._save()
         return self.snapshot()
 
@@ -122,6 +128,7 @@ class SharedMindState:
             return self.snapshot()
         self._state["loop_state"] = deepcopy(loop_states)
         self._state["updated_at"] = _dump_time(_utc_now())
+        self._refresh_cognitive_summary()
         self._save()
         return self.snapshot()
 
@@ -131,6 +138,7 @@ class SharedMindState:
             "last_error": str(last_error or ""),
         }
         self._state["updated_at"] = _dump_time(_utc_now())
+        self._refresh_cognitive_summary()
         self._save()
         return self.snapshot()
 
@@ -227,8 +235,11 @@ class SharedMindState:
         activity = raw.get("activity") if isinstance(raw.get("activity"), dict) else {}
         health = raw.get("health") if isinstance(raw.get("health"), dict) else {}
         loop_state = raw.get("loop_state") if isinstance(raw.get("loop_state"), dict) else {}
+        reflection = raw.get("reflection") if isinstance(raw.get("reflection"), dict) else {}
+        agenda = raw.get("agenda") if isinstance(raw.get("agenda"), dict) else {}
+        attention = raw.get("attention") if isinstance(raw.get("attention"), dict) else {}
         return {
-            "version": int(raw.get("version") or 1),
+            "version": int(raw.get("version") or 2),
             "mode": str(raw.get("mode") or "active"),
             "mode_changed": bool(raw.get("mode_changed")),
             "focus": {
@@ -248,6 +259,40 @@ class SharedMindState:
             "health": {
                 "degraded": bool(health.get("degraded", False)),
                 "last_error": str(health.get("last_error") or ""),
+            },
+            "reflection": {
+                "path": str(reflection.get("path") or ""),
+                "count": int(reflection.get("count") or 0),
+                "last_reflection_at": str(reflection.get("last_reflection_at") or ""),
+                "last_high_importance_reflection_id": str(reflection.get("last_high_importance_reflection_id") or ""),
+                "recent_themes": [
+                    str(item).strip()
+                    for item in list(reflection.get("recent_themes") or [])
+                    if str(item).strip()
+                ],
+            },
+            "agenda": {
+                "path": str(agenda.get("path") or ""),
+                "active_count": int(agenda.get("active_count") or 0),
+                "last_drive_update_at": str(agenda.get("last_drive_update_at") or ""),
+                "top_items": [
+                    dict(item)
+                    for item in list(agenda.get("top_items") or [])
+                    if isinstance(item, dict)
+                ],
+            },
+            "attention": {
+                "path": str(attention.get("path") or ""),
+                "current_focus_kind": str(attention.get("current_focus_kind") or "conversation"),
+                "current_focus_summary": str(attention.get("current_focus_summary") or ""),
+                "top_priority_tags": [
+                    str(item).strip()
+                    for item in list(attention.get("top_priority_tags") or [])
+                    if str(item).strip()
+                ],
+                "reflection_stale": bool(attention.get("reflection_stale", False)),
+                "drive_stale": bool(attention.get("drive_stale", False)),
+                "last_updated_at": str(attention.get("last_updated_at") or ""),
             },
             "updated_at": str(raw.get("updated_at") or ""),
         }
@@ -283,7 +328,7 @@ class SharedMindState:
     @staticmethod
     def _default_state() -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "mode": "active",
             "mode_changed": False,
             "focus": {
@@ -304,8 +349,36 @@ class SharedMindState:
                 "degraded": False,
                 "last_error": "",
             },
+            "reflection": {
+                "path": "",
+                "count": 0,
+                "last_reflection_at": "",
+                "last_high_importance_reflection_id": "",
+                "recent_themes": [],
+            },
+            "agenda": {
+                "path": "",
+                "active_count": 0,
+                "last_drive_update_at": "",
+                "top_items": [],
+            },
+            "attention": {
+                "path": "",
+                "current_focus_kind": "conversation",
+                "current_focus_summary": "",
+                "top_priority_tags": [],
+                "reflection_stale": False,
+                "drive_stale": False,
+                "last_updated_at": "",
+            },
             "updated_at": "",
         }
+
+    def _refresh_cognitive_summary(self) -> None:
+        summary = self._cognitive_artifacts.summary()
+        self._state["reflection"] = dict(summary.get("reflection") or {})
+        self._state["agenda"] = dict(summary.get("agenda") or {})
+        self._state["attention"] = dict(summary.get("attention") or {})
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

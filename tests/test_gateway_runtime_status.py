@@ -45,6 +45,9 @@ class _FakeMindState:
             "focus": {"chat_id": 123, "session_key": "main:telegram:123__s_2026-03-10_20-00-00", "channel": "telegram"},
             "activity": {"last_user_message_at": "2026-03-10T20:01:00Z"},
             "health": {"degraded": False, "last_error": ""},
+            "reflection": {"count": 2, "last_reflection_at": "2026-03-10T20:02:00Z"},
+            "agenda": {"active_count": 1, "top_items": [{"drive_id": "drv_1"}]},
+            "attention": {"current_focus_kind": "conversation"},
         }
 
 
@@ -72,6 +75,9 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events() -> None:
     assert payload["mode"] == "active"
     assert payload["focus"]["chat_id"] == 123
     assert payload["health"]["degraded"] is False
+    assert payload["reflection"]["count"] == 2
+    assert payload["agenda"]["active_count"] == 1
+    assert payload["attention"]["current_focus_kind"] == "conversation"
     assert payload["loop_health"]["running"] == 2
     assert payload["event_counts"]["assistant_turn_completed"] == 1
     assert payload["recent_events"][0]["type"] == "assistant_turn_completed"
