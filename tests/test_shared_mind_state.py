@@ -23,6 +23,14 @@ def test_shared_mind_state_persists_focus_and_activity_across_reload(tmp_path: P
         at=start + timedelta(minutes=30),
         cooldown_seconds=3600,
     )
+    state.note_heartbeat_decision(
+        decision="noop",
+        reason="drive_prefers_hold",
+        follow_up_id="followup_1",
+        audit_id="hba_test",
+        trigger_reason="manual",
+        at=start + timedelta(minutes=35),
+    )
     state.set_loop_states({"heartbeat_loop": {"state": "running"}})
 
     reloaded = SharedMindState(tmp_path)
@@ -32,6 +40,8 @@ def test_shared_mind_state_persists_focus_and_activity_across_reload(tmp_path: P
     assert snapshot["focus"]["session_key"] == "main:telegram:8271705169__s_2026-03-10_10-00-00"
     assert snapshot["activity"]["last_proactive_surface_at"]
     assert snapshot["loop_state"]["heartbeat_loop"]["state"] == "running"
+    assert snapshot["heartbeat"]["last_decision"] == "noop"
+    assert snapshot["heartbeat"]["last_audit_id"] == "hba_test"
     assert reloaded.path.exists()
 
 

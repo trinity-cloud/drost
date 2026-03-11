@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from drost.cognitive_artifacts import CognitiveArtifactStore
 from drost.followups import FollowUpStore
 from drost.idle_state import IdleStateStore
 from drost.loop_events import EventSubscription, LoopEventBus
@@ -23,6 +25,7 @@ _ALLOWED_DECISIONS = {"noop", "surface_follow_up", "snooze_follow_up", "mark_exp
 _HEARTBEAT_SYSTEM_PROMPT = """You are the Drost idle heartbeat decision engine.
 
 You are reviewing due follow-ups while the user is idle.
+You may use current internal agenda items and recent reflections as decision context.
 Return ONLY valid JSON. No markdown. No prose before or after the JSON.
 
 Output schema:
@@ -39,6 +42,8 @@ Rules:
 - Be conservative. If uncertain, return noop.
 - Do not initiate generic social check-ins with no concrete reason.
 - Only surface a follow-up when it is genuinely due and worth interrupting for.
+- Treat internal agenda items with `recommended_channel=heartbeat` as a strong positive signal.
+- Treat agenda items with `recommended_channel=conversation_only` or `hold` as suppression signals unless there is a compelling reason to overrule them.
 - Prefer the provided follow_up_prompt as the core outbound message unless you have a strong reason to tighten it.
 - If surfacing, keep the message concise and natural.
 - If no follow-up clearly deserves action, return noop.
@@ -60,6 +65,7 @@ class IdleHeartbeatRunner:
         begin_proactive_action: Callable[..., dict[str, Any]] | None = None,
         finish_proactive_action: Callable[..., None] | None = None,
         provider_getter: Callable[[], BaseProvider] | None = None,
+        artifact_store: CognitiveArtifactStore | None = None,
         interval_seconds: int = 1800,
         active_window_seconds: int = 20 * 60,
         proactive_cooldown_seconds: int = 6 * 60 * 60,
@@ -75,6 +81,8 @@ class IdleHeartbeatRunner:
         self._finish_proactive_action = finish_proactive_action
         self._provider_getter = provider_getter
         self._workspace_loader = WorkspaceLoader(self._workspace_dir)
+        self._artifact_store = artifact_store or CognitiveArtifactStore(self._workspace_dir)
+        self._artifact_store.ensure_layout()
         self._enabled = bool(enabled)
         self._proactive_enabled = bool(proactive_enabled)
         self._interval_seconds = max(60, int(interval_seconds))
@@ -101,7 +109,13 @@ class IdleHeartbeatRunner:
             "event_driven": self._event_bus is not None,
             "last_trigger_event": "",
             "last_policy_reason": "",
+            "heartbeat_audit_path": str(self.audit_path),
+            "last_audit_id": "",
         }
+
+    @property
+    def audit_path(self) -> Path:
+        return self._workspace_dir / "state" / "heartbeat-decisions.jsonl"
 
     async def start(self) -> None:
         if not self._enabled or self._running:
@@ -196,6 +210,8 @@ class IdleHeartbeatRunner:
 
     def status(self) -> dict[str, Any]:
         state = self._idle_state.status(active_window_seconds=self._active_window_seconds)
+        drive_state = self._artifact_store.load_drive_state()
+        reflections = self._artifact_store.list_reflections(limit=4)
         result = dict(self._last_status)
         result["idle_state"] = state
         result["followup_counts"] = {
@@ -206,6 +222,15 @@ class IdleHeartbeatRunner:
                     limit=self._max_due_items,
                 )
             ),
+        }
+        result["cognitive_context"] = {
+            "active_drive_count": len(list(drive_state.get("active_items") or [])),
+            "recent_reflection_count": len(reflections),
+            "top_drive_ids": [
+                str(item.get("drive_id") or "")
+                for item in list(drive_state.get("active_items") or [])[:3]
+                if str(item.get("drive_id") or "")
+            ],
         }
         return result
 
@@ -254,9 +279,22 @@ class IdleHeartbeatRunner:
                 return result
 
             due_items = self._followups.list_due(now=started_at, chat_id=chat_id, limit=self._max_due_items)
+            drive_state = self._artifact_store.load_drive_state()
+            reflections = self._artifact_store.list_reflections(limit=4)
             if not due_items:
                 result = self._record_result(
-                    {"reason": reason, "decision": "noop", "why": "no_due_followups", "chat_id": chat_id}
+                    {
+                        "reason": reason,
+                        "decision": "noop",
+                        "why": "no_due_followups",
+                        "suppression_reason": "no_due_followups",
+                        "chat_id": chat_id,
+                    },
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
                 )
                 self._emit_heartbeat_decision(result)
                 return result
@@ -267,15 +305,23 @@ class IdleHeartbeatRunner:
                         "reason": reason,
                         "decision": "noop",
                         "why": "proactive_disabled",
+                        "suppression_reason": "proactive_disabled",
                         "chat_id": chat_id,
                         "due_followup_ids": [str(item.get("id") or "") for item in due_items],
-                    }
+                    },
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
                 )
                 self._emit_heartbeat_decision(result)
                 return result
 
             decision = await self._decide(
                 due_items=due_items,
+                drive_state=drive_state,
+                reflections=reflections,
                 idle_state=state,
                 now=started_at,
                 reason=reason,
@@ -286,12 +332,20 @@ class IdleHeartbeatRunner:
             followup = self._resolve_followup(decision.get("follow_up_id"), due_items)
             action = str(decision.get("decision") or "noop")
             if action == "noop":
-                result = self._record_result(decision)
+                decision.setdefault("suppression_reason", str(decision.get("reason") or "noop"))
+                result = self._record_result(
+                    decision,
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
+                )
                 self._emit_heartbeat_decision(result)
                 return result
 
             if followup is None:
-                fallback = self._deterministic_decision(due_items=due_items)
+                fallback = self._deterministic_decision(due_items=due_items, drive_state=drive_state)
                 fallback["reason"] = "invalid_follow_up_reference"
                 followup = due_items[0]
                 decision = {**fallback, "chat_id": chat_id}
@@ -300,7 +354,14 @@ class IdleHeartbeatRunner:
             if action == "mark_expired":
                 updated = self._followups.expire(str(followup.get("id") or "")) or followup
                 self._emit_followup_updated(updated, source="heartbeat_expired")
-                result = self._record_result(decision)
+                result = self._record_result(
+                    decision,
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
+                )
                 self._emit_heartbeat_decision(result)
                 return result
 
@@ -312,7 +373,14 @@ class IdleHeartbeatRunner:
                     decision["snooze_until"] = _dump_time(snooze_until)
                 updated = self._followups.snooze(str(followup.get("id") or ""), until=snooze_until) or followup
                 self._emit_followup_updated(updated, source="heartbeat_snoozed")
-                result = self._record_result(decision)
+                result = self._record_result(
+                    decision,
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
+                )
                 self._emit_heartbeat_decision(result)
                 return result
 
@@ -323,9 +391,15 @@ class IdleHeartbeatRunner:
                         "reason": reason,
                         "decision": "noop",
                         "why": "missing_prompt",
+                        "suppression_reason": "missing_prompt",
                         "chat_id": chat_id,
                         "follow_up_id": str(followup.get("id") or ""),
-                    }
+                    },
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
                 )
                 self._emit_heartbeat_decision(result)
                 return result
@@ -345,9 +419,15 @@ class IdleHeartbeatRunner:
                             "reason": reason,
                             "decision": "noop",
                             "why": str(claim.get("reason") or "policy_blocked"),
+                            "suppression_reason": str(claim.get("reason") or "policy_blocked"),
                             "chat_id": chat_id,
                             "follow_up_id": str(followup.get("id") or ""),
-                        }
+                        },
+                        idle_state=state,
+                        due_items=due_items,
+                        drive_state=drive_state,
+                        reflections=reflections,
+                        at=started_at,
                     )
                     self._emit_heartbeat_decision(result)
                     return result
@@ -372,7 +452,14 @@ class IdleHeartbeatRunner:
                     session_key=str(state.get("active_session_key") or ""),
                     message=message,
                 )
-                result = self._record_result(decision)
+                result = self._record_result(
+                    decision,
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
+                )
                 self._emit_heartbeat_decision(result)
                 return result
             except Exception as exc:
@@ -383,10 +470,16 @@ class IdleHeartbeatRunner:
                         "reason": reason,
                         "decision": "noop",
                         "why": "send_failed",
+                        "suppression_reason": "send_failed",
                         "chat_id": chat_id,
                         "follow_up_id": str(followup.get("id") or ""),
                         "error": str(exc),
-                    }
+                    },
+                    idle_state=state,
+                    due_items=due_items,
+                    drive_state=drive_state,
+                    reflections=reflections,
+                    at=started_at,
                 )
                 self._emit_heartbeat_decision(result)
                 return result
@@ -398,22 +491,26 @@ class IdleHeartbeatRunner:
         self,
         *,
         due_items: list[dict[str, Any]],
+        drive_state: dict[str, Any],
+        reflections: list[dict[str, Any]],
         idle_state: dict[str, Any],
         now: datetime,
         reason: str,
     ) -> dict[str, Any]:
         if self._provider_getter is None:
-            return self._deterministic_decision(due_items=due_items)
+            return self._deterministic_decision(due_items=due_items, drive_state=drive_state)
 
         try:
             provider = self._provider_getter()
         except Exception:
             logger.warning("Idle heartbeat provider getter failed; falling back to deterministic decision", exc_info=True)
-            return self._deterministic_decision(due_items=due_items)
+            return self._deterministic_decision(due_items=due_items, drive_state=drive_state)
 
         system = self._build_system_prompt()
         user_payload = self._build_user_payload(
             due_items=due_items,
+            drive_state=drive_state,
+            reflections=reflections,
             idle_state=idle_state,
             now=now,
             reason=reason,
@@ -427,13 +524,13 @@ class IdleHeartbeatRunner:
             )
         except Exception:
             logger.warning("Idle heartbeat provider decision failed; falling back to deterministic decision", exc_info=True)
-            return self._deterministic_decision(due_items=due_items)
+            return self._deterministic_decision(due_items=due_items, drive_state=drive_state)
 
         payload = self._parse_json(str(response.message.content or ""))
         normalized = self._normalize_decision(payload=payload, due_items=due_items)
         if normalized is None:
             logger.warning("Idle heartbeat provider returned invalid decision; falling back to deterministic decision")
-            return self._deterministic_decision(due_items=due_items)
+            return self._deterministic_decision(due_items=due_items, drive_state=drive_state)
         return normalized
 
     def _build_system_prompt(self) -> str:
@@ -447,6 +544,8 @@ class IdleHeartbeatRunner:
         self,
         *,
         due_items: list[dict[str, Any]],
+        drive_state: dict[str, Any],
+        reflections: list[dict[str, Any]],
         idle_state: dict[str, Any],
         now: datetime,
         reason: str,
@@ -480,6 +579,30 @@ class IdleHeartbeatRunner:
                 }
                 for item in due_items
             ],
+            "current_internal_agenda": [
+                {
+                    "drive_id": str(item.get("drive_id") or ""),
+                    "title": str(item.get("title") or ""),
+                    "summary": str(item.get("summary") or ""),
+                    "kind": str(item.get("kind") or ""),
+                    "priority": float(item.get("priority") or 0.0),
+                    "recommended_channel": str(item.get("recommended_channel") or "hold"),
+                    "source_refs": list(item.get("source_refs") or []),
+                }
+                for item in list(drive_state.get("active_items") or [])[:5]
+            ],
+            "recent_reflections": [
+                {
+                    "reflection_id": str(item.get("reflection_id") or ""),
+                    "kind": str(item.get("kind") or ""),
+                    "summary": str(item.get("summary") or ""),
+                    "importance": float(item.get("importance") or 0.0),
+                    "actionability": float(item.get("actionability") or 0.0),
+                    "suggested_drive_tags": list(item.get("suggested_drive_tags") or []),
+                }
+                for item in reflections[-4:]
+            ],
+            "attention_state": self._artifact_store.load_attention_state(),
             "recent_daily_memory": recent_daily,
         }
         return json.dumps(payload, ensure_ascii=False)
@@ -540,10 +663,27 @@ class IdleHeartbeatRunner:
         return due_items[0] if due_items else None
 
     @staticmethod
-    def _deterministic_decision(*, due_items: list[dict[str, Any]]) -> dict[str, Any]:
-        followup = due_items[0] if due_items else None
+    def _deterministic_decision(*, due_items: list[dict[str, Any]], drive_state: dict[str, Any]) -> dict[str, Any]:
+        followup = IdleHeartbeatRunner._choose_deterministic_followup(due_items=due_items, drive_state=drive_state)
         if followup is None:
             return {"decision": "noop", "reason": "no_due_followups", "confidence": 0.0}
+        channel = IdleHeartbeatRunner._agenda_channel_for_followup(followup=followup, drive_state=drive_state)
+        if channel == "conversation_only":
+            return {
+                "decision": "noop",
+                "follow_up_id": str(followup.get("id") or ""),
+                "reason": "drive_prefers_conversation_only",
+                "suppression_reason": "drive_prefers_conversation_only",
+                "confidence": 0.55,
+            }
+        if channel == "hold":
+            return {
+                "decision": "noop",
+                "follow_up_id": str(followup.get("id") or ""),
+                "reason": "drive_prefers_hold",
+                "suppression_reason": "drive_prefers_hold",
+                "confidence": 0.55,
+            }
         return {
             "decision": "surface_follow_up",
             "follow_up_id": str(followup.get("id") or ""),
@@ -552,10 +692,122 @@ class IdleHeartbeatRunner:
             "confidence": 0.5,
         }
 
-    def _record_result(self, result: dict[str, Any]) -> dict[str, Any]:
+    @classmethod
+    def _choose_deterministic_followup(cls, *, due_items: list[dict[str, Any]], drive_state: dict[str, Any]) -> dict[str, Any] | None:
+        if not due_items:
+            return None
+        ranked = sorted(
+            due_items,
+            key=lambda item: (
+                -cls._deterministic_followup_score(item=item, drive_state=drive_state),
+                str(item.get("due_at") or ""),
+                str(item.get("id") or ""),
+            ),
+        )
+        return ranked[0] if ranked else None
+
+    @classmethod
+    def _deterministic_followup_score(cls, *, item: dict[str, Any], drive_state: dict[str, Any]) -> float:
+        priority = str(item.get("priority") or "medium").strip().lower()
+        priority_score = {"high": 3.0, "medium": 2.0, "low": 1.0}.get(priority, 2.0)
+        confidence = float(item.get("confidence") or 0.0)
+        channel = cls._agenda_channel_for_followup(followup=item, drive_state=drive_state)
+        channel_delta = {"heartbeat": 2.0, "conversation_only": -2.0, "hold": -1.0}.get(channel, 0.0)
+        return priority_score + confidence + channel_delta
+
+    @staticmethod
+    def _agenda_channel_for_followup(*, followup: dict[str, Any], drive_state: dict[str, Any]) -> str:
+        followup_id = str(followup.get("id") or "").strip()
+        entity_refs = {str(ref).strip() for ref in list(followup.get("entity_refs") or []) if str(ref).strip()}
+        best_channel = ""
+        best_score = -1
+        for item in list(drive_state.get("active_items") or []):
+            if not isinstance(item, dict):
+                continue
+            refs = {str(ref).strip() for ref in list(item.get("source_refs") or []) if str(ref).strip()}
+            score = 0
+            if followup_id and followup_id in refs:
+                score = 3
+            elif entity_refs and entity_refs.intersection(refs):
+                score = 2
+            elif followup_id and followup_id in str(item.get("summary") or ""):
+                score = 1
+            if score > best_score:
+                best_score = score
+                best_channel = str(item.get("recommended_channel") or "").strip().lower()
+        return best_channel
+
+    def _record_result(
+        self,
+        result: dict[str, Any],
+        *,
+        idle_state: dict[str, Any] | None = None,
+        due_items: list[dict[str, Any]] | None = None,
+        drive_state: dict[str, Any] | None = None,
+        reflections: list[dict[str, Any]] | None = None,
+        at: datetime | None = None,
+    ) -> dict[str, Any]:
         self._last_status["last_result"] = result
         self._last_status["last_error"] = str(result.get("error") or "")
+        audit_id = self._append_audit(
+            result=result,
+            idle_state=idle_state,
+            due_items=due_items or [],
+            drive_state=drive_state or {},
+            reflections=reflections or [],
+            at=at,
+        )
+        result["audit_id"] = audit_id
+        self._last_status["last_audit_id"] = audit_id
+        self._idle_state.note_heartbeat_decision(
+            decision=str(result.get("decision") or ""),
+            reason=str(result.get("suppression_reason") or result.get("why") or result.get("reason") or ""),
+            follow_up_id=str(result.get("follow_up_id") or ""),
+            audit_id=audit_id,
+            trigger_reason=str(result.get("reason") or ""),
+            at=at,
+        )
         return result
+
+    def _append_audit(
+        self,
+        *,
+        result: dict[str, Any],
+        idle_state: dict[str, Any] | None,
+        due_items: list[dict[str, Any]],
+        drive_state: dict[str, Any],
+        reflections: list[dict[str, Any]],
+        at: datetime | None,
+    ) -> str:
+        state = idle_state or {}
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_id = f"hba_{uuid.uuid4().hex[:12]}"
+        payload = {
+            "audit_id": audit_id,
+            "timestamp": _dump_time(at or datetime.now(UTC)),
+            "decision": str(result.get("decision") or ""),
+            "reason": str(result.get("reason") or ""),
+            "why": str(result.get("why") or ""),
+            "suppression_reason": str(result.get("suppression_reason") or ""),
+            "follow_up_id": str(result.get("follow_up_id") or ""),
+            "chat_id": int(result.get("chat_id") or 0),
+            "idle_mode": str(state.get("mode") or ""),
+            "session_key": str(state.get("active_session_key") or ""),
+            "due_followup_ids": [str(item.get("id") or "") for item in due_items if str(item.get("id") or "")],
+            "considered_drive_ids": [
+                str(item.get("drive_id") or "")
+                for item in list(drive_state.get("active_items") or [])[:5]
+                if str(item.get("drive_id") or "")
+            ],
+            "considered_reflection_ids": [
+                str(item.get("reflection_id") or "")
+                for item in reflections[-4:]
+                if str(item.get("reflection_id") or "")
+            ],
+        }
+        with self.audit_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        return audit_id
 
     def _emit_heartbeat_decision(self, result: dict[str, Any]) -> None:
         if self._event_bus is None:

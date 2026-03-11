@@ -104,6 +104,29 @@ class SharedMindState:
         self._save()
         return self.snapshot()
 
+    def note_heartbeat_decision(
+        self,
+        *,
+        decision: str,
+        reason: str = "",
+        follow_up_id: str = "",
+        audit_id: str = "",
+        trigger_reason: str = "",
+        at: datetime | None = None,
+    ) -> dict[str, Any]:
+        moment = at or _utc_now()
+        self._state["heartbeat"] = {
+            "last_decision_at": _dump_time(moment),
+            "last_decision": str(decision or "").strip(),
+            "last_reason": str(reason or "").strip(),
+            "last_follow_up_id": str(follow_up_id or "").strip(),
+            "last_audit_id": str(audit_id or "").strip(),
+            "last_trigger_reason": str(trigger_reason or "").strip(),
+        }
+        self._state["updated_at"] = _dump_time(moment)
+        self._save()
+        return self.snapshot()
+
     def note_proactive_surface(
         self,
         *,
@@ -243,6 +266,7 @@ class SharedMindState:
         reflection = raw.get("reflection") if isinstance(raw.get("reflection"), dict) else {}
         agenda = raw.get("agenda") if isinstance(raw.get("agenda"), dict) else {}
         attention = raw.get("attention") if isinstance(raw.get("attention"), dict) else {}
+        heartbeat = raw.get("heartbeat") if isinstance(raw.get("heartbeat"), dict) else {}
         return {
             "version": int(raw.get("version") or 2),
             "mode": str(raw.get("mode") or "active"),
@@ -298,6 +322,14 @@ class SharedMindState:
                 "reflection_stale": bool(attention.get("reflection_stale", False)),
                 "drive_stale": bool(attention.get("drive_stale", False)),
                 "last_updated_at": str(attention.get("last_updated_at") or ""),
+            },
+            "heartbeat": {
+                "last_decision_at": str(heartbeat.get("last_decision_at") or ""),
+                "last_decision": str(heartbeat.get("last_decision") or ""),
+                "last_reason": str(heartbeat.get("last_reason") or ""),
+                "last_follow_up_id": str(heartbeat.get("last_follow_up_id") or ""),
+                "last_audit_id": str(heartbeat.get("last_audit_id") or ""),
+                "last_trigger_reason": str(heartbeat.get("last_trigger_reason") or ""),
             },
             "updated_at": str(raw.get("updated_at") or ""),
         }
@@ -375,6 +407,14 @@ class SharedMindState:
                 "reflection_stale": False,
                 "drive_stale": False,
                 "last_updated_at": "",
+            },
+            "heartbeat": {
+                "last_decision_at": "",
+                "last_decision": "",
+                "last_reason": "",
+                "last_follow_up_id": "",
+                "last_audit_id": "",
+                "last_trigger_reason": "",
             },
             "updated_at": "",
         }

@@ -124,6 +124,7 @@ class Gateway:
             begin_proactive_action=self.loop_manager.begin_proactive_action,
             finish_proactive_action=self.loop_manager.finish_proactive_action,
             provider_getter=self.providers.get,
+            artifact_store=self.cognitive_artifacts,
             enabled=settings.idle_mode_enabled and settings.idle_heartbeat_enabled,
             proactive_enabled=settings.proactive_surfacing_enabled,
             interval_seconds=settings.idle_heartbeat_interval_seconds,

@@ -71,6 +71,25 @@ class IdleStateStore:
         self._shared.note_heartbeat(at=at)
         return self._shared.to_idle_view(active_window_seconds=20 * 60, now=at)
 
+    def note_heartbeat_decision(
+        self,
+        *,
+        decision: str,
+        reason: str = "",
+        follow_up_id: str = "",
+        audit_id: str = "",
+        trigger_reason: str = "",
+        at: datetime | None = None,
+    ) -> dict[str, Any]:
+        return self._shared.note_heartbeat_decision(
+            decision=decision,
+            reason=reason,
+            follow_up_id=follow_up_id,
+            audit_id=audit_id,
+            trigger_reason=trigger_reason,
+            at=at,
+        )
+
     def note_proactive_surface(
         self,
         *,
