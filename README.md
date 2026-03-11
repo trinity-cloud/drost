@@ -39,7 +39,7 @@ Drost is neither. It's a **complete personal agent runtime** you can deploy toda
 
 &nbsp;&nbsp;&nbsp;&nbsp;**It's yours** — self-hosted, single-owner, no cloud dependency. Files, shell, web — full capability without sandbox restrictions. The agent can even edit its own code and deploy changes through a built-in control plane.
 
-&nbsp;&nbsp;&nbsp;&nbsp;**It's inspectable** — every turn logged as JSONL, every tool call traced, runtime state in readable JSON. 20+ operator API endpoints for memory, loops, events, and runtime health.
+&nbsp;&nbsp;&nbsp;&nbsp;**It's inspectable** — every turn logged as JSONL, every tool call traced, runtime state in readable JSON. 20+ operator API endpoints for memory, loops, cognition, quality gates, and runtime health.
 
 ## Quick Start
 
@@ -99,6 +99,14 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
 | **[Workspace](docs/workspace.md)** | Filesystem layout, bootstrap, prompt assembly |
 | **[Telegram](docs/telegram.md)** | Bot setup, commands, streaming, vision support |
 | **[Observability](docs/observability.md)** | JSONL traces, cognition/loop/runtime endpoints, event bus |
+
+Key operator endpoints:
+- `/v1/loops/status`
+- `/v1/mind/status`
+- `/v1/cognition/status`
+- `/v1/quality/status`
+- `/v1/heartbeat/status`
+- `/v1/memory/maintenance/status`
 
 ## Status
 

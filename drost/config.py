@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     idle_heartbeat_interval_seconds: int = 1800
     proactive_surfacing_enabled: bool = True
     proactive_followup_cooldown_seconds: int = 6 * 60 * 60
+    quality_reflection_min_samples: int = 5
+    quality_reflection_skip_ratio_threshold: float = 0.60
+    quality_heartbeat_min_samples: int = 3
+    quality_heartbeat_meaningful_ratio_threshold: float = 0.20
+    quality_deploy_canary_recent_window: int = 3
+    quality_deploy_canary_min_samples: int = 3
+    quality_deploy_canary_pass_rate_threshold: float = 0.66
+    quality_deploy_canary_consecutive_ok_threshold: int = 2
 
     session_history_limit: int = 64
 
@@ -217,6 +225,11 @@ class Settings(BaseSettings):
         "idle_active_window_seconds",
         "idle_heartbeat_interval_seconds",
         "proactive_followup_cooldown_seconds",
+        "quality_reflection_min_samples",
+        "quality_heartbeat_min_samples",
+        "quality_deploy_canary_recent_window",
+        "quality_deploy_canary_min_samples",
+        "quality_deploy_canary_consecutive_ok_threshold",
         "context_budget_total_tokens",
         "context_budget_system_tokens",
         "context_budget_history_tokens",
@@ -242,6 +255,9 @@ class Settings(BaseSettings):
         "followup_confidence_threshold",
         "memory_promotion_confidence_threshold",
         "memory_promotion_stability_threshold",
+        "quality_reflection_skip_ratio_threshold",
+        "quality_heartbeat_meaningful_ratio_threshold",
+        "quality_deploy_canary_pass_rate_threshold",
     )
     @classmethod
     def validate_unit_interval_thresholds(cls, value: float) -> float:

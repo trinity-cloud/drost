@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from drost.cognitive_artifacts import CognitiveArtifactStore
 from drost.gateway import Gateway
+from drost.quality_gates import QualityGateEvaluator
 
 
 class _FakeLoopManager:
@@ -115,6 +116,7 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events(tmp_path) ->
     gateway.loop_events = _FakeEvents()
     gateway.cognitive_artifacts = artifacts
     gateway.idle_heartbeat = SimpleNamespace(audit_path=audit_path)
+    gateway.quality_gates = QualityGateEvaluator(tmp_path)
 
     payload = Gateway._runtime_status_payload(gateway)
 
@@ -134,3 +136,4 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events(tmp_path) ->
     assert payload["cognition"]["active_agenda_items"][0]["drive_id"] == "drv_1"
     assert len(payload["cognition"]["recent_heartbeat_decisions"]) == 1
     assert payload["cognition"]["recent_heartbeat_decisions"][0]["audit_id"] == "hba_test"
+    assert payload["quality"]["overall_state"] in {"pending", "fail", "pass"}

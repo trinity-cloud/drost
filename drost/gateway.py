@@ -22,6 +22,7 @@ from drost.loop_manager import LoopManager
 from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
+from drost.quality_gates import QualityGateEvaluator
 from drost.reflection_loop import ReflectionLoop
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
 from drost.shared_mind_state import SharedMindState
@@ -43,6 +44,12 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class PromotionReviewRequest(BaseModel):
+    approved: bool
+    note: str = ""
+    sample_size: int = 0
+
+
 class Gateway:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -60,6 +67,17 @@ class Gateway:
         self.shared_mind_state = SharedMindState(
             settings.workspace_dir,
             cognitive_artifacts=self.cognitive_artifacts,
+        )
+        self.quality_gates = QualityGateEvaluator(
+            settings.workspace_dir,
+            reflection_min_samples=settings.quality_reflection_min_samples,
+            reflection_skip_ratio_threshold=settings.quality_reflection_skip_ratio_threshold,
+            heartbeat_min_samples=settings.quality_heartbeat_min_samples,
+            heartbeat_meaningful_ratio_threshold=settings.quality_heartbeat_meaningful_ratio_threshold,
+            deploy_canary_recent_window=settings.quality_deploy_canary_recent_window,
+            deploy_canary_min_samples=settings.quality_deploy_canary_min_samples,
+            deploy_canary_pass_rate_threshold=settings.quality_deploy_canary_pass_rate_threshold,
+            deploy_canary_consecutive_ok_threshold=settings.quality_deploy_canary_consecutive_ok_threshold,
         )
         self.loop_manager = LoopManager(
             shared_mind_state=self.shared_mind_state,
@@ -210,6 +228,7 @@ class Gateway:
         mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
         events = self.loop_events.status()
         cognition = self._cognition_status_payload(mind=mind, loops=loops)
+        quality = self._quality_status_payload(mind=mind, loops=loops)
         return {
             **loops,
             "mode": str(mind.get("mode") or "active"),
@@ -221,6 +240,7 @@ class Gateway:
             "attention": dict(mind.get("attention") or {}),
             "heartbeat": dict(mind.get("heartbeat") or {}),
             "cognition": cognition,
+            "quality": quality,
             "event_counts": dict(events.get("event_counts") or {}),
             "recent_events": list(events.get("recent_events") or []),
             "subscriber_count": int(events.get("subscriber_count") or 0),
@@ -284,6 +304,26 @@ class Gateway:
             "recent_heartbeat_decisions": heartbeat_decisions,
             "loops": cognitive_loops,
         }
+
+    def _quality_status_payload(
+        self,
+        *,
+        mind: dict[str, Any] | None = None,
+        loops: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mind_state = (
+            dict(mind)
+            if isinstance(mind, dict)
+            else self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+        )
+        loop_status = dict(loops) if isinstance(loops, dict) else self.loop_manager.status()
+        loop_map = loop_status.get("loops") if isinstance(loop_status.get("loops"), dict) else {}
+        reflection_status = dict(loop_map.get("reflection_loop") or {})
+        heartbeat_status = dict(mind_state.get("heartbeat") or {})
+        return self.quality_gates.status(
+            reflection_status=reflection_status,
+            heartbeat_status=heartbeat_status,
+        )
 
     @staticmethod
     def _read_recent_jsonl_dicts(path: Any, *, limit: int) -> list[dict[str, Any]]:
@@ -504,19 +544,46 @@ class Gateway:
         @self.app.get("/v1/mind/status")
         async def mind_status() -> dict[str, Any]:
             self._sync_shared_mind_state()
+            loops = self.loop_manager.status()
             mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
             return {
                 **mind,
-                "cognition": self._cognition_status_payload(mind=mind, loops=self.loop_manager.status()),
+                "cognition": self._cognition_status_payload(mind=mind, loops=loops),
+                "quality": self._quality_status_payload(mind=mind, loops=loops),
             }
 
         @self.app.get("/v1/cognition/status")
         async def cognition_status() -> dict[str, Any]:
             self._sync_shared_mind_state()
-            return self._cognition_status_payload(
-                mind=self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds),
-                loops=self.loop_manager.status(),
+            loops = self.loop_manager.status()
+            mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+            return {
+                **self._cognition_status_payload(mind=mind, loops=loops),
+                "quality": self._quality_status_payload(mind=mind, loops=loops),
+            }
+
+        @self.app.get("/v1/quality/status")
+        async def quality_status() -> dict[str, Any]:
+            self._sync_shared_mind_state()
+            loops = self.loop_manager.status()
+            mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+            return self._quality_status_payload(mind=mind, loops=loops)
+
+        @self.app.post("/v1/quality/promotion-review")
+        async def quality_promotion_review(payload: PromotionReviewRequest) -> dict[str, Any]:
+            self._sync_shared_mind_state()
+            review = self.quality_gates.record_promotion_review(
+                approved=payload.approved,
+                note=payload.note,
+                sample_size=payload.sample_size,
             )
+            loops = self.loop_manager.status()
+            mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+            return {
+                "ok": True,
+                "review": review,
+                "quality": self._quality_status_payload(mind=mind, loops=loops),
+            }
 
         @self.app.post("/v1/canary/deploy")
         async def deploy_canary() -> dict[str, Any]:
