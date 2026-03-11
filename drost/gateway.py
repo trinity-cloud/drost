@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -202,6 +203,7 @@ class Gateway:
         loops = self.loop_manager.status()
         mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
         events = self.loop_events.status()
+        cognition = self._cognition_status_payload(mind=mind, loops=loops)
         return {
             **loops,
             "mode": str(mind.get("mode") or "active"),
@@ -211,12 +213,92 @@ class Gateway:
             "reflection": dict(mind.get("reflection") or {}),
             "agenda": dict(mind.get("agenda") or {}),
             "attention": dict(mind.get("attention") or {}),
+            "heartbeat": dict(mind.get("heartbeat") or {}),
+            "cognition": cognition,
             "event_counts": dict(events.get("event_counts") or {}),
             "recent_events": list(events.get("recent_events") or []),
             "subscriber_count": int(events.get("subscriber_count") or 0),
             "subscriptions": dict(events.get("subscriptions") or {}),
             "total_events_emitted": int(events.get("total_emitted") or 0),
         }
+
+    def _cognition_status_payload(
+        self,
+        *,
+        mind: dict[str, Any] | None = None,
+        loops: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mind_state = (
+            dict(mind)
+            if isinstance(mind, dict)
+            else self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+        )
+        loop_status = dict(loops) if isinstance(loops, dict) else self.loop_manager.status()
+        recent_reflections: list[dict[str, Any]] = []
+        active_agenda_items: list[dict[str, Any]] = []
+        heartbeat_decisions: list[dict[str, Any]] = []
+
+        artifacts = getattr(self, "cognitive_artifacts", None)
+        if artifacts is not None:
+            try:
+                recent_reflections = list(artifacts.list_reflections(limit=5))
+            except Exception:
+                recent_reflections = []
+            try:
+                drive_state = artifacts.load_drive_state()
+                active_agenda_items = [
+                    dict(item)
+                    for item in list(drive_state.get("active_items") or [])[:5]
+                    if isinstance(item, dict)
+                ]
+            except Exception:
+                active_agenda_items = []
+
+        heartbeat_runner = getattr(self, "idle_heartbeat", None)
+        audit_path = getattr(heartbeat_runner, "audit_path", None)
+        if audit_path is not None:
+            heartbeat_decisions = self._read_recent_jsonl_dicts(audit_path, limit=5)
+
+        loop_map = loop_status.get("loops") if isinstance(loop_status.get("loops"), dict) else {}
+        cognitive_loops = {
+            name: dict(loop_map.get(name) or {})
+            for name in ("reflection_loop", "drive_loop", "heartbeat_loop")
+            if dict(loop_map.get(name) or {})
+        }
+
+        return {
+            "summary": {
+                "reflection": dict(mind_state.get("reflection") or {}),
+                "agenda": dict(mind_state.get("agenda") or {}),
+                "attention": dict(mind_state.get("attention") or {}),
+                "heartbeat": dict(mind_state.get("heartbeat") or {}),
+            },
+            "recent_reflections": recent_reflections,
+            "active_agenda_items": active_agenda_items,
+            "recent_heartbeat_decisions": heartbeat_decisions,
+            "loops": cognitive_loops,
+        }
+
+    @staticmethod
+    def _read_recent_jsonl_dicts(path: Any, *, limit: int) -> list[dict[str, Any]]:
+        try:
+            from pathlib import Path
+
+            rows = Path(path).expanduser().read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        out: list[dict[str, Any]] = []
+        for line in rows[-max(1, int(limit)) :]:
+            cleaned = str(line or "").strip()
+            if not cleaned:
+                continue
+            try:
+                payload = json.loads(cleaned)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                out.append(payload)
+        return out
 
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()
@@ -391,7 +473,19 @@ class Gateway:
         @self.app.get("/v1/mind/status")
         async def mind_status() -> dict[str, Any]:
             self._sync_shared_mind_state()
-            return self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+            mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
+            return {
+                **mind,
+                "cognition": self._cognition_status_payload(mind=mind, loops=self.loop_manager.status()),
+            }
+
+        @self.app.get("/v1/cognition/status")
+        async def cognition_status() -> dict[str, Any]:
+            self._sync_shared_mind_state()
+            return self._cognition_status_payload(
+                mind=self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds),
+                loops=self.loop_manager.status(),
+            )
 
         @self.app.get("/v1/heartbeat/status")
         async def heartbeat_status() -> dict[str, Any]:

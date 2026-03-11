@@ -98,7 +98,7 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
 | **[Deployer](docs/deployer.md)** | Supervised runtime, control plane, self-modification |
 | **[Workspace](docs/workspace.md)** | Filesystem layout, bootstrap, prompt assembly |
 | **[Telegram](docs/telegram.md)** | Bot setup, commands, streaming, vision support |
-| **[Observability](docs/observability.md)** | JSONL traces, 20+ API endpoints, event bus |
+| **[Observability](docs/observability.md)** | JSONL traces, cognition/loop/runtime endpoints, event bus |
 
 ## Status
 
