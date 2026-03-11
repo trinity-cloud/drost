@@ -133,6 +133,17 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
                             "source": "sessions/test.jsonl:1",
                         }
                     ],
+                    "promotion_candidates": [
+                        {
+                            "target_file": "MEMORY.md",
+                            "candidate_text": "Drost uses Markdown files as durable canonical memory.",
+                            "kind": "operational_context",
+                            "confidence": 0.98,
+                            "stability": 0.95,
+                            "evidence_refs": ["sessions/test.jsonl:1"],
+                            "why_promotable": "This affects future retrieval and prompt quality.",
+                        }
+                    ],
                 }
             ),
             "# Drost\n\nDrost stores durable memory in Markdown files and reindexes them into SQLite.",
@@ -161,17 +172,23 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
     daily_path = workspace / "memory" / "daily" / "2026-03-07.md"
     fact_path = workspace / "memory" / "entities" / "projects" / "drost" / "items.md"
     summary_path = workspace / "memory" / "entities" / "projects" / "drost" / "summary.md"
+    promoted_memory_path = workspace / "MEMORY.md"
+    promotion_journal_path = workspace / "state" / "promotion-decisions.jsonl"
     state_path = workspace / "state" / "memory-maintenance.json"
 
     assert result["daily_notes_written"] == 1
     assert result["facts_written"] == 1
+    assert result["promotions_written"] == 1
     assert result["summaries_written"] == 1
     assert sync_calls == ["sync"]
     assert daily_path.exists()
     assert fact_path.exists()
     assert summary_path.exists()
+    assert promoted_memory_path.exists()
+    assert promotion_journal_path.exists()
     assert "Markdown files as durable memory" in fact_path.read_text(encoding="utf-8")
     assert "Drost stores durable memory in Markdown files" in summary_path.read_text(encoding="utf-8")
+    assert "Drost uses Markdown files as durable canonical memory." in promoted_memory_path.read_text(encoding="utf-8")
     assert json.loads(state_path.read_text(encoding="utf-8"))["files"]
     payload = json.loads(str(provider.message_calls[0][0].content or ""))
     assert payload["events"]

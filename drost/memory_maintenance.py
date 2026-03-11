@@ -16,6 +16,7 @@ from drost.entity_resolution import EntityResolver
 from drost.followups import FollowUpStore
 from drost.loop_events import EventSubscription, LoopEventBus
 from drost.memory_files import MemoryFiles
+from drost.memory_promotion import MemoryPromotionStore
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,10 @@ class MemoryMaintenanceRunner:
         interval_seconds: int = 1800,
         max_events_per_run: int = 200,
         entity_synthesis_enabled: bool = True,
+        memory_promotion_enabled: bool = True,
+        memory_promotion_interval_seconds: int = 6 * 60 * 60,
+        memory_promotion_confidence_threshold: float = 0.90,
+        memory_promotion_stability_threshold: float = 0.85,
         followups: FollowUpStore | None = None,
         followups_enabled: bool = True,
         followup_confidence_threshold: float = 0.80,
@@ -89,6 +94,11 @@ class MemoryMaintenanceRunner:
         self._max_events_per_run = max(1, int(max_events_per_run))
         self._entity_synthesis_enabled = bool(entity_synthesis_enabled)
         self._memory_files = MemoryFiles(self._workspace_dir)
+        self._promotion_store = MemoryPromotionStore(self._workspace_dir)
+        self._memory_promotion_enabled = bool(memory_promotion_enabled)
+        self._memory_promotion_interval_seconds = max(60, int(memory_promotion_interval_seconds))
+        self._memory_promotion_confidence_threshold = max(0.0, min(1.0, float(memory_promotion_confidence_threshold)))
+        self._memory_promotion_stability_threshold = max(0.0, min(1.0, float(memory_promotion_stability_threshold)))
         self._followups = followups or (FollowUpStore(self._workspace_dir) if followups_enabled else None)
         self._followups_enabled = bool(followups_enabled)
         self._followup_confidence_threshold = max(0.0, min(1.0, float(followup_confidence_threshold)))
@@ -105,6 +115,10 @@ class MemoryMaintenanceRunner:
             "interval_seconds": self._interval_seconds,
             "max_events_per_run": self._max_events_per_run,
             "entity_synthesis_enabled": self._entity_synthesis_enabled,
+            "memory_promotion_enabled": self._memory_promotion_enabled,
+            "memory_promotion_interval_seconds": self._memory_promotion_interval_seconds,
+            "memory_promotion_confidence_threshold": self._memory_promotion_confidence_threshold,
+            "memory_promotion_stability_threshold": self._memory_promotion_stability_threshold,
             "followups_enabled": self._followups_enabled,
             "followup_confidence_threshold": self._followup_confidence_threshold,
             "last_run_at": "",
@@ -218,6 +232,7 @@ class MemoryMaintenanceRunner:
                         "aliases_written": 0,
                         "facts_written": 0,
                         "relations_written": 0,
+                        "promotions_written": 0,
                         "followups_written": 0,
                         "summaries_written": 0,
                         "policy_blocked": str(policy.get("reason") or "policy_blocked"),
@@ -240,6 +255,7 @@ class MemoryMaintenanceRunner:
                     "aliases_written": 0,
                     "facts_written": 0,
                     "relations_written": 0,
+                    "promotions_written": 0,
                     "followups_written": 0,
                     "summaries_written": 0,
                     "sync_result": {"indexed": 0, "skipped": 0, "removed": 0},
@@ -274,6 +290,12 @@ class MemoryMaintenanceRunner:
                 payload.get("relations"),
                 resolver=resolver,
             )
+            promotions_written, touched_promotions = self._write_promotions(
+                payload.get("promotion_candidates"),
+                state=state,
+                reason=reason,
+                at=started_at,
+            )
             followups_written, touched_followups, followup_events = self._write_followups(
                 payload.get("follow_ups"),
                 resolver=resolver,
@@ -292,6 +314,7 @@ class MemoryMaintenanceRunner:
                     *touched_aliases,
                     *touched_facts,
                     *touched_relations,
+                    *touched_promotions,
                     *touched_followups,
                     *touched_summaries,
                 ]
@@ -312,6 +335,7 @@ class MemoryMaintenanceRunner:
                 "aliases_written": aliases_written,
                 "facts_written": facts_written,
                 "relations_written": relations_written,
+                "promotions_written": promotions_written,
                 "followups_written": followups_written,
                 "summaries_written": summaries_written,
                 "touched_paths": sorted(touched_paths),
@@ -587,7 +611,7 @@ class MemoryMaintenanceRunner:
         system = (
             "You are Drost memory extraction. Output ONLY valid JSON. No markdown.\n\n"
             "Goal: convert fresh transcript events into durable memory.\n"
-            "Return an object with exactly six keys:\n"
+            "Return an object with exactly seven keys:\n"
             '  \"daily_notes\": list of {\"date\": \"YYYY-MM-DD\", \"bullets\": [\"...\"]}\n'
             '  \"entities\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"summary_hint\": \"optional\"}\n'
             '  \"aliases\": list of {\"entity_type\": \"...\", \"entity_name\": \"...\", \"alias\": \"...\"}\n'
@@ -598,6 +622,9 @@ class MemoryMaintenanceRunner:
             '"relation_type\": \"...\", \"to_entity_type\": \"...\", \"to_entity_name\": \"...\", '
             '"statement\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
             '"supersedes\": \"optional\"}\n'
+            '  \"promotion_candidates\": list of {\"target_file\": \"USER.md|IDENTITY.md|MEMORY.md\", '
+            '"candidate_text\": \"...\", \"kind\": \"...\", \"confidence\": 0.0, \"stability\": 0.0, '
+            '"evidence_refs\": [\"file:line\"], \"why_promotable\": \"...\"}\n'
             '  \"follow_ups\": list of {\"kind\": \"...\", \"subject\": \"...\", '
             '"entity_refs\": [\"entity_type/entity_name\"], \"source\": \"file:line\", \"source_session_key\": \"optional\", '
             '"source_excerpt\": \"...\", \"follow_up_prompt\": \"...\", \"due_at\": \"ISO-8601 UTC\", '
@@ -610,6 +637,8 @@ class MemoryMaintenanceRunner:
             "- Entity names should be human-readable, not slugified ids.\n"
             "- Aliases should only be written when they add useful alternate surfaces.\n"
             "- Relations should be typed and concrete.\n"
+            "- Promotion candidates should be reserved for durable user preferences, durable agent behavior commitments, or stable shared context that will improve future turns.\n"
+            "- Do not propose promotions for one-off task state, temporary emotions, or routine summaries.\n"
             "- Follow-ups should only be included when there is a concrete future check-in or obligation.\n"
             "- Follow-up prompts should be natural, concise, and specific.\n"
             "- Do not create vague social check-ins with no concrete reason.\n"
@@ -650,6 +679,7 @@ class MemoryMaintenanceRunner:
         payload.setdefault("aliases", [])
         payload.setdefault("facts", [])
         payload.setdefault("relations", [])
+        payload.setdefault("promotion_candidates", [])
         payload.setdefault("follow_ups", [])
         return payload
 
@@ -808,6 +838,95 @@ class MemoryMaintenanceRunner:
                 entities.add(EntityRef(entity_type=result.from_entity_type, entity_id=result.from_entity_id))
         return count, touched, entities
 
+    def _write_promotions(
+        self,
+        promotion_candidates: Any,
+        *,
+        state: dict[str, Any],
+        reason: str,
+        at: str,
+    ) -> tuple[int, set[Path]]:
+        if not self._memory_promotion_enabled or not isinstance(promotion_candidates, list):
+            return 0, set()
+
+        promotion_state = state.setdefault("promotion", {})
+        touched: set[Path] = set()
+        count = 0
+        can_promote = self._promotion_window_open(promotion_state=promotion_state, reason=reason, now=at)
+
+        for item in promotion_candidates:
+            if not isinstance(item, dict):
+                continue
+            target_file = str(item.get("target_file") or "").strip()
+            candidate_text = str(item.get("candidate_text") or "").strip()
+            kind = str(item.get("kind") or "note").strip() or "note"
+            why_promotable = str(item.get("why_promotable") or "").strip()
+            evidence_refs = [
+                str(ref).strip()
+                for ref in list(item.get("evidence_refs") or [])
+                if str(ref).strip()
+            ]
+            try:
+                confidence = float(item["confidence"]) if item.get("confidence") is not None else None
+            except Exception:
+                confidence = None
+            try:
+                stability = float(item["stability"]) if item.get("stability") is not None else None
+            except Exception:
+                stability = None
+
+            decision_reason = ""
+            accepted = False
+            if target_file not in {"USER.md", "IDENTITY.md", "MEMORY.md"}:
+                decision_reason = "unsupported_target"
+            elif not candidate_text:
+                decision_reason = "empty_candidate"
+            elif confidence is None or confidence < self._memory_promotion_confidence_threshold:
+                decision_reason = "low_confidence"
+            elif stability is None or stability < self._memory_promotion_stability_threshold:
+                decision_reason = "low_stability"
+            elif not can_promote:
+                decision_reason = "interval_not_elapsed"
+            else:
+                write_result = self._promotion_store.promote(
+                    target_file=target_file,
+                    candidate_text=candidate_text,
+                    kind=kind,
+                )
+                accepted = bool(write_result.created)
+                decision_reason = write_result.reason
+                if write_result.created:
+                    count += 1
+                    touched.add(write_result.path)
+
+            touched.add(
+                self._promotion_store.record_decision(
+                    target_file=target_file,
+                    candidate_text=candidate_text,
+                    kind=kind,
+                    confidence=confidence,
+                    stability=stability,
+                    evidence_refs=evidence_refs,
+                    why_promotable=why_promotable,
+                    accepted=accepted,
+                    reason=decision_reason,
+                )
+            )
+
+        promotion_state["last_run_at"] = at
+        if can_promote:
+            promotion_state["last_success_at"] = at
+        return count, touched
+
+    def _promotion_window_open(self, *, promotion_state: dict[str, Any], reason: str, now: str) -> bool:
+        if reason == "manual":
+            return True
+        last_success = _parse_time(str(promotion_state.get("last_success_at") or ""))
+        current = _parse_time(now)
+        if last_success is None or current is None:
+            return True
+        return (current - last_success).total_seconds() >= self._memory_promotion_interval_seconds
+
     @staticmethod
     def _resolve_entity_ref_value(value: Any, *, resolver: EntityResolver) -> str | None:
         cleaned = str(value or "").strip()
@@ -921,6 +1040,7 @@ class MemoryMaintenanceRunner:
                 "aliases_written": int(result.get("aliases_written") or 0),
                 "facts_written": int(result.get("facts_written") or 0),
                 "relations_written": int(result.get("relations_written") or 0),
+                "promotions_written": int(result.get("promotions_written") or 0),
                 "followups_written": int(result.get("followups_written") or 0),
                 "summaries_written": int(result.get("summaries_written") or 0),
             },
@@ -1075,3 +1195,16 @@ class MemoryMaintenanceRunner:
                 files_state[file_name] = {"last_line": new_value}
                 changed = True
         return changed
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return None
+    try:
+        if cleaned.endswith("Z"):
+            return datetime.fromisoformat(cleaned.replace("Z", "+00:00")).astimezone(UTC)
+        parsed = datetime.fromisoformat(cleaned)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    except Exception:
+        return None

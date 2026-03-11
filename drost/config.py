@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     memory_maintenance_interval_seconds: int = 1800
     memory_maintenance_max_events_per_run: int = 200
     memory_entity_synthesis_enabled: bool = True
+    memory_promotion_enabled: bool = True
+    memory_promotion_interval_seconds: int = 6 * 60 * 60
+    memory_promotion_confidence_threshold: float = 0.90
+    memory_promotion_stability_threshold: float = 0.85
     memory_continuity_enabled: bool = True
     memory_continuity_auto_on_new: bool = True
     memory_continuity_source_max_messages: int = 120
@@ -202,6 +206,7 @@ class Settings(BaseSettings):
         "agent_max_tool_calls_per_run",
         "memory_maintenance_interval_seconds",
         "memory_maintenance_max_events_per_run",
+        "memory_promotion_interval_seconds",
         "memory_continuity_source_max_messages",
         "memory_continuity_source_max_chars",
         "memory_continuity_summary_max_tokens",
@@ -233,12 +238,16 @@ class Settings(BaseSettings):
             raise ValueError("value must be > 0")
         return float(value)
 
-    @field_validator("followup_confidence_threshold")
+    @field_validator(
+        "followup_confidence_threshold",
+        "memory_promotion_confidence_threshold",
+        "memory_promotion_stability_threshold",
+    )
     @classmethod
-    def validate_followup_confidence_threshold(cls, value: float) -> float:
+    def validate_unit_interval_thresholds(cls, value: float) -> float:
         threshold = float(value)
         if threshold < 0.0 or threshold > 1.0:
-            raise ValueError("followup_confidence_threshold must be in [0, 1]")
+            raise ValueError("threshold must be in [0, 1]")
         return threshold
 
     @field_validator("history_compaction_trigger_ratio")
