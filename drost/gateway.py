@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from drost.agent import AgentRuntime
 from drost.channels import TelegramChannel
+from drost.cognitive_artifacts import CognitiveArtifactStore
 from drost.config import Settings
 from drost.conversation_loop import ConversationLoop
 from drost.embeddings import EmbeddingService
@@ -19,6 +20,7 @@ from drost.loop_manager import LoopManager
 from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
 from drost.providers import build_provider_registry
+from drost.reflection_loop import ReflectionLoop
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
 from drost.shared_mind_state import SharedMindState
 from drost.storage import SQLiteStore
@@ -49,8 +51,12 @@ class Gateway:
         self.providers = build_provider_registry(settings)
         self.embeddings = EmbeddingService(settings)
         self.followups = FollowUpStore(settings.workspace_dir)
+        self.cognitive_artifacts = CognitiveArtifactStore(settings.workspace_dir)
         self.loop_events = LoopEventBus()
-        self.shared_mind_state = SharedMindState(settings.workspace_dir)
+        self.shared_mind_state = SharedMindState(
+            settings.workspace_dir,
+            cognitive_artifacts=self.cognitive_artifacts,
+        )
         self.loop_manager = LoopManager(
             shared_mind_state=self.shared_mind_state,
             active_window_seconds=settings.idle_active_window_seconds,
@@ -123,6 +129,15 @@ class Gateway:
             active_window_seconds=settings.idle_active_window_seconds,
             proactive_cooldown_seconds=settings.proactive_followup_cooldown_seconds,
         )
+        self.reflection_loop = ReflectionLoop(
+            workspace_dir=settings.workspace_dir,
+            sessions_dir=settings.workspace_dir / "sessions",
+            provider_getter=self.providers.get,
+            shared_mind_state=self.shared_mind_state,
+            event_bus=self.loop_events,
+            policy_gate=self.loop_manager.background_policy,
+            artifact_store=self.cognitive_artifacts,
+        )
         self.conversation_loop = ConversationLoop(event_bus=self.loop_events)
         self.loop_manager.register(self.conversation_loop)
         self.loop_manager.register(
@@ -145,6 +160,7 @@ class Gateway:
                 status_fn=self.memory_maintenance.status,
             )
         )
+        self.loop_manager.register(self.reflection_loop)
         self.loop_manager.register(
             ManagedRunnerLoop(
                 name="heartbeat_loop",

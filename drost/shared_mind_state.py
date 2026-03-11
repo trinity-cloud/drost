@@ -10,9 +10,14 @@ from drost.cognitive_artifacts import CognitiveArtifactStore
 
 
 class SharedMindState:
-    def __init__(self, workspace_dir: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_dir: str | Path,
+        *,
+        cognitive_artifacts: CognitiveArtifactStore | None = None,
+    ) -> None:
         self._workspace_dir = Path(workspace_dir).expanduser()
-        self._cognitive_artifacts = CognitiveArtifactStore(self._workspace_dir)
+        self._cognitive_artifacts = cognitive_artifacts or CognitiveArtifactStore(self._workspace_dir)
         self._cognitive_artifacts.ensure_layout()
         self._state = self._load_initial_state()
         self._refresh_cognitive_summary()
