@@ -59,6 +59,7 @@ class PromptAssembler:
         *,
         base_prompt: str,
         memory_block: str = "",
+        cognitive_block: str = "",
         follow_up_block: str = "",
         continuity_summary: str = "",
         history_summary: str = "",
@@ -93,6 +94,9 @@ class PromptAssembler:
 
         if history_summary.strip():
             sections.append(f"[Conversation Summary]\n{history_summary.strip()}")
+
+        if cognitive_block.strip():
+            sections.append(cognitive_block.strip())
 
         if memory_block.strip():
             sections.append(memory_block.strip())

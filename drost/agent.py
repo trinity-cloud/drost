@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from drost.agent_loop import DefaultSingleLoopRunner, internal_loop_tool_names
+from drost.cognitive_artifacts import CognitiveArtifactStore
+from drost.cognitive_summary import CognitiveSummaryBuilder
 from drost.config import Settings
 from drost.context_budget import (
     should_compact_history,
@@ -56,6 +58,11 @@ class AgentRuntime:
         self._embeddings = embeddings
         self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._prompt_assembler = PromptAssembler(settings)
+        self._cognitive_artifacts = CognitiveArtifactStore(settings.workspace_dir)
+        self._cognitive_summary_builder = CognitiveSummaryBuilder(
+            settings,
+            artifact_store=self._cognitive_artifacts,
+        )
         self._session_jsonl = SessionJSONLStore(store_path=settings.workspace_dir / "sessions")
         self._workspace_memory_indexer = WorkspaceMemoryIndexer(
             workspace_dir=settings.workspace_dir,
@@ -430,6 +437,7 @@ class AgentRuntime:
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []
         memory_block = ""
+        cognitive_block = self._cognitive_summary_builder.build(query_text=query_text)
         follow_up_block = self._build_follow_up_block(chat_id=chat_id)
         continuity_summary = self._load_continuity_summary(session_key)
         if self._settings.memory_enabled and query_text:
@@ -495,6 +503,7 @@ class AgentRuntime:
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,
             memory_block=memory_block,
+            cognitive_block=cognitive_block,
             follow_up_block=follow_up_block,
             continuity_summary="" if memory_block else continuity_summary,
             history_summary=history_summary,

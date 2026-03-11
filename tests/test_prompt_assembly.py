@@ -25,6 +25,7 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assembler = PromptAssembler(settings)
     prompt = assembler.assemble(
         base_prompt="Base prompt",
+        cognitive_block="[Recent Reflections]\n- Reflection line\n\n[Current Internal Agenda]\n- Agenda line",
         memory_block="Memory block",
         follow_up_block="[Due Follow-Ups]\n- [id=followup_2026_03_10_0001] (high; surfaced; due=2026-03-10T19:00:00Z) How did the CPAP fitting go?",
         history_summary="Summary block",
@@ -46,6 +47,8 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "User preferences" in prompt
     assert "Extra workspace file" in prompt
     assert "Summary block" in prompt
+    assert "[Recent Reflections]" in prompt
+    assert "Agenda line" in prompt
     assert "Memory block" in prompt
     assert "[Due Follow-Ups]" in prompt
     assert "How did the CPAP fitting go?" in prompt
