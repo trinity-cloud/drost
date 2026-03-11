@@ -29,6 +29,8 @@ Return ONLY valid JSON. No markdown. No prose before or after the JSON.
 
 Output schema:
 {
+  "decision": "write_reflections" | "skip_reflection",
+  "skip_reason": "optional short reason",
   "reflections": [
     {
       "kind": "pattern|tension|insight|unresolved|identity_shift",
@@ -44,7 +46,7 @@ Output schema:
 
 Rules:
 - Return at most 3 reflections.
-- Be selective. If nothing important emerged, return {"reflections":[]}.
+- Be selective. If nothing important emerged, return {"decision":"skip_reflection","skip_reason":"short reason","reflections":[]}.
 - Do not restate raw facts unless they matter as a pattern or tension.
 - Prefer concrete observations tied to recent events.
 - Keep summaries concise and operationally useful.
@@ -109,6 +111,13 @@ class ReflectionLoop(ManagedLoop):
             "last_success_at": "",
             "last_trigger_event": "",
             "last_policy_reason": "",
+            "reflection_write_count": 0,
+            "reflection_skip_count": 0,
+            "consecutive_skip_count": 0,
+            "last_skip_reason": "",
+            "last_evaluated_at": "",
+            "last_source_session_key": "",
+            "last_source_fingerprint": "",
             "last_result": {},
         }
 
@@ -277,9 +286,13 @@ class ReflectionLoop(ManagedLoop):
                         "reflections_written": 0,
                         "policy_blocked": str(policy.get("reason") or "policy_blocked"),
                     }
-                    self._last_status["last_result"] = result
-                    self._last_error = ""
-                    return result
+                    return self._record_skip(
+                        result,
+                        skip_reason=str(policy.get("reason") or "policy_blocked"),
+                        started_at=started_at,
+                        session_key="",
+                        fingerprint="",
+                    )
 
             if reason not in {"manual", "startup"}:
                 last_success = _parse_time(self._last_status.get("last_success_at"))
@@ -291,9 +304,13 @@ class ReflectionLoop(ManagedLoop):
                             "reflections_written": 0,
                             "why": "interval_not_elapsed",
                         }
-                        self._last_status["last_result"] = result
-                        self._last_error = ""
-                        return result
+                        return self._record_skip(
+                            result,
+                            skip_reason="interval_not_elapsed",
+                            started_at=started_at,
+                            session_key="",
+                            fingerprint="",
+                        )
 
             focus = dict(self._shared_mind_state.snapshot().get("focus") or {})
             scope = dict(event_scope or {})
@@ -308,10 +325,34 @@ class ReflectionLoop(ManagedLoop):
                     "reflections_written": 0,
                     "why": "no_recent_transcript",
                 }
-                self._last_status["last_result"] = result
-                self._last_error = ""
-                self._last_status["last_success_at"] = _dump_time(started_at)
-                return result
+                return self._record_skip(
+                    result,
+                    skip_reason="no_recent_transcript",
+                    started_at=started_at,
+                    session_key=session_key,
+                    fingerprint="",
+                )
+
+            transcript_fingerprint = self._transcript_fingerprint(transcript)
+            if self._should_skip_for_unchanged_source(
+                reason=reason,
+                session_key=session_key,
+                transcript_fingerprint=transcript_fingerprint,
+            ):
+                result = {
+                    "reason": reason,
+                    "chat_id": chat_id,
+                    "session_key": session_key,
+                    "reflections_written": 0,
+                    "why": "no_new_signal",
+                }
+                return self._record_skip(
+                    result,
+                    skip_reason="no_new_signal",
+                    started_at=started_at,
+                    session_key=session_key,
+                    fingerprint=transcript_fingerprint,
+                )
 
             try:
                 provider = self._provider_getter()
@@ -340,7 +381,23 @@ class ReflectionLoop(ManagedLoop):
                 self._last_status["last_result"] = result
                 return result
 
+            decision = self._normalize_decision(payload)
             reflections = self._normalize_reflections(payload)
+            if decision["decision"] == "skip_reflection":
+                result = {
+                    "reason": reason,
+                    "chat_id": chat_id,
+                    "session_key": session_key,
+                    "reflections_written": 0,
+                    "why": decision["skip_reason"] or "provider_skip",
+                }
+                return self._record_skip(
+                    result,
+                    skip_reason=decision["skip_reason"] or "provider_skip",
+                    started_at=started_at,
+                    session_key=session_key,
+                    fingerprint=transcript_fingerprint,
+                )
             written_ids: list[str] = []
             for item in reflections[: self._max_reflections_per_run]:
                 try:
@@ -384,8 +441,19 @@ class ReflectionLoop(ManagedLoop):
                 "reflection_ids": written_ids,
                 "why": "ok" if written_ids else "no_reflections",
             }
+            if written_ids:
+                self._last_status["reflection_write_count"] = int(self._last_status.get("reflection_write_count") or 0) + 1
+                self._last_status["consecutive_skip_count"] = 0
+                self._last_status["last_skip_reason"] = ""
+            else:
+                self._last_status["reflection_skip_count"] = int(self._last_status.get("reflection_skip_count") or 0) + 1
+                self._last_status["consecutive_skip_count"] = int(self._last_status.get("consecutive_skip_count") or 0) + 1
+                self._last_status["last_skip_reason"] = "no_reflections"
             self._last_status["last_result"] = result
             self._last_status["last_success_at"] = _dump_time(started_at)
+            self._last_status["last_evaluated_at"] = _dump_time(started_at)
+            self._last_status["last_source_session_key"] = session_key
+            self._last_status["last_source_fingerprint"] = transcript_fingerprint
             self._last_error = ""
             return result
 
@@ -501,6 +569,21 @@ class ReflectionLoop(ManagedLoop):
         payload.setdefault("reflections", [])
         return payload
 
+    @staticmethod
+    def _normalize_decision(payload: dict[str, Any] | None) -> dict[str, str]:
+        if not isinstance(payload, dict):
+            return {"decision": "skip_reflection", "skip_reason": "invalid_payload"}
+        decision = str(payload.get("decision") or "").strip().lower()
+        skip_reason = " ".join(str(payload.get("skip_reason") or "").split()).strip()
+        if decision == "write_reflections":
+            return {"decision": "write_reflections", "skip_reason": ""}
+        if decision == "skip_reflection":
+            return {"decision": "skip_reflection", "skip_reason": skip_reason}
+        reflections = payload.get("reflections")
+        if isinstance(reflections, list) and reflections:
+            return {"decision": "write_reflections", "skip_reason": ""}
+        return {"decision": "skip_reflection", "skip_reason": skip_reason or "no_reflections"}
+
     def _normalize_reflections(self, payload: dict[str, Any] | None) -> list[dict[str, Any]]:
         if not isinstance(payload, dict):
             return []
@@ -537,6 +620,60 @@ class ReflectionLoop(ManagedLoop):
                 }
             )
         return out
+
+    def _should_skip_for_unchanged_source(
+        self,
+        *,
+        reason: str,
+        session_key: str,
+        transcript_fingerprint: str,
+    ) -> bool:
+        if not session_key or not transcript_fingerprint:
+            return False
+        last_session_key = str(self._last_status.get("last_source_session_key") or "")
+        last_fingerprint = str(self._last_status.get("last_source_fingerprint") or "")
+        if session_key != last_session_key or transcript_fingerprint != last_fingerprint:
+            return False
+        if reason in {"manual", "startup"}:
+            return False
+        if reason.startswith("event:"):
+            event_type = reason.split(":", 1)[1]
+            if event_type in {"memory_maintenance_completed", "followup_created", "followup_updated", "continuity_written"}:
+                return False
+        return True
+
+    @staticmethod
+    def _transcript_fingerprint(transcript: list[dict[str, str]]) -> str:
+        if not transcript:
+            return ""
+        normalized = [
+            {
+                "role": str(row.get("role") or "").strip().lower(),
+                "content": " ".join(str(row.get("content") or "").split()).strip(),
+            }
+            for row in transcript
+        ]
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+    def _record_skip(
+        self,
+        result: dict[str, Any],
+        *,
+        skip_reason: str,
+        started_at: datetime,
+        session_key: str,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        self._last_status["reflection_skip_count"] = int(self._last_status.get("reflection_skip_count") or 0) + 1
+        self._last_status["consecutive_skip_count"] = int(self._last_status.get("consecutive_skip_count") or 0) + 1
+        self._last_status["last_skip_reason"] = str(skip_reason or "").strip()
+        self._last_status["last_result"] = dict(result)
+        self._last_status["last_success_at"] = _dump_time(started_at)
+        self._last_status["last_evaluated_at"] = _dump_time(started_at)
+        self._last_status["last_source_session_key"] = session_key
+        self._last_status["last_source_fingerprint"] = fingerprint
+        self._last_error = ""
+        return result
 
     @staticmethod
     def _utc_now() -> str:
