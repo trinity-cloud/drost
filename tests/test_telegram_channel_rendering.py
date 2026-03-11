@@ -326,17 +326,17 @@ async def test_route_context_preserves_streamed_text_when_tool_phase_starts(
 
     await channel._route_context(message, text="hello", media=None)
 
-    assert len(bot.sent) == 2
+    assert len(bot.sent) == 1
     assert bot.sent[0]["text"] == "Working..."
-    assert bot.sent[1]["text"] == "Working..."
 
     html_edits = [edit for edit in bot.edited if edit["parse_mode"] == "HTML"]
-    plain_text_edits = [edit for edit in bot.edited if edit["parse_mode"] is None]
 
     assert any("Brain surgery on yourself." in str(edit["text"]) for edit in html_edits)
-    assert any(str(edit["text"]) == "Using tools: file_write" for edit in plain_text_edits)
     assert any(
-        "Noted. Source code = handle with extreme care." in str(edit["text"]) for edit in html_edits
+        edit["message_id"] == 1
+        and "Brain surgery on yourself." in str(edit["text"])
+        and "Noted. Source code = handle with extreme care." in str(edit["text"])
+        for edit in html_edits
     )
 
 
@@ -362,10 +362,9 @@ async def test_route_context_suppresses_duplicate_final_after_preserved_stream(
 
     await channel._route_context(message, text="hello", media=None)
 
-    assert len(bot.sent) == 2
-    assert any(final_text in str(edit["text"]) for edit in bot.edited)
-    assert bot.deleted
-    assert bot.deleted[-1]["message_id"] == 2
+    assert len(bot.sent) == 1
+    assert any(edit["message_id"] == 1 and final_text in str(edit["text"]) for edit in bot.edited)
+    assert not bot.deleted
 
 
 @pytest.mark.asyncio
@@ -412,16 +411,12 @@ async def test_route_context_coalesces_near_duplicate_final_after_preserved_stre
 
     await channel._route_context(message, text="hello", media=None)
 
-    assert bot.deleted
-    assert bot.deleted[-1]["message_id"] == 2
+    assert len(bot.sent) == 1
+    assert not bot.deleted
     html_edits = [edit for edit in bot.edited if edit["parse_mode"] == "HTML"]
     assert any(
         edit["message_id"] == 1
         and "~200 pmol/L" in str(edit["text"])
         and "Elevated, but not crisis territory." in str(edit["text"])
-        for edit in html_edits
-    )
-    assert not any(
-        edit["message_id"] == 2 and "~200 pmol/L" in str(edit["text"])
         for edit in html_edits
     )

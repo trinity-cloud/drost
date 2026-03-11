@@ -406,6 +406,31 @@ class TelegramChannel(BaseChannel):
         )
         return similarity >= 0.70 and overlap >= 0.72
 
+    @classmethod
+    def _resolve_final_reply_text(cls, draft: str, final: str) -> str:
+        draft_text = str(draft or "").strip()
+        final_text = str(final or "").strip()
+        if not final_text:
+            return draft_text
+        if not draft_text:
+            return final_text
+
+        draft_norm = cls._normalize_reply_for_compare(draft_text)
+        final_norm = cls._normalize_reply_for_compare(final_text)
+        if not draft_norm:
+            return final_text
+        if not final_norm:
+            return draft_text
+        if draft_norm == final_norm:
+            return final_text
+        if cls._should_coalesce_final_reply(draft_text, final_text):
+            return final_text
+        if draft_norm in final_norm:
+            return final_text
+        if final_norm in draft_norm:
+            return draft_text
+        return f"{draft_text}\n\n{final_text}"
+
     async def _build_photo_payload(self, message: TgMessage) -> tuple[str, str, list[dict[str, Any]]]:
         caption = str(message.caption or "").strip()
         if not message.photo:
@@ -664,19 +689,21 @@ class TelegramChannel(BaseChannel):
             "status_text": "Working...",
             "stream_text": "",
             "stream_active": False,
+            "provisional_text": "",
             "last_sent_text": "",
             "last_edit_at": 0.0,
             "flush_task": None,
-            "last_committed_stream_text": "",
-            "last_committed_stream_message_id": 0,
         }
 
         async def _render_locked(*, force: bool) -> None:
-            target = (
-                str(render_state["stream_text"]).strip()
-                if bool(render_state["stream_active"]) and str(render_state["stream_text"]).strip()
-                else str(render_state["status_text"]).strip()
-            )
+            stream_text = str(render_state["stream_text"]).strip()
+            provisional_text = str(render_state["provisional_text"]).strip()
+            if bool(render_state["stream_active"]) and stream_text:
+                target = stream_text
+            elif provisional_text:
+                target = provisional_text
+            else:
+                target = str(render_state["status_text"]).strip()
             if not target:
                 target = "Working..."
             if target == str(render_state["last_sent_text"]):
@@ -710,38 +737,6 @@ class TelegramChannel(BaseChannel):
                     await flush_task
             render_state["flush_task"] = None
 
-        async def _split_stream_segment_locked() -> None:
-            preserved = str(render_state["stream_text"]).strip()
-            if not preserved:
-                render_state["stream_text"] = ""
-                render_state["stream_active"] = False
-                return
-
-            await _cancel_flush_locked()
-            preserved_message_id = int(working_ref["message_id"])
-            await self._finalize_working_message(
-                chat_id=chat_id,
-                message_id=preserved_message_id,
-                text=preserved,
-                reply_to=message.message_id,
-            )
-
-            next_status = str(render_state["status_text"]).strip() or "Working..."
-            next_working = await self.bot.send_message(
-                chat_id,
-                next_status,
-                parse_mode=None,
-            )
-            working_ref["message_id"] = int(next_working.message_id)
-            render_state["status_text"] = next_status
-            render_state["stream_text"] = ""
-            render_state["stream_active"] = False
-            render_state["last_sent_text"] = next_status
-            render_state["last_edit_at"] = 0.0
-            render_state["flush_task"] = None
-            render_state["last_committed_stream_text"] = preserved
-            render_state["last_committed_stream_message_id"] = preserved_message_id
-
         async def _status_callback(status_text: str) -> None:
             cleaned = str(status_text or "").strip()
             if not cleaned:
@@ -757,8 +752,7 @@ class TelegramChannel(BaseChannel):
             async with status_lock:
                 if text is None:
                     if str(render_state["stream_text"]).strip():
-                        await _split_stream_segment_locked()
-                        return
+                        render_state["provisional_text"] = str(render_state["stream_text"]).strip()
                     render_state["stream_active"] = False
                     render_state["stream_text"] = ""
                 else:
@@ -785,29 +779,23 @@ class TelegramChannel(BaseChannel):
         async with status_lock:
             await _cancel_flush_locked()
 
+        draft_text = str(render_state["stream_text"]).strip() or str(render_state["provisional_text"]).strip()
+
         if reply:
-            committed_stream = str(render_state["last_committed_stream_text"]).strip()
-            committed_stream_message_id = int(render_state["last_committed_stream_message_id"] or 0)
-            if committed_stream and str(reply).strip() == committed_stream:
-                await self._delete_message(chat_id, int(working_ref["message_id"]))
-                return
-            if (
-                committed_stream
-                and committed_stream_message_id > 0
-                and self._should_coalesce_final_reply(committed_stream, str(reply))
-            ):
-                await self._finalize_working_message(
-                    chat_id=chat_id,
-                    message_id=committed_stream_message_id,
-                    text=reply,
-                    reply_to=message.message_id,
-                )
-                await self._delete_message(chat_id, int(working_ref["message_id"]))
-                return
+            final_text = self._resolve_final_reply_text(draft_text, str(reply))
             await self._finalize_working_message(
                 chat_id=chat_id,
                 message_id=int(working_ref["message_id"]),
-                text=reply,
+                text=final_text,
+                reply_to=message.message_id,
+            )
+            return
+
+        if draft_text:
+            await self._finalize_working_message(
+                chat_id=chat_id,
+                message_id=int(working_ref["message_id"]),
+                text=draft_text,
                 reply_to=message.message_id,
             )
             return
