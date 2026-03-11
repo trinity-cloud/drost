@@ -366,3 +366,62 @@ async def test_route_context_suppresses_duplicate_final_after_preserved_stream(
     assert any(final_text in str(edit["text"]) for edit in bot.edited)
     assert bot.deleted
     assert bot.deleted[-1]["message_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_route_context_coalesces_near_duplicate_final_after_preserved_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = _FakeBot(token="test-token")
+    channel = _build_channel(monkeypatch, bot)
+    message = _FakeInboundTelegramMessage(chat_id=123, text="hello")
+
+    preserved_text = (
+        "Okay, here's the deal.\n\n"
+        "**Is 191 pmol/L high?**\n\n"
+        "Normal male estradiol reference range is roughly **40-160 pmol/L**. "
+        "Some labs stretch the upper end to 200 pmol/L for men on TRT. "
+        "So you're at 191 - at the top of or slightly above the normal range. "
+        "It's elevated, but not crisis territory.\n\n"
+        "High E2 symptoms you'd normally watch for are water retention, nipple sensitivity, "
+        "mood swings, libido changes, weaker erections, and fatigue."
+    )
+    final_text = (
+        "Okay, here's the deal.\n\n"
+        "**Is 191 pmol/L high?**\n\n"
+        "Normal male estradiol reference range is roughly **40-160 pmol/L**. "
+        "Some labs stretch the upper end to ~200 pmol/L for men on TRT. "
+        "You're at 191 - top of or slightly above the normal range. "
+        "Elevated, but not crisis territory.\n\n"
+        "High E2 symptoms you'd normally watch for are water retention, nipple sensitivity, "
+        "mood swings, libido changes, weaker erections, and fatigue."
+    )
+
+    async def _handler(context: dict[str, object]) -> str:
+        answer_stream_callback = context["answer_stream_callback"]
+        status_callback = context["status_callback"]
+        assert callable(answer_stream_callback)
+        assert callable(status_callback)
+        await answer_stream_callback(preserved_text)
+        await asyncio.sleep(0.4)
+        await answer_stream_callback(None)
+        await status_callback("Using tools: memory_search")
+        return final_text
+
+    channel.set_message_handler(_handler)
+
+    await channel._route_context(message, text="hello", media=None)
+
+    assert bot.deleted
+    assert bot.deleted[-1]["message_id"] == 2
+    html_edits = [edit for edit in bot.edited if edit["parse_mode"] == "HTML"]
+    assert any(
+        edit["message_id"] == 1
+        and "~200 pmol/L" in str(edit["text"])
+        and "Elevated, but not crisis territory." in str(edit["text"])
+        for edit in html_edits
+    )
+    assert not any(
+        edit["message_id"] == 2 and "~200 pmol/L" in str(edit["text"])
+        for edit in html_edits
+    )

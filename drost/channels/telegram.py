@@ -5,9 +5,11 @@ import base64
 import contextlib
 import logging
 import mimetypes
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -368,6 +370,42 @@ class TelegramChannel(BaseChannel):
         filename = f"{int(time.time())}-{message_id}-{unique_id}{suffix}"
         return dest_dir / filename
 
+    @staticmethod
+    def _normalize_reply_for_compare(text: str) -> str:
+        return " ".join(str(text or "").split()).strip()
+
+    @classmethod
+    def _should_coalesce_final_reply(cls, preserved: str, final: str) -> bool:
+        preserved_norm = cls._normalize_reply_for_compare(preserved)
+        final_norm = cls._normalize_reply_for_compare(final)
+        if not preserved_norm or not final_norm:
+            return False
+        if preserved_norm == final_norm:
+            return True
+
+        shorter_len = min(len(preserved_norm), len(final_norm))
+        longer_len = max(len(preserved_norm), len(final_norm))
+        if shorter_len < 240:
+            return False
+
+        length_ratio = shorter_len / longer_len if longer_len else 0.0
+        if length_ratio < 0.72:
+            return False
+
+        similarity = SequenceMatcher(None, preserved_norm, final_norm).ratio()
+        if similarity >= 0.78:
+            return True
+
+        preserved_tokens = set(re.findall(r"[a-z0-9]+", preserved_norm.lower()))
+        final_tokens = set(re.findall(r"[a-z0-9]+", final_norm.lower()))
+        if not preserved_tokens or not final_tokens:
+            return False
+        overlap = len(preserved_tokens & final_tokens) / max(
+            1,
+            min(len(preserved_tokens), len(final_tokens)),
+        )
+        return similarity >= 0.70 and overlap >= 0.72
+
     async def _build_photo_payload(self, message: TgMessage) -> tuple[str, str, list[dict[str, Any]]]:
         caption = str(message.caption or "").strip()
         if not message.photo:
@@ -630,6 +668,7 @@ class TelegramChannel(BaseChannel):
             "last_edit_at": 0.0,
             "flush_task": None,
             "last_committed_stream_text": "",
+            "last_committed_stream_message_id": 0,
         }
 
         async def _render_locked(*, force: bool) -> None:
@@ -679,9 +718,10 @@ class TelegramChannel(BaseChannel):
                 return
 
             await _cancel_flush_locked()
+            preserved_message_id = int(working_ref["message_id"])
             await self._finalize_working_message(
                 chat_id=chat_id,
-                message_id=int(working_ref["message_id"]),
+                message_id=preserved_message_id,
                 text=preserved,
                 reply_to=message.message_id,
             )
@@ -700,6 +740,7 @@ class TelegramChannel(BaseChannel):
             render_state["last_edit_at"] = 0.0
             render_state["flush_task"] = None
             render_state["last_committed_stream_text"] = preserved
+            render_state["last_committed_stream_message_id"] = preserved_message_id
 
         async def _status_callback(status_text: str) -> None:
             cleaned = str(status_text or "").strip()
@@ -746,7 +787,21 @@ class TelegramChannel(BaseChannel):
 
         if reply:
             committed_stream = str(render_state["last_committed_stream_text"]).strip()
+            committed_stream_message_id = int(render_state["last_committed_stream_message_id"] or 0)
             if committed_stream and str(reply).strip() == committed_stream:
+                await self._delete_message(chat_id, int(working_ref["message_id"]))
+                return
+            if (
+                committed_stream
+                and committed_stream_message_id > 0
+                and self._should_coalesce_final_reply(committed_stream, str(reply))
+            ):
+                await self._finalize_working_message(
+                    chat_id=chat_id,
+                    message_id=committed_stream_message_id,
+                    text=reply,
+                    reply_to=message.message_id,
+                )
                 await self._delete_message(chat_id, int(working_ref["message_id"]))
                 return
             await self._finalize_working_message(
