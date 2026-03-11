@@ -250,21 +250,46 @@ def _write_health_server_script(path: Path) -> None:
         "marker.write_text('started', encoding='utf-8')",
         "",
         "class Handler(BaseHTTPRequestHandler):",
-        "    def do_GET(self):",
-        "        if self.path != '/health':",
-        "            self.send_response(404)",
-        "            self.end_headers()",
-        "            return",
-        "        mode = repo_root.joinpath('health.txt').read_text(encoding='utf-8').strip()",
-        "        if mode == 'ok':",
-        "            payload = {'status': 'ok'}",
-        "            self.send_response(200)",
-        "        else:",
-        "            payload = {'status': 'error', 'mode': mode or 'missing'}",
-        "            self.send_response(503)",
+        "    def _mode(self):",
+        "        return repo_root.joinpath('health.txt').read_text(encoding='utf-8').strip()",
+        "",
+        "    def _send_json(self, status, payload):",
+        "        self.send_response(status)",
         "        self.send_header('Content-Type', 'application/json')",
         "        self.end_headers()",
         "        self.wfile.write(json.dumps(payload).encode('utf-8'))",
+        "",
+        "    def do_GET(self):",
+        "        mode = self._mode()",
+        "        if self.path == '/health':",
+        "            if mode == 'ok' or mode == 'runtime_fail' or mode == 'canary_fail':",
+        "                payload = {'status': 'ok'}",
+        "                self._send_json(200, payload)",
+        "            else:",
+        "                payload = {'status': 'error', 'mode': mode or 'missing'}",
+        "                self._send_json(503, payload)",
+        "            return",
+        "        if self.path in {'/v1/loops/status', '/v1/mind/status', '/v1/cognition/status'}:",
+        "            if mode == 'runtime_fail':",
+        "                self._send_json(503, {'ok': False, 'label': 'runtime_surface_failed'})",
+        "            else:",
+        "                self._send_json(200, {'ok': True, 'path': self.path})",
+        "            return",
+        "        self.send_response(404)",
+        "        self.end_headers()",
+        "",
+        "    def do_POST(self):",
+        "        mode = self._mode()",
+        "        if self.path != '/v1/canary/deploy':",
+        "            self.send_response(404)",
+        "            self.end_headers()",
+        "            return",
+        "        if mode == 'ok':",
+        "            self._send_json(200, {'ok': True, 'label': 'ok'})",
+        "        elif mode == 'canary_fail':",
+        "            self._send_json(503, {'ok': False, 'label': 'tool_canary_failed'})",
+        "        else:",
+        "            self._send_json(503, {'ok': False, 'label': 'provider_canary_failed'})",
         "",
         "    def log_message(self, format, *args):",
         "        _ = format, args",
@@ -554,12 +579,14 @@ def test_deployer_rollout_promote_and_deploy_candidate_success(tmp_path: Path) -
         promoted = rollout.promote_current()
         assert promoted["state"] == "healthy"
         assert promoted["known_good_commit"] == stable_commit
+        assert promoted["last_canary_label"] == "ok"
         assert store.read_known_good()["commit"] == stable_commit
 
         deployed = rollout.deploy_candidate(candidate_commit)
         assert deployed["state"] == "healthy"
         assert deployed["active_commit"] == candidate_commit
         assert deployed["known_good_commit"] == candidate_commit
+        assert deployed["last_canary_label"] == "ok"
         assert _git(repo_root, "rev-parse", "HEAD") == candidate_commit
         assert store.read_known_good()["commit"] == candidate_commit
         assert store.read_known_good()["ref_name"] == f"refs/drost/{config.known_good_ref_name}"
@@ -592,6 +619,34 @@ def test_deployer_rollout_failed_candidate_rolls_back_to_known_good(tmp_path: Pa
         assert "rolled back" in str(deployed["last_error"])
         assert _git(repo_root, "rev-parse", "HEAD") == stable_commit
         assert store.read_known_good()["commit"] == stable_commit
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "deploy_candidate_failed_validation" in events
+        assert "rollback_succeeded" in events
+    finally:
+        supervisor.stop_child()
+
+
+def test_deployer_rollout_failed_canary_rolls_back_to_known_good(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    bad_commit = _commit_health_state(repo_root, mode="canary_fail", message="bad-canary")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        deployed = rollout.deploy_candidate(bad_commit)
+        assert deployed["state"] == "healthy"
+        assert deployed["active_commit"] == stable_commit
+        assert deployed["known_good_commit"] == stable_commit
+        assert "tool_canary_failed" in str(deployed["last_error"])
+        assert _git(repo_root, "rev-parse", "HEAD") == stable_commit
 
         events = store.events_path.read_text(encoding="utf-8")
         assert "deploy_candidate_failed_validation" in events

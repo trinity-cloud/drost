@@ -12,7 +12,12 @@ from drost.deployer.git_ops import (
     resolve_ref,
     update_ref,
 )
-from drost.deployer.health import HealthCheckResult, wait_for_health
+from drost.deployer.health import (
+    CanaryCheckResult,
+    HealthCheckResult,
+    run_gateway_canary_suite,
+    wait_for_health,
+)
 from drost.deployer.state import DeployerStateStore
 from drost.deployer.supervisor import DeployerSupervisor
 
@@ -59,6 +64,42 @@ class DeployerRolloutManager:
             }
         )
 
+    def _update_canary_fields(
+        self,
+        status: dict[str, Any],
+        result: CanaryCheckResult,
+        *,
+        clear_error_on_success: bool,
+    ) -> dict[str, Any]:
+        status.update(
+            {
+                "last_canary_checked_at": result.checked_at,
+                "last_canary_phase": result.phase,
+                "last_canary_label": result.label,
+                "last_canary_duration_ms": result.duration_ms,
+            }
+        )
+        if result.ok:
+            status["last_canary_ok_at"] = result.checked_at
+            if clear_error_on_success:
+                status["last_error"] = ""
+        return status
+
+    def _run_validation(self, *, startup_grace_seconds: float) -> tuple[HealthCheckResult, CanaryCheckResult | None]:
+        health_result = wait_for_health(
+            self.store.config.health_url,
+            startup_grace_seconds=startup_grace_seconds,
+            timeout_seconds=self.store.config.health_timeout_seconds,
+            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
+        )
+        if not health_result.ok:
+            return health_result, None
+        canary_result = run_gateway_canary_suite(
+            self.store.config.health_url,
+            timeout_seconds=self.store.config.health_timeout_seconds,
+        )
+        return health_result, canary_result
+
     def _require_clean_worktree(self) -> None:
         if not is_worktree_clean(self.store.config.repo_root):
             raise GitOperationError("repo worktree must be clean for deployer rollout operations")
@@ -70,27 +111,30 @@ class DeployerRolloutManager:
         return self.store.write_status(status)
 
     def healthcheck(self, *, startup_grace_seconds: float | None = None) -> dict[str, Any]:
-        result = wait_for_health(
-            self.store.config.health_url,
+        result, canary = self._run_validation(
             startup_grace_seconds=self.store.config.startup_grace_seconds
             if startup_grace_seconds is None
-            else max(0.0, float(startup_grace_seconds)),
-            timeout_seconds=self.store.config.health_timeout_seconds,
-            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
+            else max(0.0, float(startup_grace_seconds))
         )
         status = self.store.read_status()
         self._update_health_fields(status, result, clear_error_on_success=True)
-        if result.ok and status.get("child_pid"):
+        if canary is not None:
+            self._update_canary_fields(status, canary, clear_error_on_success=True)
+        if result.ok and (canary is None or canary.ok) and status.get("child_pid"):
             status["state"] = "healthy"
         elif not result.ok and not status.get("last_error"):
             status["last_error"] = result.error or "health check failed"
+        elif canary is not None and not canary.ok:
+            status["last_error"] = canary.error or canary.label
         self.store.write_status(status)
         self.store.append_event(
             "health_check_completed",
-            ok=result.ok,
+            ok=result.ok and (canary is None or canary.ok),
             status_code=result.status_code,
-            duration_ms=result.duration_ms,
-            error=result.error,
+            duration_ms=(result.duration_ms + (int(canary.duration_ms) if canary is not None else 0)),
+            error=result.error or (canary.error if canary is not None else ""),
+            canary_phase="" if canary is None else canary.phase,
+            canary_label="" if canary is None else canary.label,
         )
         return self.store.read_status()
 
@@ -102,23 +146,24 @@ class DeployerRolloutManager:
             raise RuntimeError("cannot promote without a supervised child process")
 
         commit = resolve_head_commit(self.store.config.repo_root)
-        result = wait_for_health(
-            self.store.config.health_url,
-            startup_grace_seconds=0.0,
-            timeout_seconds=self.store.config.health_timeout_seconds,
-            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
-        )
+        result, canary = self._run_validation(startup_grace_seconds=0.0)
         status = self.store.read_status()
         self._update_health_fields(status, result, clear_error_on_success=True)
-        if not result.ok:
+        if canary is not None:
+            self._update_canary_fields(status, canary, clear_error_on_success=True)
+        if not result.ok or (canary is not None and not canary.ok):
             status["state"] = "running"
-            status["last_error"] = f"promotion health check failed: {result.error or result.body_excerpt or 'unknown error'}"
+            status["last_error"] = (
+                "promotion validation failed: "
+                f"{(canary.error or canary.label) if canary is not None and not canary.ok else (result.error or result.body_excerpt or 'unknown error')}"
+            )
             self.store.write_status(status)
             self.store.append_event(
                 "promote_current_failed",
                 active_commit=commit,
                 status_code=result.status_code,
-                error=result.error,
+                error=result.error or (canary.error if canary is not None else ""),
+                canary_label="" if canary is None else canary.label,
             )
             return self.store.read_status()
 
@@ -139,9 +184,10 @@ class DeployerRolloutManager:
         self.store.append_event(
             "promote_current_succeeded",
             active_commit=commit,
-            duration_ms=result.duration_ms,
-            status_code=result.status_code,
-        )
+                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
+                status_code=result.status_code,
+                canary_label="" if canary is None else canary.label,
+            )
         return self.store.read_status()
 
     def restart_current(self, *, reason: str = "") -> dict[str, Any]:
@@ -153,25 +199,23 @@ class DeployerRolloutManager:
             reason=reason,
         )
         self.supervisor.restart_child()
-        result = wait_for_health(
-            self.store.config.health_url,
-            startup_grace_seconds=self.store.config.startup_grace_seconds,
-            timeout_seconds=self.store.config.health_timeout_seconds,
-            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
-        )
+        result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
         status = self.store.read_status()
         self._update_health_fields(status, result, clear_error_on_success=False)
+        if canary is not None:
+            self._update_canary_fields(status, canary, clear_error_on_success=False)
         status["active_commit"] = current_commit
 
-        if result.ok:
+        if result.ok and (canary is None or canary.ok):
             status["state"] = "healthy"
             status["last_error"] = ""
             self.store.write_status(status)
             self.store.append_event(
                 "restart_succeeded",
                 active_commit=current_commit,
-                duration_ms=result.duration_ms,
+                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
                 status_code=result.status_code,
+                canary_label="" if canary is None else canary.label,
             )
             return self.store.read_status()
 
@@ -183,13 +227,14 @@ class DeployerRolloutManager:
             active_commit=current_commit,
             rollback_ref=rollback_ref,
             status_code=result.status_code,
-            error=result.error,
+            error=result.error or (canary.error if canary is not None else ""),
+            canary_label="" if canary is None else canary.label,
         )
         if not rollback_ref:
             status["state"] = "degraded"
             status["last_error"] = (
                 f"restart validation failed with no rollback target: "
-                f"{result.error or result.body_excerpt or 'unknown error'}"
+                f"{(canary.error or canary.label) if canary is not None and not canary.ok else (result.error or result.body_excerpt or 'unknown error')}"
             )
             self.store.write_status(status)
             self.store.append_event(
@@ -201,7 +246,7 @@ class DeployerRolloutManager:
             to_ref=rollback_ref,
             reason=(
                 f"restart validation failed on {current_commit}: "
-                f"{result.error or result.body_excerpt or 'unknown error'};"
+                f"{(canary.error or canary.label) if canary is not None and not canary.ok else (result.error or result.body_excerpt or 'unknown error')};"
                 f" rolled back to {rollback_ref}"
             ),
         )
@@ -218,15 +263,12 @@ class DeployerRolloutManager:
         target_commit = resolve_ref(self.store.config.repo_root, target_ref)
         current_commit = resolve_head_commit(self.store.config.repo_root)
         if target_commit == current_commit:
-            result = wait_for_health(
-                self.store.config.health_url,
-                startup_grace_seconds=0.0,
-                timeout_seconds=self.store.config.health_timeout_seconds,
-                poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
-            )
+            result, canary = self._run_validation(startup_grace_seconds=0.0)
             status = self.store.read_status()
             self._update_health_fields(status, result, clear_error_on_success=False)
-            if result.ok:
+            if canary is not None:
+                self._update_canary_fields(status, canary, clear_error_on_success=False)
+            if result.ok and (canary is None or canary.ok):
                 status.update(
                     {
                         "state": "healthy",
@@ -260,19 +302,16 @@ class DeployerRolloutManager:
 
         checkout_ref(self.store.config.repo_root, target_commit)
         self.supervisor.restart_child()
-        result = wait_for_health(
-            self.store.config.health_url,
-            startup_grace_seconds=self.store.config.startup_grace_seconds,
-            timeout_seconds=self.store.config.health_timeout_seconds,
-            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
-        )
+        result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
 
         status = self.store.read_status()
         self._update_health_fields(status, result, clear_error_on_success=False)
+        if canary is not None:
+            self._update_canary_fields(status, canary, clear_error_on_success=False)
         status["active_commit"] = target_commit
         status["known_good_commit"] = str(known_good.get("commit") or target_commit)
 
-        if result.ok:
+        if result.ok and (canary is None or canary.ok):
             status["state"] = "healthy"
             status["last_error"] = reason.strip()
             self.store.write_status(status)
@@ -280,20 +319,23 @@ class DeployerRolloutManager:
                 "rollback_succeeded",
                 target_commit=target_commit,
                 status_code=result.status_code,
-                duration_ms=result.duration_ms,
+                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
+                canary_label="" if canary is None else canary.label,
             )
             return self.store.read_status()
 
         status["state"] = "degraded"
         status["last_error"] = (
-            f"{reason.strip()} rollback validation failed: {result.error or result.body_excerpt or 'unknown error'}"
+            f"{reason.strip()} rollback validation failed: "
+            f"{(canary.error or canary.label) if canary is not None and not canary.ok else (result.error or result.body_excerpt or 'unknown error')}"
         ).strip()
         self.store.write_status(status)
         self.store.append_event(
             "rollback_failed",
             target_commit=target_commit,
             status_code=result.status_code,
-            error=result.error,
+            error=result.error or (canary.error if canary is not None else ""),
+            canary_label="" if canary is None else canary.label,
         )
         return self.store.read_status()
 
@@ -329,21 +371,18 @@ class DeployerRolloutManager:
 
         checkout_ref(self.store.config.repo_root, candidate_commit)
         self.supervisor.restart_child()
-        result = wait_for_health(
-            self.store.config.health_url,
-            startup_grace_seconds=self.store.config.startup_grace_seconds,
-            timeout_seconds=self.store.config.health_timeout_seconds,
-            poll_interval_seconds=min(self.store.config.request_poll_interval_seconds, 0.5),
-        )
+        result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
         status = self.store.read_status()
         self._update_health_fields(status, result, clear_error_on_success=False)
+        if canary is not None:
+            self._update_canary_fields(status, canary, clear_error_on_success=False)
         status["active_commit"] = candidate_commit
 
-        if result.ok:
+        if result.ok and (canary is None or canary.ok):
             self._write_known_good(
                 commit=candidate_commit,
                 notes=f"Candidate {candidate_ref} validated and promoted.",
-                duration_ms=result.duration_ms,
+                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
             )
             status.update(
                 {
@@ -359,7 +398,8 @@ class DeployerRolloutManager:
                 candidate_ref=candidate_ref,
                 candidate_commit=candidate_commit,
                 status_code=result.status_code,
-                duration_ms=result.duration_ms,
+                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
+                canary_label="" if canary is None else canary.label,
             )
             return self.store.read_status()
 
@@ -370,11 +410,12 @@ class DeployerRolloutManager:
             candidate_commit=candidate_commit,
             rollback_ref=rollback_ref,
             status_code=result.status_code,
-            error=result.error,
+            error=result.error or (canary.error if canary is not None else ""),
+            canary_label="" if canary is None else canary.label,
         )
         reason = (
             f"candidate {candidate_ref} ({candidate_commit}) failed validation:"
-            f" {result.error or result.body_excerpt or 'unknown error'};"
+            f" {(canary.error or canary.label) if canary is not None and not canary.ok else (result.error or result.body_excerpt or 'unknown error')};"
             f" rolled back to {rollback_ref}"
         )
         return self.rollback(to_ref=rollback_ref, reason=reason)

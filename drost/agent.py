@@ -92,6 +92,97 @@ class AgentRuntime:
     async def sync_memory_index(self) -> dict[str, int]:
         return await self._workspace_memory_indexer.sync()
 
+    def _build_tool_registry(self, *, chat_id: int, session_key: str):
+        return build_default_registry(
+            settings=self._settings,
+            store=self._store,
+            embeddings=self._embeddings,
+            workspace_memory_indexer=self._workspace_memory_indexer,
+            followups=self._followups,
+            current_chat_id=lambda: chat_id,
+            current_session_key=lambda: session_key,
+        )
+
+    async def run_provider_canary(self) -> dict[str, Any]:
+        provider = self._providers.get()
+        system_prompt = self._prompt_assembler.assemble(
+            base_prompt=SYSTEM_PROMPT,
+            provider_name=provider.name,
+            tool_names=[],
+        )
+        response = await provider.chat(
+            messages=[Message(role=MessageRole.USER, content="Reply with EXACTLY CANARY_OK and nothing else.")],
+            system=system_prompt,
+            max_tokens=32,
+            temperature=0,
+        )
+        content = str(response.message.content or "").strip()
+        ok = content == "CANARY_OK" or "CANARY_OK" in content
+        return {
+            "ok": ok,
+            "provider": provider.name,
+            "model": provider.model,
+            "response": content,
+            "error": "" if ok else "provider canary response mismatch",
+        }
+
+    async def run_tool_canary(self) -> dict[str, Any]:
+        provider = self._providers.get()
+        canary_chat_id = 999_000_001
+        canary_session_key = "canary:deployer"
+        tool_registry = self._build_tool_registry(chat_id=canary_chat_id, session_key=canary_session_key)
+        tool_names = list(dict.fromkeys([*tool_registry.names(), *internal_loop_tool_names()]))
+        system_prompt = self._prompt_assembler.assemble(
+            base_prompt=SYSTEM_PROMPT,
+            provider_name=provider.name,
+            tool_names=tool_names,
+        )
+        runner = DefaultSingleLoopRunner(
+            provider=provider,
+            tool_registry=tool_registry,
+            settings=self._settings,
+        )
+        run = await runner.run_turn(
+            messages=[
+                Message(
+                    role=MessageRole.USER,
+                    content=(
+                        "Call session_status exactly once. "
+                        "After the tool result, reply with EXACTLY CANARY_TOOL_OK and nothing else."
+                    ),
+                )
+            ],
+            system_prompt=system_prompt,
+        )
+        final_text = str(run.final_text or "").strip()
+        ok = run.tool_calls >= 1 and (final_text == "CANARY_TOOL_OK" or "CANARY_TOOL_OK" in final_text)
+        return {
+            "ok": ok,
+            "provider": provider.name,
+            "model": provider.model,
+            "final_text": final_text,
+            "tool_calls": int(run.tool_calls),
+            "iterations": int(run.iterations),
+            "error": "" if ok else str(run.provider_error or "tool canary failed"),
+        }
+
+    async def run_deploy_canary(self) -> dict[str, Any]:
+        provider_result = await self.run_provider_canary()
+        if not bool(provider_result.get("ok")):
+            return {
+                "ok": False,
+                "label": "provider_canary_failed",
+                "provider": provider_result,
+                "tool": {},
+            }
+        tool_result = await self.run_tool_canary()
+        return {
+            "ok": bool(tool_result.get("ok")),
+            "label": "ok" if bool(tool_result.get("ok")) else "tool_canary_failed",
+            "provider": provider_result,
+            "tool": tool_result,
+        }
+
     @staticmethod
     def _message_role(value: str) -> MessageRole:
         cleaned = (value or "").strip().lower()
@@ -490,15 +581,7 @@ class AgentRuntime:
             )
         )
 
-        tool_registry = build_default_registry(
-            settings=self._settings,
-            store=self._store,
-            embeddings=self._embeddings,
-            workspace_memory_indexer=self._workspace_memory_indexer,
-            followups=self._followups,
-            current_chat_id=lambda: chat_id,
-            current_session_key=lambda: session_key,
-        )
+        tool_registry = self._build_tool_registry(chat_id=chat_id, session_key=session_key)
         tool_names = list(dict.fromkeys([*tool_registry.names(), *internal_loop_tool_names()]))
         system_prompt = self._prompt_assembler.assemble(
             base_prompt=SYSTEM_PROMPT,

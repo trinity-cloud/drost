@@ -518,6 +518,13 @@ class Gateway:
                 loops=self.loop_manager.status(),
             )
 
+        @self.app.post("/v1/canary/deploy")
+        async def deploy_canary() -> dict[str, Any]:
+            result = await self.agent.run_deploy_canary()
+            if not bool(result.get("ok")):
+                raise HTTPException(status_code=503, detail=result)
+            return result
+
         @self.app.get("/v1/heartbeat/status")
         async def heartbeat_status() -> dict[str, Any]:
             return self.idle_heartbeat.status()
