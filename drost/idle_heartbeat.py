@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _JSON_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?|\n?```$", re.MULTILINE)
 _ALLOWED_DECISIONS = {"noop", "surface_follow_up", "snooze_follow_up", "mark_expired"}
+_TRIVIAL_IGNORE_REASONS = {"active_mode", "interval_not_elapsed", "no_due_followups"}
 _HEARTBEAT_SYSTEM_PROMPT = """You are the Drost idle heartbeat decision engine.
 
 You are reviewing due follow-ups while the user is idle.
@@ -111,6 +112,16 @@ class IdleHeartbeatRunner:
             "last_policy_reason": "",
             "heartbeat_audit_path": str(self.audit_path),
             "last_audit_id": "",
+            "last_meaningful_audit_id": "",
+            "last_meaningful_decision_at": "",
+            "last_meaningful_decision": "",
+            "last_meaningful_reason": "",
+            "surface_count": 0,
+            "suppress_count": 0,
+            "ignore_count": 0,
+            "noop_active_mode_count": 0,
+            "noop_interval_count": 0,
+            "noop_no_due_count": 0,
         }
 
     @property
@@ -747,8 +758,27 @@ class IdleHeartbeatRunner:
         reflections: list[dict[str, Any]] | None = None,
         at: datetime | None = None,
     ) -> dict[str, Any]:
+        classification = self._classify_result(result=result)
+        result["decision_class"] = classification["decision_class"]
+        result["importance"] = classification["importance"]
+        result["meaningful"] = classification["meaningful"]
         self._last_status["last_result"] = result
         self._last_status["last_error"] = str(result.get("error") or "")
+        self._last_status["last_success_at"] = _dump_time(at or datetime.now(UTC))
+        decision_class = str(classification.get("decision_class") or "")
+        if decision_class == "surface":
+            self._last_status["surface_count"] = int(self._last_status.get("surface_count") or 0) + 1
+        elif decision_class == "suppress":
+            self._last_status["suppress_count"] = int(self._last_status.get("suppress_count") or 0) + 1
+        else:
+            self._last_status["ignore_count"] = int(self._last_status.get("ignore_count") or 0) + 1
+        aggregate_counter = str(classification.get("aggregate_counter") or "")
+        if aggregate_counter == "active_mode":
+            self._last_status["noop_active_mode_count"] = int(self._last_status.get("noop_active_mode_count") or 0) + 1
+        elif aggregate_counter == "interval_not_elapsed":
+            self._last_status["noop_interval_count"] = int(self._last_status.get("noop_interval_count") or 0) + 1
+        elif aggregate_counter == "no_due_followups":
+            self._last_status["noop_no_due_count"] = int(self._last_status.get("noop_no_due_count") or 0) + 1
         audit_id = self._append_audit(
             result=result,
             idle_state=idle_state,
@@ -756,15 +786,29 @@ class IdleHeartbeatRunner:
             drive_state=drive_state or {},
             reflections=reflections or [],
             at=at,
+            meaningful=bool(classification.get("meaningful")),
         )
         result["audit_id"] = audit_id
-        self._last_status["last_audit_id"] = audit_id
+        if audit_id:
+            self._last_status["last_audit_id"] = audit_id
+        if bool(classification.get("meaningful")):
+            self._last_status["last_meaningful_decision_at"] = _dump_time(at or datetime.now(UTC))
+            self._last_status["last_meaningful_decision"] = str(result.get("decision") or "")
+            self._last_status["last_meaningful_reason"] = str(
+                result.get("suppression_reason") or result.get("why") or result.get("reason") or ""
+            )
+            if audit_id:
+                self._last_status["last_meaningful_audit_id"] = audit_id
         self._idle_state.note_heartbeat_decision(
             decision=str(result.get("decision") or ""),
             reason=str(result.get("suppression_reason") or result.get("why") or result.get("reason") or ""),
             follow_up_id=str(result.get("follow_up_id") or ""),
             audit_id=audit_id,
             trigger_reason=str(result.get("reason") or ""),
+            decision_class=decision_class,
+            importance=str(classification.get("importance") or ""),
+            meaningful=bool(classification.get("meaningful")),
+            aggregate_counter=aggregate_counter,
             at=at,
         )
         return result
@@ -778,7 +822,10 @@ class IdleHeartbeatRunner:
         drive_state: dict[str, Any],
         reflections: list[dict[str, Any]],
         at: datetime | None,
+        meaningful: bool,
     ) -> str:
+        if not meaningful:
+            return ""
         state = idle_state or {}
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         audit_id = f"hba_{uuid.uuid4().hex[:12]}"
@@ -786,6 +833,8 @@ class IdleHeartbeatRunner:
             "audit_id": audit_id,
             "timestamp": _dump_time(at or datetime.now(UTC)),
             "decision": str(result.get("decision") or ""),
+            "decision_class": str(result.get("decision_class") or ""),
+            "importance": str(result.get("importance") or ""),
             "reason": str(result.get("reason") or ""),
             "why": str(result.get("why") or ""),
             "suppression_reason": str(result.get("suppression_reason") or ""),
@@ -812,6 +861,8 @@ class IdleHeartbeatRunner:
     def _emit_heartbeat_decision(self, result: dict[str, Any]) -> None:
         if self._event_bus is None:
             return
+        if str(result.get("importance") or "normal").strip().lower() == "low":
+            return
         current_state = self._idle_state.status(active_window_seconds=self._active_window_seconds)
         self._event_bus.emit(
             "heartbeat_decision_made",
@@ -821,6 +872,40 @@ class IdleHeartbeatRunner:
             },
             payload=dict(result),
         )
+
+    @staticmethod
+    def _classify_result(*, result: dict[str, Any]) -> dict[str, Any]:
+        decision = str(result.get("decision") or "").strip().lower()
+        reason = str(result.get("suppression_reason") or result.get("why") or result.get("reason") or "").strip().lower()
+        follow_up_id = str(result.get("follow_up_id") or "").strip()
+
+        if decision == "surface_follow_up":
+            return {
+                "decision_class": "surface",
+                "importance": "high",
+                "meaningful": True,
+                "aggregate_counter": "",
+            }
+        if decision in {"snooze_follow_up", "mark_expired"}:
+            return {
+                "decision_class": "suppress",
+                "importance": "normal",
+                "meaningful": True,
+                "aggregate_counter": "",
+            }
+        if decision == "noop" and not follow_up_id and reason in _TRIVIAL_IGNORE_REASONS:
+            return {
+                "decision_class": "ignore",
+                "importance": "low",
+                "meaningful": False,
+                "aggregate_counter": reason,
+            }
+        return {
+            "decision_class": "suppress" if decision == "noop" else "ignore",
+            "importance": "normal",
+            "meaningful": True,
+            "aggregate_counter": "",
+        }
 
     def _emit_followup_updated(self, followup: dict[str, Any], *, source: str) -> None:
         if self._event_bus is None:

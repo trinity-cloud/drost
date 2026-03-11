@@ -91,7 +91,20 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events(tmp_path) ->
     audit_path = tmp_path / "state" / "heartbeat-decisions.jsonl"
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(
-        json.dumps({"audit_id": "hba_test", "decision": "noop", "reason": "active_mode"}) + "\n",
+        (
+            json.dumps({"audit_id": "hba_old", "decision": "noop", "reason": "active_mode"})
+            + "\n"
+            + json.dumps(
+                {
+                    "audit_id": "hba_test",
+                    "decision": "noop",
+                    "decision_class": "suppress",
+                    "importance": "normal",
+                    "reason": "drive_prefers_hold",
+                }
+            )
+            + "\n"
+        ),
         encoding="utf-8",
     )
 
@@ -119,4 +132,5 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events(tmp_path) ->
     assert payload["subscriber_count"] == 3
     assert payload["cognition"]["recent_reflections"][0]["reflection_id"] == "refl_a"
     assert payload["cognition"]["active_agenda_items"][0]["drive_id"] == "drv_1"
+    assert len(payload["cognition"]["recent_heartbeat_decisions"]) == 1
     assert payload["cognition"]["recent_heartbeat_decisions"][0]["audit_id"] == "hba_test"

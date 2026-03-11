@@ -29,6 +29,9 @@ def test_shared_mind_state_persists_focus_and_activity_across_reload(tmp_path: P
         follow_up_id="followup_1",
         audit_id="hba_test",
         trigger_reason="manual",
+        decision_class="suppress",
+        importance="normal",
+        meaningful=True,
         at=start + timedelta(minutes=35),
     )
     state.set_loop_states({"heartbeat_loop": {"state": "running"}})
@@ -42,6 +45,10 @@ def test_shared_mind_state_persists_focus_and_activity_across_reload(tmp_path: P
     assert snapshot["loop_state"]["heartbeat_loop"]["state"] == "running"
     assert snapshot["heartbeat"]["last_decision"] == "noop"
     assert snapshot["heartbeat"]["last_audit_id"] == "hba_test"
+    assert snapshot["heartbeat"]["last_decision_class"] == "suppress"
+    assert snapshot["heartbeat"]["last_importance"] == "normal"
+    assert snapshot["heartbeat"]["last_meaningful_decision"] == "noop"
+    assert snapshot["heartbeat"]["suppress_count"] == 1
     assert reloaded.path.exists()
 
 

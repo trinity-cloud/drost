@@ -29,6 +29,8 @@ from drost.storage import SQLiteStore
 
 logger = logging.getLogger(__name__)
 
+_TRIVIAL_HEARTBEAT_REASONS = {"active_mode", "interval_not_elapsed", "no_due_followups"}
+
 
 class ProviderSelectRequest(BaseModel):
     provider: str
@@ -257,7 +259,7 @@ class Gateway:
         heartbeat_runner = getattr(self, "idle_heartbeat", None)
         audit_path = getattr(heartbeat_runner, "audit_path", None)
         if audit_path is not None:
-            heartbeat_decisions = self._read_recent_jsonl_dicts(audit_path, limit=5)
+            heartbeat_decisions = self._read_recent_heartbeat_decisions(audit_path, limit=5)
 
         loop_map = loop_status.get("loops") if isinstance(loop_status.get("loops"), dict) else {}
         cognitive_loops = {
@@ -299,6 +301,31 @@ class Gateway:
             if isinstance(payload, dict):
                 out.append(payload)
         return out
+
+    @classmethod
+    def _read_recent_heartbeat_decisions(cls, path: Any, *, limit: int) -> list[dict[str, Any]]:
+        rows = cls._read_recent_jsonl_dicts(path, limit=max(10, int(limit) * 10))
+        meaningful: list[dict[str, Any]] = []
+        for payload in reversed(rows):
+            if cls._is_meaningful_heartbeat_payload(payload):
+                meaningful.append(payload)
+            if len(meaningful) >= max(1, int(limit)):
+                break
+        meaningful.reverse()
+        return meaningful
+
+    @staticmethod
+    def _is_meaningful_heartbeat_payload(payload: dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        importance = str(payload.get("importance") or "").strip().lower()
+        if importance == "low":
+            return False
+        decision = str(payload.get("decision") or "").strip().lower()
+        reason = str(
+            payload.get("suppression_reason") or payload.get("why") or payload.get("reason") or ""
+        ).strip().lower()
+        return not (decision == "noop" and reason in _TRIVIAL_HEARTBEAT_REASONS)
 
     async def _handle_telegram_message(self, context: dict[str, Any]) -> str | None:
         text = str(context.get("text") or "").strip()

@@ -79,6 +79,10 @@ class IdleStateStore:
         follow_up_id: str = "",
         audit_id: str = "",
         trigger_reason: str = "",
+        decision_class: str = "",
+        importance: str = "",
+        meaningful: bool = True,
+        aggregate_counter: str = "",
         at: datetime | None = None,
     ) -> dict[str, Any]:
         return self._shared.note_heartbeat_decision(
@@ -87,6 +91,10 @@ class IdleStateStore:
             follow_up_id=follow_up_id,
             audit_id=audit_id,
             trigger_reason=trigger_reason,
+            decision_class=decision_class,
+            importance=importance,
+            meaningful=meaningful,
+            aggregate_counter=aggregate_counter,
             at=at,
         )
 

@@ -112,17 +112,60 @@ class SharedMindState:
         follow_up_id: str = "",
         audit_id: str = "",
         trigger_reason: str = "",
+        decision_class: str = "",
+        importance: str = "",
+        meaningful: bool = True,
+        aggregate_counter: str = "",
         at: datetime | None = None,
     ) -> dict[str, Any]:
         moment = at or _utc_now()
-        self._state["heartbeat"] = {
+        current = dict(self._state.get("heartbeat") or {})
+        heartbeat = {
             "last_decision_at": _dump_time(moment),
             "last_decision": str(decision or "").strip(),
             "last_reason": str(reason or "").strip(),
             "last_follow_up_id": str(follow_up_id or "").strip(),
-            "last_audit_id": str(audit_id or "").strip(),
+            "last_audit_id": str(audit_id or current.get("last_audit_id") or "").strip(),
             "last_trigger_reason": str(trigger_reason or "").strip(),
+            "last_decision_class": str(decision_class or "").strip(),
+            "last_importance": str(importance or "").strip(),
+            "last_meaningful_decision_at": str(current.get("last_meaningful_decision_at") or ""),
+            "last_meaningful_decision": str(current.get("last_meaningful_decision") or ""),
+            "last_meaningful_reason": str(current.get("last_meaningful_reason") or ""),
+            "last_meaningful_follow_up_id": str(current.get("last_meaningful_follow_up_id") or ""),
+            "last_meaningful_audit_id": str(current.get("last_meaningful_audit_id") or ""),
+            "surface_count": int(current.get("surface_count") or 0),
+            "suppress_count": int(current.get("suppress_count") or 0),
+            "ignore_count": int(current.get("ignore_count") or 0),
+            "noop_active_mode_count": int(current.get("noop_active_mode_count") or 0),
+            "noop_interval_count": int(current.get("noop_interval_count") or 0),
+            "noop_no_due_count": int(current.get("noop_no_due_count") or 0),
         }
+        normalized_class = str(decision_class or "").strip().lower()
+        if normalized_class == "surface":
+            heartbeat["surface_count"] = int(heartbeat["surface_count"]) + 1
+        elif normalized_class == "suppress":
+            heartbeat["suppress_count"] = int(heartbeat["suppress_count"]) + 1
+        else:
+            heartbeat["ignore_count"] = int(heartbeat["ignore_count"]) + 1
+
+        counter_key = str(aggregate_counter or "").strip().lower()
+        if counter_key == "active_mode":
+            heartbeat["noop_active_mode_count"] = int(heartbeat["noop_active_mode_count"]) + 1
+        elif counter_key == "interval_not_elapsed":
+            heartbeat["noop_interval_count"] = int(heartbeat["noop_interval_count"]) + 1
+        elif counter_key == "no_due_followups":
+            heartbeat["noop_no_due_count"] = int(heartbeat["noop_no_due_count"]) + 1
+
+        if meaningful:
+            heartbeat["last_meaningful_decision_at"] = _dump_time(moment)
+            heartbeat["last_meaningful_decision"] = str(decision or "").strip()
+            heartbeat["last_meaningful_reason"] = str(reason or "").strip()
+            heartbeat["last_meaningful_follow_up_id"] = str(follow_up_id or "").strip()
+            if audit_id:
+                heartbeat["last_meaningful_audit_id"] = str(audit_id).strip()
+
+        self._state["heartbeat"] = heartbeat
         self._state["updated_at"] = _dump_time(moment)
         self._save()
         return self.snapshot()
@@ -330,6 +373,19 @@ class SharedMindState:
                 "last_follow_up_id": str(heartbeat.get("last_follow_up_id") or ""),
                 "last_audit_id": str(heartbeat.get("last_audit_id") or ""),
                 "last_trigger_reason": str(heartbeat.get("last_trigger_reason") or ""),
+                "last_decision_class": str(heartbeat.get("last_decision_class") or ""),
+                "last_importance": str(heartbeat.get("last_importance") or ""),
+                "last_meaningful_decision_at": str(heartbeat.get("last_meaningful_decision_at") or ""),
+                "last_meaningful_decision": str(heartbeat.get("last_meaningful_decision") or ""),
+                "last_meaningful_reason": str(heartbeat.get("last_meaningful_reason") or ""),
+                "last_meaningful_follow_up_id": str(heartbeat.get("last_meaningful_follow_up_id") or ""),
+                "last_meaningful_audit_id": str(heartbeat.get("last_meaningful_audit_id") or ""),
+                "surface_count": int(heartbeat.get("surface_count") or 0),
+                "suppress_count": int(heartbeat.get("suppress_count") or 0),
+                "ignore_count": int(heartbeat.get("ignore_count") or 0),
+                "noop_active_mode_count": int(heartbeat.get("noop_active_mode_count") or 0),
+                "noop_interval_count": int(heartbeat.get("noop_interval_count") or 0),
+                "noop_no_due_count": int(heartbeat.get("noop_no_due_count") or 0),
             },
             "updated_at": str(raw.get("updated_at") or ""),
         }
@@ -415,6 +471,19 @@ class SharedMindState:
                 "last_follow_up_id": "",
                 "last_audit_id": "",
                 "last_trigger_reason": "",
+                "last_decision_class": "",
+                "last_importance": "",
+                "last_meaningful_decision_at": "",
+                "last_meaningful_decision": "",
+                "last_meaningful_reason": "",
+                "last_meaningful_follow_up_id": "",
+                "last_meaningful_audit_id": "",
+                "surface_count": 0,
+                "suppress_count": 0,
+                "ignore_count": 0,
+                "noop_active_mode_count": 0,
+                "noop_interval_count": 0,
+                "noop_no_due_count": 0,
             },
             "updated_at": "",
         }

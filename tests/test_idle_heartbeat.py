@@ -426,16 +426,67 @@ async def test_idle_heartbeat_writes_audit_and_shared_state_on_noop(tmp_path: Pa
     result = await runner.run_once(reason="manual", now=now)
 
     assert result["decision"] == "noop"
+    assert result["decision_class"] == "suppress"
+    assert result["importance"] == "normal"
     assert sent == []
     audit_lines = runner.audit_path.read_text(encoding="utf-8").splitlines()
     assert audit_lines
     audit = json.loads(audit_lines[-1])
     assert audit["decision"] == "noop"
+    assert audit["decision_class"] == "suppress"
+    assert audit["importance"] == "normal"
     assert audit["reason"] == "drive says wait"
     shared = idle_state.shared_mind_state.snapshot()
     assert shared["heartbeat"]["last_decision"] == "noop"
     assert shared["heartbeat"]["last_follow_up_id"] == ""
     assert shared["heartbeat"]["last_audit_id"] == audit["audit_id"]
+    assert shared["heartbeat"]["last_meaningful_decision"] == "noop"
+    assert shared["heartbeat"]["suppress_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_heartbeat_aggregates_trivial_interval_noop_without_audit_or_event(tmp_path: Path) -> None:
+    followups = FollowUpStore(tmp_path)
+    idle_state = IdleStateStore(tmp_path)
+    bus = LoopEventBus()
+    now = datetime(2026, 3, 9, 12, 0, tzinfo=UTC)
+    sent: list[tuple[int, str]] = []
+
+    idle_state.mark_user_message(chat_id=8271705169, at=now - timedelta(hours=2))
+    idle_state.note_heartbeat(at=now - timedelta(minutes=5))
+
+    runner = IdleHeartbeatRunner(
+        workspace_dir=tmp_path,
+        followups=followups,
+        idle_state=idle_state,
+        send_message=lambda chat_id, message: _record_send(sent, chat_id, message),
+        event_bus=bus,
+        enabled=True,
+        proactive_enabled=True,
+        interval_seconds=1800,
+        active_window_seconds=20 * 60,
+        proactive_cooldown_seconds=3600,
+    )
+
+    result = await runner.run_once(reason="tick", now=now)
+
+    assert result["decision"] == "noop"
+    assert result["why"] == "interval_not_elapsed"
+    assert result["decision_class"] == "ignore"
+    assert result["importance"] == "low"
+    assert result["audit_id"] == ""
+    assert sent == []
+    assert not runner.audit_path.exists()
+
+    shared = idle_state.shared_mind_state.snapshot()
+    assert shared["heartbeat"]["ignore_count"] == 1
+    assert shared["heartbeat"]["noop_interval_count"] == 1
+    assert shared["heartbeat"]["last_decision"] == "noop"
+    assert shared["heartbeat"]["last_audit_id"] == ""
+    assert shared["heartbeat"]["last_meaningful_decision"] == ""
+
+    status = bus.status()
+    assert status["event_counts"].get("heartbeat_decision_made", 0) == 0
 
 
 @pytest.mark.asyncio
