@@ -45,29 +45,155 @@ Drost is neither. It's a **complete personal agent runtime** you can deploy toda
 
 ## Quick Start
 
+### 1. Prerequisites
+
+You need:
+
+- Python `3.11+`
+- [`uv`](https://docs.astral.sh/uv/)
+- a Telegram bot token from `@BotFather`
+- `GEMINI_API_KEY` for embeddings
+- one provider configured for actual model calls:
+  - OpenAI/Codex OAuth, or
+  - Anthropic API key, or
+  - xAI API key
+
+### 2. Clone and install
+
 ```bash
 git clone https://github.com/your-org/drost.git && cd drost
 uv sync --extra dev
 cp .env.example .env
 ```
 
-Add your tokens to `.env`:
+### 3. Configure `.env`
+
+The `.env` file lives in the **project repo**, not in `~/.drost`.
+
+At minimum, set:
 
 ```env
-DROST_TELEGRAM_BOT_TOKEN=...       # from @BotFather
-GEMINI_API_KEY=...                 # for embeddings
+DROST_TELEGRAM_BOT_TOKEN=...    # from @BotFather
+GEMINI_API_KEY=...              # required for memory embeddings
 DROST_DEFAULT_PROVIDER=openai-codex
 ```
 
-Run:
+Then configure one provider.
+
+For `openai-codex`:
+
+```env
+DROST_DEFAULT_PROVIDER=openai-codex
+# Usually no API key needed if Codex OAuth auth already exists at ~/.codex/auth.json
+# Optional override:
+# DROST_OPENAI_CODEX_AUTH_PATH=~/.codex/auth.json
+```
+
+For `anthropic`:
+
+```env
+DROST_DEFAULT_PROVIDER=anthropic
+DROST_ANTHROPIC_TOKEN=...
+```
+
+For `xai`:
+
+```env
+DROST_DEFAULT_PROVIDER=xai
+DROST_XAI_API_KEY=...
+```
+
+### 4. Start Drost
 
 ```bash
 uv run drost
 ```
 
-Open Telegram. Talk to your bot. That's it.
+This is the normal startup path.
 
-> On first boot, Drost bootstraps itself — it'll ask a few questions to establish its identity and learn about you.
+It starts:
+
+- the deployer control plane
+- the Drost gateway as a supervised child
+- Telegram polling
+- background loops for maintenance, reflection, drive, heartbeat, and continuity
+
+### 5. What happens on first boot
+
+On first startup, Drost creates `~/.drost` automatically.
+
+That workspace becomes the agent's durable home and contains:
+
+- `SOUL.md`
+- `IDENTITY.md`
+- `USER.md`
+- `MEMORY.md`
+- `AGENTS.md`
+- `TOOLS.md`
+- `HEARTBEAT.md`
+- session logs, traces, memory files, follow-ups, and deployer state
+
+If this is a brand-new workspace, Drost bootstraps itself and starts learning who it is and who you are.
+
+### 6. Talk to the bot
+
+Open Telegram and send a message to your bot.
+
+Good first checks:
+
+- send `/start`
+- send `Yo`
+- send a photo with a caption
+- create a new session with `/new`
+
+### 7. Verify the runtime
+
+Once Drost is running, you can verify the gateway locally:
+
+```bash
+curl http://127.0.0.1:8766/health
+curl http://127.0.0.1:8766/v1/providers
+curl http://127.0.0.1:8766/v1/loops/status
+```
+
+You should see:
+
+- `{"status":"ok"}` from `/health`
+- your configured provider in `/v1/providers`
+- the managed loop runtime in `/v1/loops/status`
+
+### 8. Useful run modes
+
+Normal supervised mode:
+
+```bash
+uv run drost
+```
+
+Direct raw gateway mode:
+
+```bash
+uv run drost-gateway
+```
+
+Deployer/operator commands:
+
+```bash
+uv run drost-deployer status
+uv run drost-deployer events --limit 20
+uv run drost-deployer requests
+```
+
+### 9. Where the files go
+
+- repo config: `.env`
+- durable agent workspace: `~/.drost`
+- SQLite database: `~/.drost/drost.sqlite3`
+- session transcripts: `~/.drost/sessions/`
+- traces: `~/.drost/traces/`
+- deployer state: `~/.drost/deployer/`
+
+If you want the full variable surface, see [docs/configuration.md](docs/configuration.md).
 
 ## What's Inside
 
