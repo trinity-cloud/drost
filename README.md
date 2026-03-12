@@ -5,8 +5,8 @@
 <h1 align="center">Drost</h1>
 
 <p align="center">
-  <strong>A personal AI agent that actually runs.</strong><br>
-  Persistent memory. Iterative tool use. Proactive follow-ups. Supervised runtime.<br>
+  <strong>A personal AI agent that actually runs — and thinks between conversations.</strong><br>
+  Persistent memory. Background cognition. Proactive follow-ups. Supervised runtime.<br>
   All through Telegram.
 </p>
 
@@ -35,7 +35,9 @@ Drost is neither. It's a **complete personal agent runtime** you can deploy toda
 
 &nbsp;&nbsp;&nbsp;&nbsp;**It acts** — not single-shot function calling, but a full iterative agent loop. The LLM plans, calls tools, observes results, adjusts, and keeps going until the work is done.
 
-&nbsp;&nbsp;&nbsp;&nbsp;**It follows up** — extracts deadlines, action items, and promises from conversations. A background heartbeat reviews what's due and proactively surfaces reminders when you're idle.
+&nbsp;&nbsp;&nbsp;&nbsp;**It thinks** — a background cognitive pipeline reflects on recent conversations, notices patterns and tensions, and maintains a self-updating internal agenda. The agent builds its own priorities — not from rules you write, but from what it observes. That context flows into every decision it makes, from what to say next to whether a follow-up is worth interrupting you for.
+
+&nbsp;&nbsp;&nbsp;&nbsp;**It follows up** — extracts deadlines, action items, and promises from conversations. A background heartbeat reviews what's due, consults the agent's internal agenda, and proactively surfaces reminders when you're idle — but only when it's actually worth it.
 
 &nbsp;&nbsp;&nbsp;&nbsp;**It's yours** — self-hosted, single-owner, no cloud dependency. Files, shell, web — full capability without sandbox restrictions. The agent can even edit its own code and deploy changes through a built-in control plane.
 
@@ -74,9 +76,10 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
                             │
                             ├── Agent Loop (LLM → tools → LLM, checklist contract)
                             ├── Memory (6 layers: logs → files → entities → index → continuity → capsule)
+                            ├── Cognition (reflection → drive → attention → prompt injection)
                             ├── 12 Built-in Tools (memory, files, shell, web, deployer, follow-ups)
-                            ├── Loop Manager (conversation, reflection, drive, heartbeat, continuity, maintenance)
-                            ├── Shared Mind State (active / idle / cooldown, agenda, attention)
+                            ├── 6 Managed Loops (conversation, reflection, drive, heartbeat, continuity, maintenance)
+                            ├── Shared Mind State (mode, focus, agenda, attention, heartbeat)
                             └── Deployer (subprocess supervisor, health checks, deploy, rollback)
 ```
 
@@ -91,6 +94,7 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
 | | |
 |---|---|
 | **[Architecture](docs/architecture.md)** | System diagram, request flow, component breakdown |
+| **[Cognition](docs/cognition.md)** | Reflection, drive, attention, memory promotion, quality gates |
 | **[Memory](docs/memory.md)** | 6 memory layers, maintenance loop, follow-ups, graph-lite |
 | **[Tools](docs/tools.md)** | All 12 tools with parameters + how to add custom tools |
 | **[Configuration](docs/configuration.md)** | Full environment variable reference |
@@ -112,7 +116,7 @@ Key operator endpoints:
 
 Drost is **alpha** — daily-drivable, actively developed, not yet stable.
 
-The core works well: agent loop, multi-loop runtime, memory, Telegram UX, multi-provider, vision, sessions, follow-ups, deployer. Memory quality, graph depth, and tool surface are still evolving.
+The core works well: agent loop, cognitive pipeline, multi-loop runtime, memory, Telegram UX, multi-provider, vision, sessions, follow-ups, deployer. Cognition depth, memory quality, and tool surface are still evolving.
 
 ## License
 
