@@ -372,6 +372,7 @@ class DriveLoop(ManagedLoop):
                 "suppressed_items": list(payload.get("suppressed_items") or []),
             }
             drive_state = self._artifact_store.replace_drive_state(snapshot_payload)
+            self._artifact_store.sync_initiatives_from_drive_state(drive_state, reviewed_at=started_at)
             attention_payload = dict(payload.get("attention") or {})
             active_items = list(drive_state.get("active_items") or [])
             top_item = active_items[0] if active_items else {}

@@ -127,3 +127,35 @@ def test_shared_mind_state_includes_cognitive_artifact_summary(tmp_path: Path) -
     assert snapshot["agenda"]["active_count"] == 1
     assert snapshot["agenda"]["top_items"][0]["drive_id"] == "drv_x"
     assert snapshot["attention"]["current_focus_kind"] == "reflection"
+    # initiatives block should be present (empty since none were stored)
+    assert "initiatives" in snapshot
+    assert snapshot["initiatives"]["active_count"] == 0
+    assert snapshot["initiatives"]["top_items"] == []
+
+
+def test_shared_mind_state_includes_initiative_summary(tmp_path: Path) -> None:
+    artifacts = CognitiveArtifactStore(tmp_path)
+    artifacts.replace_initiatives(
+        {
+            "updated_at": "2026-03-10T23:00:00Z",
+            "generated_at": "2026-03-10T23:00:00Z",
+            "active_items": [
+                {
+                    "initiative_id": "init_deploy",
+                    "title": "Harden deploy pipeline",
+                    "summary": "Canary checks are insufficient.",
+                    "kind": "concern",
+                    "priority": 0.9,
+                    "recommended_channel": "conversation_only",
+                },
+            ],
+        }
+    )
+
+    state = SharedMindState(tmp_path, cognitive_artifacts=artifacts)
+    snapshot = state.status(active_window_seconds=1200)
+
+    assert snapshot["initiatives"]["active_count"] == 1
+    assert snapshot["initiatives"]["last_updated_at"] == "2026-03-10T23:00:00Z"
+    assert snapshot["initiatives"]["top_items"][0]["initiative_id"] == "init_deploy"
+    assert snapshot["initiatives"]["top_items"][0]["title"] == "Harden deploy pipeline"

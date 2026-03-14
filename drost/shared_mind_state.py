@@ -309,6 +309,7 @@ class SharedMindState:
         reflection = raw.get("reflection") if isinstance(raw.get("reflection"), dict) else {}
         agenda = raw.get("agenda") if isinstance(raw.get("agenda"), dict) else {}
         attention = raw.get("attention") if isinstance(raw.get("attention"), dict) else {}
+        initiatives = raw.get("initiatives") if isinstance(raw.get("initiatives"), dict) else {}
         heartbeat = raw.get("heartbeat") if isinstance(raw.get("heartbeat"), dict) else {}
         return {
             "version": int(raw.get("version") or 2),
@@ -365,6 +366,16 @@ class SharedMindState:
                 "reflection_stale": bool(attention.get("reflection_stale", False)),
                 "drive_stale": bool(attention.get("drive_stale", False)),
                 "last_updated_at": str(attention.get("last_updated_at") or ""),
+            },
+            "initiatives": {
+                "path": str(initiatives.get("path") or ""),
+                "active_count": int(initiatives.get("active_count") or 0),
+                "last_updated_at": str(initiatives.get("last_updated_at") or ""),
+                "top_items": [
+                    dict(item)
+                    for item in list(initiatives.get("top_items") or [])
+                    if isinstance(item, dict)
+                ],
             },
             "heartbeat": {
                 "last_decision_at": str(heartbeat.get("last_decision_at") or ""),
@@ -464,6 +475,12 @@ class SharedMindState:
                 "drive_stale": False,
                 "last_updated_at": "",
             },
+            "initiatives": {
+                "path": "",
+                "active_count": 0,
+                "last_updated_at": "",
+                "top_items": [],
+            },
             "heartbeat": {
                 "last_decision_at": "",
                 "last_decision": "",
@@ -493,6 +510,7 @@ class SharedMindState:
         self._state["reflection"] = dict(summary.get("reflection") or {})
         self._state["agenda"] = dict(summary.get("agenda") or {})
         self._state["attention"] = dict(summary.get("attention") or {})
+        self._state["initiatives"] = dict(summary.get("initiatives") or {})
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

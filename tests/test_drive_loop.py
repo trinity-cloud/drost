@@ -139,6 +139,13 @@ async def test_drive_loop_writes_agenda_and_emits_event(tmp_path: Path) -> None:
     assert attention["top_priority_tags"] == ["docs", "runtime"]
     assert events.status()["event_counts"]["drive_updated"] == 1
 
+    # initiative sync: drive loop should populate initiatives from drive state
+    initiatives = artifacts.load_initiatives()
+    assert len(initiatives["active_items"]) == 1
+    assert initiatives["active_items"][0]["initiative_id"] == "drv_docs"
+    assert initiatives["active_items"][0]["drive_ids"] == ["drv_docs"]
+    assert initiatives["active_items"][0]["last_reviewed_at"]
+
 
 @pytest.mark.asyncio
 async def test_drive_loop_noops_without_inputs(tmp_path: Path) -> None:

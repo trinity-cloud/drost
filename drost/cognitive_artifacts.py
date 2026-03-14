@@ -171,6 +171,94 @@ class DriveStateSnapshot:
 
 
 @dataclass(slots=True, frozen=True)
+class InitiativeRecord:
+    initiative_id: str
+    title: str
+    summary: str
+    status: str = "active"
+    kind: str = "initiative"
+    priority: float = 0.0
+    urgency: float = 0.0
+    confidence: float = 0.0
+    recommended_channel: str = "hold"
+    source_refs: list[str] = field(default_factory=list)
+    drive_ids: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    last_reviewed_at: str | None = None
+    next_review_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_input(cls, value: InitiativeRecord | dict[str, Any]) -> InitiativeRecord:
+        if isinstance(value, InitiativeRecord):
+            return value
+        raw = dict(value or {})
+        initiative_id = _normalize_space(raw.get("initiative_id") or "") or _normalize_space(raw.get("drive_id") or "")
+        initiative_id = initiative_id or f"init_{uuid.uuid4().hex[:12]}"
+        evidence = _normalize_list(raw.get("evidence"))
+        source_refs = _normalize_list(raw.get("source_refs"))
+        merged_evidence = _normalize_list(evidence + source_refs)
+        drive_ids = _normalize_list(raw.get("drive_ids"))
+        fallback_drive_id = _normalize_space(raw.get("drive_id") or "")
+        if fallback_drive_id and fallback_drive_id not in drive_ids:
+            drive_ids.append(fallback_drive_id)
+        return cls(
+            initiative_id=initiative_id,
+            title=_normalize_space(raw.get("title") or ""),
+            summary=_normalize_space(raw.get("summary") or ""),
+            status=_normalize_space(raw.get("status") or "active") or "active",
+            kind=_normalize_space(raw.get("kind") or "initiative") or "initiative",
+            priority=_clamp_score(raw.get("priority")),
+            urgency=_clamp_score(raw.get("urgency")),
+            confidence=_clamp_score(raw.get("confidence")),
+            recommended_channel=_normalize_space(raw.get("recommended_channel") or "hold") or "hold",
+            source_refs=source_refs,
+            drive_ids=drive_ids,
+            evidence=merged_evidence,
+            last_reviewed_at=_dump_time(_parse_time(raw.get("last_reviewed_at"))) or None,
+            next_review_at=_dump_time(_parse_time(raw.get("next_review_at"))) or None,
+            updated_at=_dump_time(_parse_time(raw.get("updated_at"))) or None,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True, frozen=True)
+class InitiativeStateSnapshot:
+    updated_at: str
+    generated_at: str
+    active_items: list[InitiativeRecord] = field(default_factory=list)
+    completed_items: list[InitiativeRecord] = field(default_factory=list)
+    suppressed_items: list[InitiativeRecord] = field(default_factory=list)
+
+    @classmethod
+    def from_input(cls, value: InitiativeStateSnapshot | dict[str, Any]) -> InitiativeStateSnapshot:
+        if isinstance(value, InitiativeStateSnapshot):
+            return value
+        raw = dict(value or {})
+        generated_at = _dump_time(_parse_time(raw.get("generated_at")) or _utc_now())
+        updated_at = _dump_time(_parse_time(raw.get("updated_at")) or _utc_now())
+        return cls(
+            updated_at=updated_at,
+            generated_at=generated_at,
+            active_items=[InitiativeRecord.from_input(item) for item in list(raw.get("active_items") or [])],
+            completed_items=[InitiativeRecord.from_input(item) for item in list(raw.get("completed_items") or [])],
+            suppressed_items=[InitiativeRecord.from_input(item) for item in list(raw.get("suppressed_items") or [])],
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "updated_at": self.updated_at,
+            "generated_at": self.generated_at,
+            "active_items": [item.as_dict() for item in self.active_items],
+            "completed_items": [item.as_dict() for item in self.completed_items],
+            "suppressed_items": [item.as_dict() for item in self.suppressed_items],
+        }
+
+
+@dataclass(slots=True, frozen=True)
 class AttentionStateSnapshot:
     updated_at: str
     current_focus_kind: str = "conversation"
@@ -225,6 +313,10 @@ class CognitiveArtifactStore:
     def attention_state_path(self) -> Path:
         return self.state_dir / "attention-state.json"
 
+    @property
+    def initiatives_path(self) -> Path:
+        return self.state_dir / "initiatives.json"
+
     def ensure_layout(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         if not self.reflections_path.exists():
@@ -238,6 +330,11 @@ class CognitiveArtifactStore:
             self._save_json(
                 self.attention_state_path,
                 AttentionStateSnapshot.from_input({}).as_dict(),
+            )
+        if not self.initiatives_path.exists():
+            self._save_json(
+                self.initiatives_path,
+                InitiativeStateSnapshot.from_input({}).as_dict(),
             )
 
     def append_reflection(self, value: ReflectionArtifact | dict[str, Any]) -> ReflectionArtifact:
@@ -288,11 +385,60 @@ class CognitiveArtifactStore:
         self.ensure_layout()
         return self._load_json(self.attention_state_path, AttentionStateSnapshot.from_input({}).as_dict())
 
+    def replace_initiatives(self, value: InitiativeStateSnapshot | dict[str, Any]) -> dict[str, Any]:
+        self.ensure_layout()
+        snapshot = InitiativeStateSnapshot.from_input(value)
+        payload = snapshot.as_dict()
+        self._save_json(self.initiatives_path, payload)
+        return payload
+
+    def load_initiatives(self) -> dict[str, Any]:
+        self.ensure_layout()
+        return self._load_json(self.initiatives_path, InitiativeStateSnapshot.from_input({}).as_dict())
+
+    def sync_initiatives_from_drive_state(
+        self,
+        drive_state: DriveStateSnapshot | dict[str, Any],
+        *,
+        reviewed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        snapshot = DriveStateSnapshot.from_input(drive_state)
+        review_time = _dump_time(reviewed_at or _parse_time(snapshot.updated_at) or _utc_now())
+
+        def _initiative_from_drive(item: DriveAgendaItem) -> dict[str, Any]:
+            return {
+                "initiative_id": item.drive_id or f"init_{uuid.uuid4().hex[:12]}",
+                "title": item.title,
+                "summary": item.summary,
+                "status": item.status or "active",
+                "kind": item.kind or "initiative",
+                "priority": item.priority,
+                "urgency": item.urgency,
+                "confidence": item.confidence,
+                "recommended_channel": item.recommended_channel,
+                "source_refs": list(item.source_refs),
+                "drive_ids": [item.drive_id] if item.drive_id else [],
+                "evidence": list(item.source_refs),
+                "last_reviewed_at": review_time,
+                "next_review_at": item.next_review_at,
+                "updated_at": snapshot.updated_at,
+            }
+
+        payload = {
+            "updated_at": snapshot.updated_at,
+            "generated_at": snapshot.generated_at,
+            "active_items": [_initiative_from_drive(item) for item in snapshot.active_items],
+            "completed_items": [_initiative_from_drive(item) for item in snapshot.completed_items],
+            "suppressed_items": [_initiative_from_drive(item) for item in snapshot.suppressed_items],
+        }
+        return self.replace_initiatives(payload)
+
     def summary(self) -> dict[str, Any]:
         self.ensure_layout()
         reflections = self.list_reflections()
         drive_state = self.load_drive_state()
         attention_state = self.load_attention_state()
+        initiative_state = self.load_initiatives()
 
         last_reflection_at = ""
         last_high_importance_reflection_id = ""
@@ -323,6 +469,15 @@ class CognitiveArtifactStore:
         ]
         top_items = sorted(
             active_items,
+            key=lambda item: (-float(item.priority), -float(item.urgency), item.title.casefold()),
+        )[:3]
+
+        active_initiatives = [
+            InitiativeRecord.from_input(item)
+            for item in list(initiative_state.get("active_items") or [])
+        ]
+        top_initiatives = sorted(
+            active_initiatives,
             key=lambda item: (-float(item.priority), -float(item.urgency), item.title.casefold()),
         )[:3]
 
@@ -357,6 +512,21 @@ class CognitiveArtifactStore:
                 "reflection_stale": bool(attention_state.get("reflection_stale", False)),
                 "drive_stale": bool(attention_state.get("drive_stale", False)),
                 "last_updated_at": str(attention_state.get("updated_at") or ""),
+            },
+            "initiatives": {
+                "path": str(self.initiatives_path),
+                "active_count": len(active_initiatives),
+                "last_updated_at": str(initiative_state.get("updated_at") or ""),
+                "top_items": [
+                    {
+                        "initiative_id": item.initiative_id,
+                        "title": item.title,
+                        "kind": item.kind,
+                        "priority": item.priority,
+                        "recommended_channel": item.recommended_channel,
+                    }
+                    for item in top_initiatives
+                ],
             },
         }
 

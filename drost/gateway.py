@@ -297,6 +297,7 @@ class Gateway:
                 "reflection": dict(mind_state.get("reflection") or {}),
                 "agenda": dict(mind_state.get("agenda") or {}),
                 "attention": dict(mind_state.get("attention") or {}),
+                "initiatives": dict(mind_state.get("initiatives") or {}),
                 "heartbeat": dict(mind_state.get("heartbeat") or {}),
             },
             "recent_reflections": recent_reflections,

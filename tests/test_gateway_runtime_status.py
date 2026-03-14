@@ -51,6 +51,7 @@ class _FakeMindState:
             "reflection": {"count": 2, "last_reflection_at": "2026-03-10T20:02:00Z"},
             "agenda": {"active_count": 1, "top_items": [{"drive_id": "drv_1"}]},
             "attention": {"current_focus_kind": "conversation"},
+            "initiatives": {"active_count": 1, "top_items": [{"initiative_id": "init_1", "title": "Strengthen deploy canary"}]},
             "heartbeat": {"last_decision": "noop", "last_audit_id": "hba_test"},
         }
 
@@ -134,6 +135,7 @@ def test_gateway_runtime_status_payload_joins_loops_mind_and_events(tmp_path) ->
     assert payload["subscriber_count"] == 3
     assert payload["cognition"]["recent_reflections"][0]["reflection_id"] == "refl_a"
     assert payload["cognition"]["active_agenda_items"][0]["drive_id"] == "drv_1"
+    assert payload["cognition"]["summary"]["initiatives"]["active_count"] == 1
     assert len(payload["cognition"]["recent_heartbeat_decisions"]) == 1
     assert payload["cognition"]["recent_heartbeat_decisions"][0]["audit_id"] == "hba_test"
     assert payload["quality"]["overall_state"] in {"pending", "fail", "pass"}
