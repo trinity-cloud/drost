@@ -1,6 +1,6 @@
 # Built-In Tools
 
-Drost ships with 12 tools that the agent can call during its iterative loop. Tools are registered per-turn and dispatched asynchronously with configurable timeouts.
+Drost ships with 14 tools that the agent can call during its iterative loop. Tools are registered per-turn and dispatched asynchronously with configurable timeouts.
 
 ## Memory Tools
 
@@ -74,6 +74,40 @@ Supports `restart`, `deploy`, and `rollback` actions through the file-backed req
 - `action` (string, required) — one of: `restart`, `deploy`, `rollback`
 - `reason` (string, optional) — reason for the action
 - `commit` (string, optional) — target commit for deploy actions
+
+## Worker Tools
+
+### `worker_status`
+
+Inspect supervised Codex / Claude worker jobs without polling tmux manually.
+
+Use this to list the current worker board or inspect one job in detail, including its last visible output and recommended next action.
+
+**Parameters:**
+- `job_id` (string, optional) — specific worker job id to inspect
+- `include_task_spec` (boolean, optional) — include the canonical task spec for one job
+- `limit` (integer, optional) — max jobs to include in the board view
+
+### `worker_request`
+
+Launch and manage supervised Codex / Claude worker jobs through durable job state.
+
+Use this instead of `shell_execute` for worker launches, review decisions, retries, and stops.
+
+**Parameters:**
+- `action` (string, required) — one of: `launch`, `review_accept`, `review_reject`, `retry`, `stop`
+- `job_id` (string, optional) — required for non-launch actions
+- `worker_kind` (string, optional) — `codex` or `claude` for launch
+- `prompt` (string, optional) — canonical task spec for launch
+- `repo_root` (string, optional) — repo root override for launch
+- `requested_mode` (string, optional) — `inspect`, `implement`, or `review`
+- `write_scope` (string, optional) — write scope such as `repo` or `none`
+- `requested_outputs` (array[string], optional) — outputs to inspect after launch
+- `requested_tests` (array[string], optional) — tests the worker should help satisfy
+- `requested_by` (string, optional) — requester identity
+- `reviewer` (string, optional) — reviewer identity for review actions
+- `notes` (string, optional) — review notes or stop context
+- `reason` (string, optional) — retry or stop reason
 
 ## File Tools
 

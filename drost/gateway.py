@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from drost.agent import AgentRuntime
 from drost.channels import TelegramChannel
@@ -27,6 +27,7 @@ from drost.reflection_loop import ReflectionLoop
 from drost.session_continuity import ContinuityJobRequest, SessionContinuityManager
 from drost.shared_mind_state import SharedMindState
 from drost.storage import SQLiteStore
+from drost.worker_supervision import WorkerSupervisor
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,32 @@ class PromotionReviewRequest(BaseModel):
     sample_size: int = 0
 
 
+class WorkerLaunchRequest(BaseModel):
+    worker_kind: str
+    prompt: str
+    repo_root: str | None = None
+    requested_mode: str = "implement"
+    write_scope: str = "repo"
+    requested_outputs: list[str] = Field(default_factory=list)
+    requested_tests: list[str] = Field(default_factory=list)
+    requested_by: str = "operator"
+
+
+class WorkerReviewRequest(BaseModel):
+    decision: str
+    reviewer: str = "operator"
+    notes: str = ""
+
+
+class WorkerRetryRequest(BaseModel):
+    requested_by: str = "operator"
+    reason: str = ""
+
+
+class WorkerStopRequest(BaseModel):
+    reason: str = ""
+
+
 class Gateway:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -62,6 +89,7 @@ class Gateway:
         self.providers = build_provider_registry(settings)
         self.embeddings = EmbeddingService(settings)
         self.followups = FollowUpStore(settings.workspace_dir)
+        self.workers = WorkerSupervisor(settings)
         self.cognitive_artifacts = CognitiveArtifactStore(settings.workspace_dir)
         self.loop_events = LoopEventBus()
         self.shared_mind_state = SharedMindState(
@@ -537,6 +565,69 @@ class Gateway:
                 "count": len(self.followups.list_followups(chat_id=chat_id)),
                 "items": self.followups.list_followups(chat_id=chat_id),
             }
+
+        @self.app.get("/v1/workers/status")
+        async def workers_status() -> dict[str, Any]:
+            return self.workers.status()
+
+        @self.app.get("/v1/workers/jobs/{job_id}")
+        async def worker_job_detail(job_id: str) -> dict[str, Any]:
+            payload = self.workers.get_job(job_id, refresh=True)
+            if payload is None:
+                raise HTTPException(status_code=404, detail=f"worker job not found: {job_id}")
+            return payload
+
+        @self.app.post("/v1/workers/launch")
+        async def workers_launch(payload: WorkerLaunchRequest) -> dict[str, Any]:
+            try:
+                job = self.workers.launch_job(
+                    worker_kind=str(payload.worker_kind).strip().lower(),
+                    prompt=str(payload.prompt or ""),
+                    repo_root=payload.repo_root,
+                    requested_mode=str(payload.requested_mode or "implement").strip().lower(),
+                    write_scope=str(payload.write_scope or "repo").strip(),
+                    requested_outputs=list(payload.requested_outputs or []),
+                    requested_tests=list(payload.requested_tests or []),
+                    requested_by=str(payload.requested_by or "operator").strip() or "operator",
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"ok": True, **job}
+
+        @self.app.post("/v1/workers/jobs/{job_id}/review")
+        async def worker_job_review(job_id: str, payload: WorkerReviewRequest) -> dict[str, Any]:
+            try:
+                job = self.workers.review_job(
+                    job_id,
+                    decision=payload.decision,
+                    reviewer=payload.reviewer,
+                    notes=payload.notes,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=f"worker job not found: {job_id}") from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"ok": True, **job}
+
+        @self.app.post("/v1/workers/jobs/{job_id}/retry")
+        async def worker_job_retry(job_id: str, payload: WorkerRetryRequest) -> dict[str, Any]:
+            try:
+                job = self.workers.retry_job(
+                    job_id,
+                    requested_by=payload.requested_by,
+                    reason=payload.reason,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=f"worker job not found: {job_id}") from exc
+            return {"ok": True, **job}
+
+        @self.app.post("/v1/workers/jobs/{job_id}/stop")
+        async def worker_job_stop(job_id: str, payload: WorkerStopRequest) -> dict[str, Any]:
+            try:
+                job = self.workers.stop_job(job_id, reason=payload.reason)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=f"worker job not found: {job_id}") from exc
+            return {"ok": True, **job}
 
         @self.app.get("/v1/idle/status")
         async def idle_status() -> dict[str, Any]:

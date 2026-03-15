@@ -19,6 +19,8 @@ from drost.tools.session_status import SessionStatusTool
 from drost.tools.shell_execute import ShellExecuteTool
 from drost.tools.web_fetch import WebFetchTool
 from drost.tools.web_search import WebSearchTool
+from drost.tools.worker_request import WorkerRequestTool
+from drost.tools.worker_status import WorkerStatusTool
 
 __all__ = [
     "ToolRegistry",
@@ -58,6 +60,8 @@ def build_default_registry(
     )
     registry.register(DeployerStatusTool(settings=settings))
     registry.register(DeployerRequestTool(settings=settings))
+    registry.register(WorkerStatusTool(settings=settings))
+    registry.register(WorkerRequestTool(settings=settings))
     registry.register(FileReadTool())
     registry.register(FileWriteTool())
     registry.register(ShellExecuteTool(default_timeout_seconds=settings.agent_tool_timeout_seconds))

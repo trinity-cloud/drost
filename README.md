@@ -51,6 +51,7 @@ You need:
 
 - Python `3.11+`
 - [`uv`](https://docs.astral.sh/uv/)
+- `tmux` if you want supervised external worker jobs
 - a Telegram bot token from `@BotFather`
 - `GEMINI_API_KEY` for embeddings
 - one provider configured for actual model calls:
@@ -101,6 +102,16 @@ For `xai`:
 ```env
 DROST_DEFAULT_PROVIDER=xai
 DROST_XAI_API_KEY=...
+```
+
+Optional, for supervised external worker jobs:
+
+```env
+# Only needed if you want Drost to launch Codex / Claude worker jobs.
+# Defaults are auto-detected when possible.
+# DROST_WORKER_TMUX_BINARY_PATH=tmux
+# DROST_WORKER_CODEX_BINARY_PATH=/opt/homebrew/bin/codex
+# DROST_WORKER_CLAUDE_BINARY_PATH=~/.local/bin/claude
 ```
 
 ### 4. Start Drost
@@ -211,7 +222,7 @@ Telegram ←→ Gateway ←→ Agent Runtime ←→ LLM Provider
 
 **3 providers** — OpenAI/Codex, Anthropic, xAI/Grok. Switch at runtime. All support streaming, tool use, and vision.
 
-**12 tools** — `memory_search` `memory_get` `session_status` `deployer_status` `deployer_request` `followup_status` `followup_update` `file_read` `file_write` `shell_execute` `web_search` `web_fetch`
+**14 tools** — `memory_search` `memory_get` `session_status` `deployer_status` `deployer_request` `worker_status` `worker_request` `followup_status` `followup_update` `file_read` `file_write` `shell_execute` `web_search` `web_fetch`
 
 **Persistent workspace** at `~/.drost` — identity files, structured memory, session logs, traces, follow-ups, deployer state. Human-readable Markdown, never overwritten.
 
@@ -237,6 +248,9 @@ Key operator endpoints:
 - `/v1/quality/status`
 - `/v1/heartbeat/status`
 - `/v1/memory/maintenance/status`
+- `/v1/workers/status`
+- `/v1/workers/jobs/{job_id}`
+- `/v1/workers/launch`
 
 ## Status
 

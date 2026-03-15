@@ -36,6 +36,8 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
             "web_search",
             "deployer_request",
             "deployer_status",
+            "worker_request",
+            "worker_status",
             "followup_status",
             "followup_update",
         ],
@@ -64,6 +66,9 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "[Deployer Control]" in prompt
     assert "[Deployer Reporting]" in prompt
     assert "Never collapse requested or accepted state" in prompt
+    assert "[Worker Supervision]" in prompt
+    assert "[Worker Reporting]" in prompt
+    assert "Do not improvise worker supervision with shell_execute" in prompt
     assert "[Workspace Runtime]" in prompt
     assert f"repo_root={settings.repo_root}" in prompt
     assert f"workspace_root={settings.workspace_dir}" in prompt

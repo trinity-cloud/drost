@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -34,6 +35,11 @@ class Settings(BaseSettings):
     repo_root: Path = Field(default_factory=lambda: Path.cwd())
     runtime_launch_mode: str = "deployer-default"
     runtime_start_command: str = "uv run drost"
+    worker_tmux_binary_path: str = Field(default_factory=lambda: shutil.which("tmux") or "tmux")
+    worker_codex_binary_path: str = Field(default_factory=lambda: shutil.which("codex") or "/opt/homebrew/bin/codex")
+    worker_claude_binary_path: str = Field(
+        default_factory=lambda: shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    )
 
     telegram_bot_token: str = ""
     telegram_allowed_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)

@@ -17,7 +17,11 @@ class ShellExecuteTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Run a shell command and return exit code plus stdout/stderr."
+        return (
+            "Run a short shell command and return exit code plus stdout/stderr. "
+            "Use dedicated tools instead of this one for deployer lifecycle control or "
+            "Codex/Claude worker supervision when those tools are available."
+        )
 
     @property
     def parameters(self) -> dict[str, object]:
@@ -80,4 +84,3 @@ class ShellExecuteTool(BaseTool):
             f"stdout:\n{stdout_text}\n"
             f"stderr:\n{stderr_text}"
         )
-

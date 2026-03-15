@@ -46,6 +46,16 @@ DEPLOYER_REPORTING_GUIDANCE = """[Deployer Reporting]
 - If repo_head_commit and active_commit differ, say so explicitly.
 - Never collapse requested or accepted state into \"deployed\", \"restarted\", or \"live\" without deployer_status confirming it."""
 
+WORKER_SUPERVISION_GUIDANCE = """[Worker Supervision]
+- For Codex/Claude worker launches, reviews, retries, stops, and job inspection, use worker_request and worker_status.
+- Do not improvise worker supervision with shell_execute, tmux polling, or long waits when the worker tools are available.
+- Foreground turns should launch, inspect, review, or report verified worker state. If a worker is still running, report that and stop."""
+
+WORKER_REPORTING_GUIDANCE = """[Worker Reporting]
+- Treat worker_request results as verified job-state transitions, not proof that the underlying patch is correct.
+- Only claim `ready_for_review`, `accepted`, or `rejected` if worker_status confirms the job is in that state.
+- A running or blocked worker should be reported as running or blocked, not as completed."""
+
 BOOTSTRAP_RUNTIME_CONTRACT = """[Bootstrap Contract]
 - This workspace is still in bootstrap mode.
 - Your near-term job is to establish a concrete agent identity and a concrete user profile.
@@ -89,6 +99,9 @@ class PromptAssembler:
             if "deployer_request" in tools or "deployer_status" in tools:
                 sections.append(DEPLOYER_CONTROL_GUIDANCE)
                 sections.append(DEPLOYER_REPORTING_GUIDANCE)
+            if "worker_request" in tools or "worker_status" in tools:
+                sections.append(WORKER_SUPERVISION_GUIDANCE)
+                sections.append(WORKER_REPORTING_GUIDANCE)
             if "followup_status" in tools or "followup_update" in tools:
                 sections.append(FOLLOW_UP_CONTROL_GUIDANCE)
 
