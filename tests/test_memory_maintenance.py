@@ -140,7 +140,7 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
                             "kind": "operational_context",
                             "confidence": 0.98,
                             "stability": 0.95,
-                            "evidence_refs": ["sessions/test.jsonl:1"],
+                            "evidence_refs": ["sessions/test.jsonl:1", "sessions/test.jsonl:2"],
                             "why_promotable": "This affects future retrieval and prompt quality.",
                         }
                     ],
@@ -195,6 +195,71 @@ async def test_memory_maintenance_run_once_writes_memory_and_advances_state(tmp_
     assert any(event["event_type"] == "tool_trace" for event in payload["events"])
     assert "entity memory synthesis" in provider.system_prompts[1].lower()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_maintenance_requires_stronger_evidence_for_user_promotions(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    session_store = SessionJSONLStore(store_path=sessions)
+    session_key = session_key_for_telegram_chat(123, "s_2026-03-07_10-05-00")
+    session_store.append_user_assistant(
+        session_key=session_key,
+        user_text="I like direct answers.",
+        assistant_text="I will answer directly.",
+    )
+
+    provider = ExtractionProvider(
+        content=json.dumps(
+            {
+                "daily_notes": [],
+                "facts": [],
+                "promotion_candidates": [
+                    {
+                        "target_file": "USER.md",
+                        "candidate_text": "Prefers direct technical answers.",
+                        "kind": "communication_style",
+                        "confidence": 0.99,
+                        "stability": 0.95,
+                        "evidence_refs": ["sessions/test.jsonl:1"],
+                        "why_promotable": "Repeated preference.",
+                    },
+                    {
+                        "target_file": "IDENTITY.md",
+                        "candidate_text": "Drost is relentlessly formal and severe.",
+                        "kind": "identity_trait",
+                        "confidence": 0.99,
+                        "stability": 0.99,
+                        "evidence_refs": ["sessions/test.jsonl:1", "sessions/test.jsonl:2", "sessions/test.jsonl:3"],
+                        "why_promotable": "Should remain manual only.",
+                    },
+                ],
+            }
+        )
+    )
+
+    async def _sync_index() -> dict[str, int]:
+        return {"indexed": 0, "skipped": 0, "removed": 0}
+
+    runner = MemoryMaintenanceRunner(
+        workspace_dir=workspace,
+        sessions_dir=sessions,
+        provider_getter=lambda: provider,
+        sync_memory_index=_sync_index,
+        enabled=True,
+        interval_seconds=1800,
+        max_events_per_run=200,
+    )
+
+    result = await runner.run_once(reason="test")
+    journal_path = workspace / "state" / "promotion-decisions.jsonl"
+    journal_rows = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    assert result["promotions_written"] == 0
+    assert not (workspace / "USER.md").exists()
+    assert not (workspace / "IDENTITY.md").exists()
+    assert [row["reason"] for row in journal_rows] == ["insufficient_evidence_refs", "manual_review_required"]
 
 
 @pytest.mark.asyncio

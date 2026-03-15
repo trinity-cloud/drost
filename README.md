@@ -248,11 +248,18 @@ Key operator endpoints:
 - `/v1/self-model/status`
 - `/v1/recursive-improvement/status`
 - `/v1/quality/status`
+- `/v1/quality/promotions`
 - `/v1/heartbeat/status`
 - `/v1/memory/maintenance/status`
 - `/v1/workers/status`
 - `/v1/workers/jobs/{job_id}`
 - `/v1/workers/launch`
+
+Memory-promotion quality is target-aware:
+- `TOOLS.md` is the lowest-risk auto-promotion target
+- `MEMORY.md` requires repeated corroboration
+- `USER.md` uses stricter thresholds than general memory
+- `IDENTITY.md` is manual-review-only and is not auto-promoted
 
 ## Status
 

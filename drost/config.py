@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     memory_promotion_interval_seconds: int = 6 * 60 * 60
     memory_promotion_confidence_threshold: float = 0.90
     memory_promotion_stability_threshold: float = 0.85
+    memory_promotion_tools_confidence_threshold: float = 0.90
+    memory_promotion_tools_stability_threshold: float = 0.85
+    memory_promotion_tools_min_evidence_refs: int = 1
+    memory_promotion_memory_confidence_threshold: float = 0.90
+    memory_promotion_memory_stability_threshold: float = 0.85
+    memory_promotion_memory_min_evidence_refs: int = 2
+    memory_promotion_user_confidence_threshold: float = 0.95
+    memory_promotion_user_stability_threshold: float = 0.90
+    memory_promotion_user_min_evidence_refs: int = 2
     memory_continuity_enabled: bool = True
     memory_continuity_auto_on_new: bool = True
     memory_continuity_source_max_messages: int = 120

@@ -52,6 +52,7 @@ class PromotionReviewRequest(BaseModel):
     approved: bool
     note: str = ""
     sample_size: int = 0
+    target_file: str = ""
 
 
 class WorkerLaunchRequest(BaseModel):
@@ -138,6 +139,15 @@ class Gateway:
             memory_promotion_interval_seconds=settings.memory_promotion_interval_seconds,
             memory_promotion_confidence_threshold=settings.memory_promotion_confidence_threshold,
             memory_promotion_stability_threshold=settings.memory_promotion_stability_threshold,
+            memory_promotion_tools_confidence_threshold=settings.memory_promotion_tools_confidence_threshold,
+            memory_promotion_tools_stability_threshold=settings.memory_promotion_tools_stability_threshold,
+            memory_promotion_tools_min_evidence_refs=settings.memory_promotion_tools_min_evidence_refs,
+            memory_promotion_memory_confidence_threshold=settings.memory_promotion_memory_confidence_threshold,
+            memory_promotion_memory_stability_threshold=settings.memory_promotion_memory_stability_threshold,
+            memory_promotion_memory_min_evidence_refs=settings.memory_promotion_memory_min_evidence_refs,
+            memory_promotion_user_confidence_threshold=settings.memory_promotion_user_confidence_threshold,
+            memory_promotion_user_stability_threshold=settings.memory_promotion_user_stability_threshold,
+            memory_promotion_user_min_evidence_refs=settings.memory_promotion_user_min_evidence_refs,
             followups=self.followups,
             followups_enabled=settings.followups_enabled,
             followup_confidence_threshold=settings.followup_confidence_threshold,
@@ -711,6 +721,7 @@ class Gateway:
                 approved=payload.approved,
                 note=payload.note,
                 sample_size=payload.sample_size,
+                target_file=payload.target_file,
             )
             loops = self.loop_manager.status()
             mind = self.shared_mind_state.status(active_window_seconds=self.settings.idle_active_window_seconds)
@@ -718,6 +729,27 @@ class Gateway:
                 "ok": True,
                 "review": review,
                 "quality": self._quality_status_payload(mind=mind, loops=loops),
+            }
+
+        @self.app.get("/v1/quality/promotions")
+        async def quality_promotions(
+            target_file: str = "",
+            accepted_only: bool = False,
+            limit: int = 25,
+        ) -> dict[str, Any]:
+            rows = self.quality_gates.list_promotion_decisions(
+                target_file=target_file,
+                accepted_only=accepted_only,
+                limit=limit,
+            )
+            return {
+                "rows": rows,
+                "count": len(rows),
+                "filters": {
+                    "target_file": target_file,
+                    "accepted_only": accepted_only,
+                    "limit": max(1, int(limit)),
+                },
             }
 
         @self.app.post("/v1/canary/deploy")

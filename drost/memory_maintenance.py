@@ -16,7 +16,11 @@ from drost.entity_resolution import EntityResolver
 from drost.followups import FollowUpStore
 from drost.loop_events import EventSubscription, LoopEventBus
 from drost.memory_files import MemoryFiles
-from drost.memory_promotion import MemoryPromotionStore
+from drost.memory_promotion import (
+    ALLOWED_PROMOTION_TARGETS,
+    MemoryPromotionStore,
+    normalize_promotion_target,
+)
 from drost.providers import BaseProvider, ChatResponse, Message, MessageRole
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,15 @@ class MemoryMaintenanceRunner:
         memory_promotion_interval_seconds: int = 6 * 60 * 60,
         memory_promotion_confidence_threshold: float = 0.90,
         memory_promotion_stability_threshold: float = 0.85,
+        memory_promotion_tools_confidence_threshold: float = 0.90,
+        memory_promotion_tools_stability_threshold: float = 0.85,
+        memory_promotion_tools_min_evidence_refs: int = 1,
+        memory_promotion_memory_confidence_threshold: float = 0.90,
+        memory_promotion_memory_stability_threshold: float = 0.85,
+        memory_promotion_memory_min_evidence_refs: int = 2,
+        memory_promotion_user_confidence_threshold: float = 0.95,
+        memory_promotion_user_stability_threshold: float = 0.90,
+        memory_promotion_user_min_evidence_refs: int = 2,
         followups: FollowUpStore | None = None,
         followups_enabled: bool = True,
         followup_confidence_threshold: float = 0.80,
@@ -99,6 +112,32 @@ class MemoryMaintenanceRunner:
         self._memory_promotion_interval_seconds = max(60, int(memory_promotion_interval_seconds))
         self._memory_promotion_confidence_threshold = max(0.0, min(1.0, float(memory_promotion_confidence_threshold)))
         self._memory_promotion_stability_threshold = max(0.0, min(1.0, float(memory_promotion_stability_threshold)))
+        self._promotion_profiles = {
+            "TOOLS.md": {
+                "auto_allowed": True,
+                "min_confidence": max(0.0, min(1.0, float(memory_promotion_tools_confidence_threshold))),
+                "min_stability": max(0.0, min(1.0, float(memory_promotion_tools_stability_threshold))),
+                "min_evidence_refs": max(1, int(memory_promotion_tools_min_evidence_refs)),
+            },
+            "MEMORY.md": {
+                "auto_allowed": True,
+                "min_confidence": max(0.0, min(1.0, float(memory_promotion_memory_confidence_threshold))),
+                "min_stability": max(0.0, min(1.0, float(memory_promotion_memory_stability_threshold))),
+                "min_evidence_refs": max(1, int(memory_promotion_memory_min_evidence_refs)),
+            },
+            "USER.md": {
+                "auto_allowed": True,
+                "min_confidence": max(0.0, min(1.0, float(memory_promotion_user_confidence_threshold))),
+                "min_stability": max(0.0, min(1.0, float(memory_promotion_user_stability_threshold))),
+                "min_evidence_refs": max(1, int(memory_promotion_user_min_evidence_refs)),
+            },
+            "IDENTITY.md": {
+                "auto_allowed": False,
+                "min_confidence": 1.0,
+                "min_stability": 1.0,
+                "min_evidence_refs": 999,
+            },
+        }
         self._followups = followups or (FollowUpStore(self._workspace_dir) if followups_enabled else None)
         self._followups_enabled = bool(followups_enabled)
         self._followup_confidence_threshold = max(0.0, min(1.0, float(followup_confidence_threshold)))
@@ -119,6 +158,7 @@ class MemoryMaintenanceRunner:
             "memory_promotion_interval_seconds": self._memory_promotion_interval_seconds,
             "memory_promotion_confidence_threshold": self._memory_promotion_confidence_threshold,
             "memory_promotion_stability_threshold": self._memory_promotion_stability_threshold,
+            "memory_promotion_profiles": dict(self._promotion_profiles),
             "followups_enabled": self._followups_enabled,
             "followup_confidence_threshold": self._followup_confidence_threshold,
             "last_run_at": "",
@@ -858,7 +898,7 @@ class MemoryMaintenanceRunner:
         for item in promotion_candidates:
             if not isinstance(item, dict):
                 continue
-            target_file = str(item.get("target_file") or "").strip()
+            target_file = normalize_promotion_target(str(item.get("target_file") or "").strip())
             candidate_text = str(item.get("candidate_text") or "").strip()
             kind = str(item.get("kind") or "note").strip() or "note"
             why_promotable = str(item.get("why_promotable") or "").strip()
@@ -867,6 +907,7 @@ class MemoryMaintenanceRunner:
                 for ref in list(item.get("evidence_refs") or [])
                 if str(ref).strip()
             ]
+            evidence_refs = list(dict.fromkeys(evidence_refs))
             try:
                 confidence = float(item["confidence"]) if item.get("confidence") is not None else None
             except Exception:
@@ -876,16 +917,21 @@ class MemoryMaintenanceRunner:
             except Exception:
                 stability = None
 
+            policy = self._promotion_policy(target_file)
             decision_reason = ""
             accepted = False
-            if target_file not in {"USER.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md"}:
+            if target_file not in ALLOWED_PROMOTION_TARGETS:
                 decision_reason = "unsupported_target"
             elif not candidate_text:
                 decision_reason = "empty_candidate"
-            elif confidence is None or confidence < self._memory_promotion_confidence_threshold:
+            elif not bool(policy.get("auto_allowed")):
+                decision_reason = "manual_review_required"
+            elif confidence is None or confidence < float(policy.get("min_confidence") or 0.0):
                 decision_reason = "low_confidence"
-            elif stability is None or stability < self._memory_promotion_stability_threshold:
+            elif stability is None or stability < float(policy.get("min_stability") or 0.0):
                 decision_reason = "low_stability"
+            elif len(evidence_refs) < int(policy.get("min_evidence_refs") or 1):
+                decision_reason = "insufficient_evidence_refs"
             elif not can_promote:
                 decision_reason = "interval_not_elapsed"
             else:
@@ -911,6 +957,7 @@ class MemoryMaintenanceRunner:
                     why_promotable=why_promotable,
                     accepted=accepted,
                     reason=decision_reason,
+                    policy=policy,
                 )
             )
 
@@ -918,6 +965,17 @@ class MemoryMaintenanceRunner:
         if can_promote:
             promotion_state["last_success_at"] = at
         return count, touched
+
+    def _promotion_policy(self, target_file: str) -> dict[str, Any]:
+        target = normalize_promotion_target(target_file)
+        if target in self._promotion_profiles:
+            return dict(self._promotion_profiles[target])
+        return {
+            "auto_allowed": False,
+            "min_confidence": self._memory_promotion_confidence_threshold,
+            "min_stability": self._memory_promotion_stability_threshold,
+            "min_evidence_refs": 1,
+        }
 
     def _promotion_window_open(self, *, promotion_state: dict[str, Any], reason: str, now: str) -> bool:
         if reason == "manual":

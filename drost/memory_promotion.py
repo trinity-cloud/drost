@@ -5,11 +5,17 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 _PROMOTION_HEADER = "## Machine-Promoted"
 _PROMOTION_START = "<!-- drost:machine-promoted:start -->"
 _PROMOTION_END = "<!-- drost:machine-promoted:end -->"
-_ALLOWED_TARGETS = {"USER.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md"}
+ALLOWED_PROMOTION_TARGETS = ("TOOLS.md", "MEMORY.md", "USER.md", "IDENTITY.md")
+MANUAL_REVIEW_ONLY_PROMOTION_TARGETS = ("IDENTITY.md",)
+AUTO_PROMOTION_TARGETS = tuple(
+    target for target in ALLOWED_PROMOTION_TARGETS if target not in MANUAL_REVIEW_ONLY_PROMOTION_TARGETS
+)
+_ALLOWED_TARGETS = set(ALLOWED_PROMOTION_TARGETS)
 _ENTRY_RE = re.compile(r"^- \[([a-z0-9_-]+)\] (.+)$", re.IGNORECASE)
 
 
@@ -20,6 +26,15 @@ def _normalize_text(value: str) -> str:
 def _normalize_kind(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9_-]+", "_", str(value or "").strip().casefold()).strip("_")
     return cleaned or "note"
+
+
+def normalize_promotion_target(value: str) -> str:
+    cleaned = str(value or "").strip()
+    return cleaned if cleaned in _ALLOWED_TARGETS else cleaned
+
+
+def is_manual_review_only_target(target_file: str) -> bool:
+    return normalize_promotion_target(target_file) in MANUAL_REVIEW_ONLY_PROMOTION_TARGETS
 
 
 def _utc_now() -> str:
@@ -54,7 +69,7 @@ class MemoryPromotionStore:
         kind: str,
     ) -> PromotionWriteResult:
         self.ensure_layout()
-        normalized_target = str(target_file or "").strip()
+        normalized_target = normalize_promotion_target(target_file)
         if normalized_target not in _ALLOWED_TARGETS:
             return PromotionWriteResult(
                 path=self.workspace_dir / normalized_target,
@@ -62,6 +77,14 @@ class MemoryPromotionStore:
                 candidate_text=str(candidate_text or "").strip(),
                 created=False,
                 reason="unsupported_target",
+            )
+        if is_manual_review_only_target(normalized_target):
+            return PromotionWriteResult(
+                path=self.workspace_dir / normalized_target,
+                target_file=normalized_target,
+                candidate_text=str(candidate_text or "").strip(),
+                created=False,
+                reason="manual_review_required",
             )
 
         text = str(candidate_text or "").strip()
@@ -112,11 +135,12 @@ class MemoryPromotionStore:
         why_promotable: str,
         accepted: bool,
         reason: str,
+        policy: dict[str, Any] | None = None,
     ) -> Path:
         self.ensure_layout()
         payload = {
             "timestamp": _utc_now(),
-            "target_file": str(target_file or "").strip(),
+            "target_file": normalize_promotion_target(target_file),
             "candidate_text": str(candidate_text or "").strip(),
             "kind": _normalize_kind(kind),
             "confidence": None if confidence is None else float(confidence),
@@ -125,10 +149,40 @@ class MemoryPromotionStore:
             "why_promotable": str(why_promotable or "").strip(),
             "accepted": bool(accepted),
             "reason": str(reason or "").strip(),
+            "policy": dict(policy or {}),
         }
         with self.journal_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return self.journal_path
+
+    def list_decisions(
+        self,
+        *,
+        limit: int = 25,
+        target_file: str = "",
+        accepted_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not self.journal_path.exists():
+            return []
+        target = normalize_promotion_target(target_file)
+        rows: list[dict[str, Any]] = []
+        for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+            cleaned = line.strip()
+            if not cleaned:
+                continue
+            try:
+                payload = json.loads(cleaned)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if target and normalize_promotion_target(str(payload.get("target_file") or "")) != target:
+                continue
+            if accepted_only and not bool(payload.get("accepted")):
+                continue
+            rows.append(payload)
+        rows.reverse()
+        return rows[: max(1, int(limit))]
 
     @staticmethod
     def _parse_entries(content: str) -> list[dict[str, str]]:

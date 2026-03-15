@@ -5,6 +5,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from drost.memory_promotion import (
+    ALLOWED_PROMOTION_TARGETS,
+    AUTO_PROMOTION_TARGETS,
+    is_manual_review_only_target,
+    normalize_promotion_target,
+)
+
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -54,9 +61,10 @@ class QualityGateStore:
         sample_size: int,
         accepted_count: int,
         reviewed_through_timestamp: str,
+        target_file: str = "",
     ) -> dict[str, Any]:
         state = self.load()
-        state["promotion_review"] = {
+        review_payload = {
             "approved": bool(approved),
             "note": str(note or "").strip(),
             "sample_size": max(0, int(sample_size)),
@@ -64,6 +72,13 @@ class QualityGateStore:
             "reviewed_through_timestamp": str(reviewed_through_timestamp or "").strip(),
             "reviewed_at": _utc_now(),
         }
+        normalized_target = normalize_promotion_target(target_file)
+        if normalized_target:
+            promotion_reviews = dict(state.get("promotion_reviews") or {})
+            promotion_reviews[normalized_target] = review_payload
+            state["promotion_reviews"] = promotion_reviews
+        else:
+            state["promotion_review"] = review_payload
         return self.save(state)
 
     @staticmethod
@@ -76,15 +91,34 @@ class QualityGateStore:
                 "accepted_count_at_review": 0,
                 "reviewed_through_timestamp": "",
                 "reviewed_at": "",
-            }
+            },
+            "promotion_reviews": {},
         }
 
     @staticmethod
     def _normalize(payload: Any) -> dict[str, Any]:
         raw = payload if isinstance(payload, dict) else {}
         review = raw.get("promotion_review") if isinstance(raw.get("promotion_review"), dict) else {}
+        promotion_reviews_raw = raw.get("promotion_reviews") if isinstance(raw.get("promotion_reviews"), dict) else {}
         approved_raw = review.get("approved")
         approved: bool | None = approved_raw if isinstance(approved_raw, bool) else None
+        normalized_reviews: dict[str, dict[str, Any]] = {}
+        for target_file, target_review_raw in promotion_reviews_raw.items():
+            if not isinstance(target_review_raw, dict):
+                continue
+            normalized_target = normalize_promotion_target(str(target_file or ""))
+            if not normalized_target:
+                continue
+            target_approved_raw = target_review_raw.get("approved")
+            target_approved = target_approved_raw if isinstance(target_approved_raw, bool) else None
+            normalized_reviews[normalized_target] = {
+                "approved": target_approved,
+                "note": str(target_review_raw.get("note") or ""),
+                "sample_size": max(0, int(target_review_raw.get("sample_size") or 0)),
+                "accepted_count_at_review": max(0, int(target_review_raw.get("accepted_count_at_review") or 0)),
+                "reviewed_through_timestamp": str(target_review_raw.get("reviewed_through_timestamp") or ""),
+                "reviewed_at": str(target_review_raw.get("reviewed_at") or ""),
+            }
         return {
             "promotion_review": {
                 "approved": approved,
@@ -93,7 +127,8 @@ class QualityGateStore:
                 "accepted_count_at_review": max(0, int(review.get("accepted_count_at_review") or 0)),
                 "reviewed_through_timestamp": str(review.get("reviewed_through_timestamp") or ""),
                 "reviewed_at": str(review.get("reviewed_at") or ""),
-            }
+            },
+            "promotion_reviews": normalized_reviews,
         }
 
 
@@ -181,9 +216,23 @@ class QualityGateEvaluator:
             "updated_at": _utc_now(),
         }
 
-    def record_promotion_review(self, *, approved: bool, note: str, sample_size: int) -> dict[str, Any]:
+    def record_promotion_review(
+        self,
+        *,
+        approved: bool,
+        note: str,
+        sample_size: int,
+        target_file: str = "",
+    ) -> dict[str, Any]:
         decisions = self._load_promotion_decisions()
+        normalized_target = normalize_promotion_target(target_file)
         accepted = [item for item in decisions if bool(item.get("accepted"))]
+        if normalized_target:
+            accepted = [
+                item
+                for item in accepted
+                if normalize_promotion_target(str(item.get("target_file") or "")) == normalized_target
+            ]
         reviewed_through = str(accepted[-1].get("timestamp") or "") if accepted else ""
         return self.store.record_promotion_review(
             approved=approved,
@@ -191,6 +240,7 @@ class QualityGateEvaluator:
             sample_size=sample_size,
             accepted_count=len(accepted),
             reviewed_through_timestamp=reviewed_through,
+            target_file=normalized_target,
         )
 
     def _reflection_gate(self, reflection_status: dict[str, Any]) -> dict[str, Any]:
@@ -284,11 +334,77 @@ class QualityGateEvaluator:
     def _promotion_gate(self, review_state: dict[str, Any]) -> dict[str, Any]:
         decisions = self._load_promotion_decisions()
         accepted = [item for item in decisions if bool(item.get("accepted"))]
-        review = dict(review_state.get("promotion_review") or {})
+        global_review = dict(review_state.get("promotion_review") or {})
+        target_reviews = {
+            normalize_promotion_target(str(key or "")): dict(value or {})
+            for key, value in dict(review_state.get("promotion_reviews") or {}).items()
+        }
         latest_accepted_at = str(accepted[-1].get("timestamp") or "") if accepted else ""
-        reviewed_through = str(review.get("reviewed_through_timestamp") or "")
-        review_approved = review.get("approved")
-        review_stale = bool(latest_accepted_at) and latest_accepted_at != reviewed_through
+        reviewed_through = str(global_review.get("reviewed_through_timestamp") or "")
+        review_approved = global_review.get("approved")
+        target_gates: dict[str, Any] = {}
+        accepted_auto_targets: list[str] = []
+        for target_file in ALLOWED_PROMOTION_TARGETS:
+            target_decisions = [
+                item
+                for item in decisions
+                if normalize_promotion_target(str(item.get("target_file") or "")) == target_file
+            ]
+            target_accepted = [item for item in target_decisions if bool(item.get("accepted"))]
+            latest_target_accepted_at = str(target_accepted[-1].get("timestamp") or "") if target_accepted else ""
+            review = dict(target_reviews.get(target_file) or global_review)
+            target_reviewed_through = str(review.get("reviewed_through_timestamp") or "")
+            target_review_approved = review.get("approved")
+            target_review_stale = bool(latest_target_accepted_at) and latest_target_accepted_at != target_reviewed_through
+            metrics = {
+                "decision_count": len(target_decisions),
+                "accepted_count": len(target_accepted),
+                "rejected_count": max(0, len(target_decisions) - len(target_accepted)),
+                "latest_accepted_at": latest_target_accepted_at,
+                "reviewed_through_timestamp": target_reviewed_through,
+                "review_approved": target_review_approved,
+                "reviewed_at": str(review.get("reviewed_at") or ""),
+                "sample_size": int(review.get("sample_size") or 0),
+                "manual_review_only": is_manual_review_only_target(target_file),
+            }
+            if is_manual_review_only_target(target_file):
+                target_gates[target_file] = self._gate(
+                    state="manual_only",
+                    reason="manual_review_only",
+                    summary="This target is manual-review-only and is not auto-promoted.",
+                    metrics=metrics,
+                )
+                continue
+            if target_accepted:
+                accepted_auto_targets.append(target_file)
+            if not target_accepted:
+                target_gates[target_file] = self._gate(
+                    state="pending",
+                    reason="no_promotions_for_target",
+                    summary="No accepted promotions for this target yet.",
+                    metrics=metrics,
+                )
+            elif target_review_approved is None or target_review_stale:
+                target_gates[target_file] = self._gate(
+                    state="pending",
+                    reason="promotion_review_required",
+                    summary="Accepted promotions for this target require operator review.",
+                    metrics=metrics,
+                )
+            elif bool(target_review_approved):
+                target_gates[target_file] = self._gate(
+                    state="pass",
+                    reason="promotion_review_approved",
+                    summary="Recent accepted promotions for this target were approved.",
+                    metrics=metrics,
+                )
+            else:
+                target_gates[target_file] = self._gate(
+                    state="fail",
+                    reason="promotion_review_rejected",
+                    summary="Recent accepted promotions for this target were rejected.",
+                    metrics=metrics,
+                )
         metrics = {
             "decision_count": len(decisions),
             "accepted_count": len(accepted),
@@ -296,36 +412,46 @@ class QualityGateEvaluator:
             "latest_accepted_at": latest_accepted_at,
             "reviewed_through_timestamp": reviewed_through,
             "review_approved": review_approved,
-            "reviewed_at": str(review.get("reviewed_at") or ""),
-            "sample_size": int(review.get("sample_size") or 0),
+            "reviewed_at": str(global_review.get("reviewed_at") or ""),
+            "sample_size": int(global_review.get("sample_size") or 0),
+            "auto_targets_with_accepts": accepted_auto_targets,
         }
-        if not accepted:
-            return self._gate(
+        if not accepted_auto_targets:
+            gate = self._gate(
                 state="pending",
                 reason="no_promotions_yet",
                 summary="No accepted promotions have been reviewed yet.",
                 metrics=metrics,
             )
-        if review_approved is None or review_stale:
-            return self._gate(
+            gate["targets"] = target_gates
+            return gate
+        relevant_states = [target_gates[target]["state"] for target in AUTO_PROMOTION_TARGETS if target in accepted_auto_targets]
+        if any(state == "fail" for state in relevant_states):
+            gate = self._gate(
+                state="fail",
+                reason="promotion_review_rejected",
+                summary="At least one promotion target failed live review.",
+                metrics=metrics,
+            )
+            gate["targets"] = target_gates
+            return gate
+        if any(state == "pending" for state in relevant_states):
+            gate = self._gate(
                 state="pending",
                 reason="promotion_review_required",
                 summary="Accepted promotions require live operator review.",
                 metrics=metrics,
             )
-        if bool(review_approved):
-            return self._gate(
-                state="pass",
-                reason="promotion_review_approved",
-                summary="Promotion precision has been approved on recent live samples.",
-                metrics=metrics,
-            )
-        return self._gate(
-            state="fail",
-            reason="promotion_review_rejected",
-            summary="Promotion precision was rejected during live review.",
+            gate["targets"] = target_gates
+            return gate
+        gate = self._gate(
+            state="pass",
+            reason="promotion_review_approved",
+            summary="Promotion precision has been approved on recent live samples.",
             metrics=metrics,
         )
+        gate["targets"] = target_gates
+        return gate
 
     def _deploy_canary_gate(self) -> dict[str, Any]:
         status = self._load_json(self.deployer_status_path, fallback={})
@@ -376,6 +502,26 @@ class QualityGateEvaluator:
 
     def _load_promotion_decisions(self) -> list[dict[str, Any]]:
         return self._load_jsonl(self.promotion_journal_path)
+
+    def list_promotion_decisions(
+        self,
+        *,
+        limit: int = 25,
+        target_file: str = "",
+        accepted_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        normalized_target = normalize_promotion_target(target_file)
+        rows = self._load_promotion_decisions()
+        filtered = []
+        for row in rows:
+            row_target = normalize_promotion_target(str(row.get("target_file") or ""))
+            if normalized_target and row_target != normalized_target:
+                continue
+            if accepted_only and not bool(row.get("accepted")):
+                continue
+            filtered.append(row)
+        filtered.reverse()
+        return filtered[: max(1, int(limit))]
 
     def _load_recent_canary_events(self, *, limit: int) -> list[dict[str, Any]]:
         events = [

@@ -72,10 +72,11 @@ def test_quality_gates_report_pending_and_pass_states(tmp_path: Path) -> None:
     assert payload["gates"]["deploy_canary"]["state"] == "pass"
     assert payload["gates"]["heartbeat_hygiene"]["state"] == "pending"
     assert payload["gates"]["promotion_precision"]["state"] == "pending"
+    assert payload["gates"]["promotion_precision"]["targets"]["IDENTITY.md"]["state"] == "manual_only"
     assert payload["ready_for_next_cognition_package"] is False
 
 
-def test_quality_gates_require_review_for_promotions_then_pass_after_review(tmp_path: Path) -> None:
+def test_quality_gates_require_review_for_promotions_then_pass_after_target_review(tmp_path: Path) -> None:
     _write_json(
         tmp_path / "deployer" / "status.json",
         {
@@ -139,6 +140,7 @@ def test_quality_gates_require_review_for_promotions_then_pass_after_review(tmp_
         approved=True,
         note="Sample looked clean.",
         sample_size=1,
+        target_file="USER.md",
     )
 
     after = evaluator.status(
@@ -153,5 +155,61 @@ def test_quality_gates_require_review_for_promotions_then_pass_after_review(tmp_
         },
     )
     assert after["gates"]["promotion_precision"]["state"] == "pass"
-    assert after["review"]["promotion_review"]["approved"] is True
+    assert after["review"]["promotion_reviews"]["USER.md"]["approved"] is True
     assert after["ready_for_next_cognition_package"] is True
+    assert after["gates"]["promotion_precision"]["targets"]["USER.md"]["state"] == "pass"
+
+
+def test_quality_gates_report_target_specific_promotion_review_failure(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "deployer" / "status.json",
+        {
+            "last_canary_label": "ok",
+            "last_canary_phase": "provider_and_tool",
+            "last_canary_ok_at": "2026-03-11T22:28:16Z",
+        },
+    )
+    _write_jsonl(
+        tmp_path / "deployer" / "events.jsonl",
+        [
+            {"event_type": "health_check_completed", "canary_phase": "provider_and_tool", "canary_label": "ok", "ok": True},
+            {"event_type": "health_check_completed", "canary_phase": "provider_and_tool", "canary_label": "ok", "ok": True},
+            {"event_type": "health_check_completed", "canary_phase": "provider_and_tool", "canary_label": "ok", "ok": True},
+        ],
+    )
+    _write_jsonl(
+        tmp_path / "state" / "promotion-decisions.jsonl",
+        [
+            {
+                "timestamp": "2026-03-11T20:00:00Z",
+                "target_file": "TOOLS.md",
+                "candidate_text": "Use worker_status before reporting worker completion.",
+                "kind": "operational_truth",
+                "accepted": True,
+                "reason": "accepted",
+            }
+        ],
+    )
+
+    evaluator = QualityGateEvaluator(tmp_path)
+    evaluator.record_promotion_review(
+        approved=False,
+        note="Wording was too broad.",
+        sample_size=1,
+        target_file="TOOLS.md",
+    )
+
+    payload = evaluator.status(
+        reflection_status={"reflection_write_count": 1, "reflection_skip_count": 5},
+        heartbeat_status={
+            "surface_count": 1,
+            "suppress_count": 1,
+            "ignore_count": 1,
+            "noop_active_mode_count": 0,
+            "noop_interval_count": 0,
+            "noop_no_due_count": 0,
+        },
+    )
+
+    assert payload["gates"]["promotion_precision"]["state"] == "fail"
+    assert payload["gates"]["promotion_precision"]["targets"]["TOOLS.md"]["state"] == "fail"
