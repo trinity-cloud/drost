@@ -21,6 +21,7 @@ from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
 from drost.loop_events import LoopEventBus
 from drost.memory_capsule import MemoryCapsuleBuilder
+from drost.operational_truths import OperationalTruthStore
 from drost.prompt_assembly import PromptAssembler
 from drost.providers import Message, MessageRole, ProviderRegistry
 from drost.storage import (
@@ -58,6 +59,7 @@ class AgentRuntime:
         self._embeddings = embeddings
         self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._prompt_assembler = PromptAssembler(settings)
+        self._operational_truths = OperationalTruthStore(settings)
         self._cognitive_artifacts = CognitiveArtifactStore(settings.workspace_dir)
         self._cognitive_summary_builder = CognitiveSummaryBuilder(
             settings,
@@ -91,6 +93,9 @@ class AgentRuntime:
 
     async def sync_memory_index(self) -> dict[str, int]:
         return await self._workspace_memory_indexer.sync()
+
+    def refresh_operational_truths(self) -> dict[str, Any]:
+        return self._operational_truths.refresh()
 
     def _build_tool_registry(self, *, chat_id: int, session_key: str):
         return build_default_registry(
@@ -524,6 +529,7 @@ class AgentRuntime:
             return "Please send a message."
 
         provider = self._providers.get()
+        self.refresh_operational_truths()
 
         query_embedding = [0.0] * self._embeddings.dimensions
         memories: list[dict[str, Any]] = []

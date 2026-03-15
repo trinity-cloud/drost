@@ -245,6 +245,8 @@ Key operator endpoints:
 - `/v1/loops/status`
 - `/v1/mind/status`
 - `/v1/cognition/status`
+- `/v1/self-model/status`
+- `/v1/recursive-improvement/status`
 - `/v1/quality/status`
 - `/v1/heartbeat/status`
 - `/v1/memory/maintenance/status`

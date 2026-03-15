@@ -622,7 +622,7 @@ class MemoryMaintenanceRunner:
             '"relation_type\": \"...\", \"to_entity_type\": \"...\", \"to_entity_name\": \"...\", '
             '"statement\": \"...\", \"date\": \"YYYY-MM-DD\", \"confidence\": 0.0, \"source\": \"file:line\", '
             '"supersedes\": \"optional\"}\n'
-            '  \"promotion_candidates\": list of {\"target_file\": \"USER.md|IDENTITY.md|MEMORY.md\", '
+            '  \"promotion_candidates\": list of {\"target_file\": \"USER.md|IDENTITY.md|MEMORY.md|TOOLS.md\", '
             '"candidate_text\": \"...\", \"kind\": \"...\", \"confidence\": 0.0, \"stability\": 0.0, '
             '"evidence_refs\": [\"file:line\"], \"why_promotable\": \"...\"}\n'
             '  \"follow_ups\": list of {\"kind\": \"...\", \"subject\": \"...\", '
@@ -637,8 +637,9 @@ class MemoryMaintenanceRunner:
             "- Entity names should be human-readable, not slugified ids.\n"
             "- Aliases should only be written when they add useful alternate surfaces.\n"
             "- Relations should be typed and concrete.\n"
-            "- Promotion candidates should be reserved for durable user preferences, durable agent behavior commitments, or stable shared context that will improve future turns.\n"
+            "- Promotion candidates should be reserved for durable user preferences, durable agent behavior commitments, stable shared context, or operational truths that will improve future turns.\n"
             "- Do not propose promotions for one-off task state, temporary emotions, or routine summaries.\n"
+            "- Only target TOOLS.md for stable operational truths such as deploy semantics, worker supervision rules, or machine-specific tool availability.\n"
             "- Follow-ups should only be included when there is a concrete future check-in or obligation.\n"
             "- Follow-up prompts should be natural, concise, and specific.\n"
             "- Do not create vague social check-ins with no concrete reason.\n"
@@ -877,7 +878,7 @@ class MemoryMaintenanceRunner:
 
             decision_reason = ""
             accepted = False
-            if target_file not in {"USER.md", "IDENTITY.md", "MEMORY.md"}:
+            if target_file not in {"USER.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md"}:
                 decision_reason = "unsupported_target"
             elif not candidate_text:
                 decision_reason = "empty_candidate"

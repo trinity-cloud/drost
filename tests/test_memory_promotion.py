@@ -54,3 +54,23 @@ def test_memory_promotion_store_records_decisions(tmp_path: Path) -> None:
     assert row["accepted"] is True
     assert row["reason"] == "accepted"
     assert row["kind"] == "operational_context"
+
+
+def test_memory_promotion_store_supports_tools_md_target(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    tools_path = workspace / "TOOLS.md"
+    tools_path.write_text("# TOOLS\n\nManual discipline.\n", encoding="utf-8")
+
+    store = MemoryPromotionStore(workspace)
+    result = store.promote(
+        target_file="TOOLS.md",
+        candidate_text="Verify worker state through worker_status before claiming completion.",
+        kind="operational_truth",
+    )
+
+    content = tools_path.read_text(encoding="utf-8")
+    assert result.created is True
+    assert result.reason == "accepted"
+    assert "Manual discipline." in content
+    assert "Verify worker state through worker_status before claiming completion." in content

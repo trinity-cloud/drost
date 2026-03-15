@@ -69,6 +69,30 @@ def test_deployer_event_log_and_status_round_trip(tmp_path: Path) -> None:
     assert json.loads(events[-1])["active_commit"] == "abc123"
 
 
+def test_deployer_state_store_recovers_corrupted_status_file(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config = DeployerConfig.load(
+        repo_root=repo_root,
+        workspace_dir=tmp_path / "workspace",
+    )
+    store = DeployerStateStore(config)
+    store.bootstrap()
+
+    good = store.default_status()
+    good["state"] = "healthy"
+    good["active_commit"] = "abc123"
+    corrupted = json.dumps(good, indent=2, sort_keys=True) + '\n"/tmp/workspace"\n}\n'
+    store.status_path.write_text(corrupted, encoding="utf-8")
+
+    recovered = store.read_status()
+
+    assert recovered["state"] == "healthy"
+    assert recovered["active_commit"] == "abc123"
+    reloaded = json.loads(store.status_path.read_text(encoding="utf-8"))
+    assert reloaded["active_commit"] == "abc123"
+
+
 def test_deployer_cli_request_enqueue_tracks_pending_request(tmp_path: Path, capsys) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

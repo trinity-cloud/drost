@@ -12,6 +12,8 @@ from drost.channels import TelegramChannel
 from drost.cognitive_artifacts import CognitiveArtifactStore
 from drost.config import Settings
 from drost.conversation_loop import ConversationLoop
+from drost.deployer.client import DeployerClient
+from drost.deployer.reporting import derive_reporting_fields
 from drost.drive_loop import DriveLoop
 from drost.embeddings import EmbeddingService
 from drost.followups import FollowUpStore
@@ -21,6 +23,7 @@ from drost.loop_events import LoopEventBus
 from drost.loop_manager import LoopManager
 from drost.managed_loop import LoopPriority, LoopVisibility, ManagedRunnerLoop
 from drost.memory_maintenance import MemoryMaintenanceRunner
+from drost.operational_truths import OperationalTruthStore
 from drost.providers import build_provider_registry
 from drost.quality_gates import QualityGateEvaluator
 from drost.reflection_loop import ReflectionLoop
@@ -90,6 +93,7 @@ class Gateway:
         self.embeddings = EmbeddingService(settings)
         self.followups = FollowUpStore(settings.workspace_dir)
         self.workers = WorkerSupervisor(settings)
+        self.operational_truths = OperationalTruthStore(settings)
         self.cognitive_artifacts = CognitiveArtifactStore(settings.workspace_dir)
         self.loop_events = LoopEventBus()
         self.shared_mind_state = SharedMindState(
@@ -354,6 +358,32 @@ class Gateway:
             heartbeat_status=heartbeat_status,
         )
 
+    def _recursive_improvement_status_payload(self) -> dict[str, Any]:
+        client = DeployerClient.from_runtime(
+            repo_root=str(self.settings.repo_root),
+            workspace_dir=str(self.settings.workspace_dir),
+        )
+        deployer = client.status()
+        deployer_reporting = derive_reporting_fields(deployer)
+        return {
+            "deployer": {
+                "reporting": deployer_reporting,
+                "status": deployer,
+            },
+            "workers": self.workers.status(),
+            "self_model": self.operational_truths.status(),
+        }
+
+    def _recursive_improvement_history_payload(self, *, limit: int = 20) -> dict[str, Any]:
+        client = DeployerClient.from_runtime(
+            repo_root=str(self.settings.repo_root),
+            workspace_dir=str(self.settings.workspace_dir),
+        )
+        return {
+            "deployer_events": self._read_recent_jsonl_dicts(client.store.events_path, limit=max(1, int(limit))),
+            "worker_jobs": self.workers.list_jobs(refresh=True, detailed=False)[: max(1, int(limit))],
+        }
+
     @staticmethod
     def _read_recent_jsonl_dicts(path: Any, *, limit: int) -> list[dict[str, Any]]:
         try:
@@ -489,6 +519,7 @@ class Gateway:
     def _mount_lifecycle(self) -> None:
         @self.app.on_event("startup")
         async def startup() -> None:
+            self.operational_truths.refresh()
             if self.settings.memory_enabled:
                 await self.agent.sync_memory_index()
             await self.telegram.start(self.app)
@@ -569,6 +600,18 @@ class Gateway:
         @self.app.get("/v1/workers/status")
         async def workers_status() -> dict[str, Any]:
             return self.workers.status()
+
+        @self.app.get("/v1/self-model/status")
+        async def self_model_status() -> dict[str, Any]:
+            return self.operational_truths.refresh()
+
+        @self.app.get("/v1/recursive-improvement/status")
+        async def recursive_improvement_status() -> dict[str, Any]:
+            return self._recursive_improvement_status_payload()
+
+        @self.app.get("/v1/recursive-improvement/history")
+        async def recursive_improvement_history(limit: int = 20) -> dict[str, Any]:
+            return self._recursive_improvement_history_payload(limit=limit)
 
         @self.app.get("/v1/workers/jobs/{job_id}")
         async def worker_job_detail(job_id: str) -> dict[str, Any]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +13,40 @@ from drost.deployer.config import DeployerConfig
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _read_json_dict(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return dict(default)
+    raw = path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        try:
+            payload, _end = decoder.raw_decode(raw.lstrip())
+        except json.JSONDecodeError:
+            return dict(default)
+        if isinstance(payload, dict):
+            _atomic_write_json(path, payload)
+            return payload
+        return dict(default)
+    return payload if isinstance(payload, dict) else dict(default)
 
 
 @dataclass(slots=True)
@@ -129,24 +165,20 @@ class DeployerStateStore:
         }
 
     def read_status(self) -> dict[str, Any]:
-        if not self.status_path.exists():
-            return self.default_status()
-        return json.loads(self.status_path.read_text(encoding="utf-8"))
+        return _read_json_dict(self.status_path, self.default_status())
 
     def write_status(self, status: dict[str, Any]) -> dict[str, Any]:
         payload = dict(status)
         payload["updated_at"] = _utc_now()
-        self.status_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _atomic_write_json(self.status_path, payload)
         return payload
 
     def read_known_good(self) -> dict[str, Any]:
-        if not self.known_good_path.exists():
-            return self.default_known_good()
-        return json.loads(self.known_good_path.read_text(encoding="utf-8"))
+        return _read_json_dict(self.known_good_path, self.default_known_good())
 
     def write_known_good(self, payload: dict[str, Any]) -> dict[str, Any]:
         data = dict(payload)
-        self.known_good_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        _atomic_write_json(self.known_good_path, data)
         return data
 
     def append_event(self, event_type: str, **fields: Any) -> dict[str, Any]:

@@ -9,7 +9,7 @@ from pathlib import Path
 _PROMOTION_HEADER = "## Machine-Promoted"
 _PROMOTION_START = "<!-- drost:machine-promoted:start -->"
 _PROMOTION_END = "<!-- drost:machine-promoted:end -->"
-_ALLOWED_TARGETS = {"USER.md", "IDENTITY.md", "MEMORY.md"}
+_ALLOWED_TARGETS = {"USER.md", "IDENTITY.md", "MEMORY.md", "TOOLS.md"}
 _ENTRY_RE = re.compile(r"^- \[([a-z0-9_-]+)\] (.+)$", re.IGNORECASE)
 
 
