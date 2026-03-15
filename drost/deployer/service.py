@@ -126,8 +126,14 @@ class DeployerService:
             )
         except Exception as exc:
             self._queue.mark_failed(request)
-            status = self._store.read_status()
+            refreshed = self._supervisor.refresh_status()
+            if refreshed.get("child_pid") and refreshed.get("state") != "degraded":
+                status = self._rollout.healthcheck(startup_grace_seconds=0.0)
+            else:
+                status = self._store.read_status()
             status["last_error"] = str(exc)
+            if status.get("state") == "processing_request":
+                status["state"] = "healthy" if status.get("child_pid") else "idle"
             self._store.write_status(status)
             self._store.append_event(
                 "request_failed",

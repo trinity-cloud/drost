@@ -847,6 +847,34 @@ def test_deployer_service_processes_requests_fifo(tmp_path: Path) -> None:
         supervisor.stop_child()
 
 
+def test_deployer_service_failed_request_restores_verified_runtime_state(tmp_path: Path) -> None:
+    config, store, supervisor, rollout, queue, service = _make_health_service_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        repo_root.joinpath("DIRTY.txt").write_text("dirty\n", encoding="utf-8")
+        queue.enqueue("deploy_candidate", requested_by="test", reason="dirty tree", candidate_ref=stable_commit)
+
+        result = service.process_next_request()
+
+        assert result is not None
+        assert result["state"] == "healthy"
+        assert result["active_request_id"] == ""
+        assert "repo worktree must be clean" in str(result["last_error"])
+        assert not list(store.pending_requests_dir.glob("*.json"))
+        assert list(store.failed_requests_dir.glob("*.json"))
+    finally:
+        supervisor.stop_child()
+
+
 def test_deployer_service_reclaims_child_from_stale_supervisor(tmp_path: Path) -> None:
     config, store, supervisor, _rollout, _queue, service = _make_health_service_runtime(tmp_path)
     _commit_health_state(config.repo_root, mode="ok", message="stable")

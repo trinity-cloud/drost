@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from drost.config import Settings
 from drost.deployer.client import DeployerClient
+from drost.deployer.reporting import derive_reporting_fields
 from drost.tools.base import BaseTool
 
 
@@ -30,9 +31,15 @@ class DeployerStatusTool(BaseTool):
 
     async def execute(self) -> str:
         payload = self._client.status()
+        reporting = derive_reporting_fields(payload)
         known_good = payload.get("known_good")
         requests = payload.get("requests")
         lines = [
+            "reporting_contract=verified_state_only",
+            f"request_state={reporting['request_state']}",
+            f"runtime_state={reporting['runtime_state']}",
+            f"promotion_state={reporting['promotion_state']}",
+            f"last_outcome={reporting['last_outcome']}",
             f"state={payload.get('state') or ''}",
             f"repo_head_commit={payload.get('repo_head_commit') or ''}",
             f"active_commit={payload.get('active_commit') or ''}",

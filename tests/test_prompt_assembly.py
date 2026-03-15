@@ -62,6 +62,8 @@ def test_prompt_assembly_includes_structured_workspace_files(tmp_path: Path) -> 
     assert "[Tool Call Style]" in prompt
     assert "[Memory Recall]" in prompt
     assert "[Deployer Control]" in prompt
+    assert "[Deployer Reporting]" in prompt
+    assert "Never collapse requested or accepted state" in prompt
     assert "[Workspace Runtime]" in prompt
     assert f"repo_root={settings.repo_root}" in prompt
     assert f"workspace_root={settings.workspace_dir}" in prompt

@@ -40,6 +40,12 @@ DEPLOYER_CONTROL_GUIDANCE = """[Deployer Control]
 - For runtime lifecycle actions such as restart, candidate deploy, rollback, or deployer inspection, use deployer_request and deployer_status.
 - Do not improvise deploy control with shell_execute when the deployer tools are available."""
 
+DEPLOYER_REPORTING_GUIDANCE = """[Deployer Reporting]
+- Treat deployer_request restart/deploy/rollback results as request creation, not proof that rollout is already live.
+- Only report `accepted`, `active`, `healthy/live`, `promoted`, `failed`, or `noop` from verified deployer state.
+- If repo_head_commit and active_commit differ, say so explicitly.
+- Never collapse requested or accepted state into \"deployed\", \"restarted\", or \"live\" without deployer_status confirming it."""
+
 BOOTSTRAP_RUNTIME_CONTRACT = """[Bootstrap Contract]
 - This workspace is still in bootstrap mode.
 - Your near-term job is to establish a concrete agent identity and a concrete user profile.
@@ -82,6 +88,7 @@ class PromptAssembler:
                 sections.append(MEMORY_RECALL_GUIDANCE)
             if "deployer_request" in tools or "deployer_status" in tools:
                 sections.append(DEPLOYER_CONTROL_GUIDANCE)
+                sections.append(DEPLOYER_REPORTING_GUIDANCE)
             if "followup_status" in tools or "followup_update" in tools:
                 sections.append(FOLLOW_UP_CONTROL_GUIDANCE)
 

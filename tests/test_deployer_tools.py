@@ -21,7 +21,11 @@ async def test_deployer_request_tool_queues_restart_request(tmp_path: Path) -> N
     tool = DeployerRequestTool(settings=settings)
     text = await tool.execute(action="restart", reason="reload runtime")
 
+    assert "reporting_contract=verified_state_only" in text
     assert "request_queued=true" in text
+    assert "request_state=requested" in text
+    assert "runtime_transition_verified=false" in text
+    assert "next_check=use_deployer_status" in text
     assert "type=restart" in text
     assert "reason=reload runtime" in text
 
@@ -74,6 +78,9 @@ async def test_deployer_status_tool_reports_known_good_and_pending_requests(tmp_
     status_tool = DeployerStatusTool(settings=settings)
     text = await status_tool.execute()
 
+    assert "reporting_contract=verified_state_only" in text
+    assert "request_state=accepted" in text
+    assert "promotion_state=unpromoted" in text
     assert "known_good_commit=" in text
     assert "known_good_record:" in text
     assert "ref_name=refs/drost/drost-known-good" in text
