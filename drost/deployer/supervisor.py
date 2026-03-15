@@ -118,6 +118,7 @@ class DeployerSupervisor:
                 "repo_root": str(self._store.config.repo_root),
                 "workspace_dir": str(self._store.config.workspace_dir),
                 "state_dir": str(self._store.config.state_dir),
+                "repo_head_commit": active_commit,
                 "active_commit": active_commit,
                 "supervisor_pid": os.getpid(),
                 "child_pid": int(pid),
@@ -131,6 +132,7 @@ class DeployerSupervisor:
 
     def refresh_status(self) -> dict[str, Any]:
         status = self._store.read_status()
+        status["repo_head_commit"] = self._git_head()
         pid = status.get("child_pid")
         if isinstance(pid, int) and pid > 0 and not self._is_pid_alive(pid):
             status.update(
@@ -147,6 +149,8 @@ class DeployerSupervisor:
                 child_pid=pid,
                 child_returncode=status.get("child_returncode"),
             )
+        else:
+            self._store.write_status(status)
         return self._store.read_status()
 
     def start_child(self) -> dict[str, Any]:

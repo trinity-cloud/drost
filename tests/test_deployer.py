@@ -598,6 +598,70 @@ def test_deployer_rollout_promote_and_deploy_candidate_success(tmp_path: Path) -
         supervisor.stop_child()
 
 
+def test_deployer_rollout_deploy_candidate_uses_active_runtime_commit_for_noop_check(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    candidate_commit = _commit_health_state(repo_root, mode="ok", message="candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+        rollout.promote_current()
+
+        # Simulate repo HEAD advancing without the supervised runtime rolling forward.
+        _git(repo_root, "checkout", "--force", candidate_commit)
+        refreshed = supervisor.refresh_status()
+        assert refreshed["repo_head_commit"] == candidate_commit
+        assert refreshed["active_commit"] == stable_commit
+
+        deployed = rollout.deploy_candidate(candidate_commit)
+        assert deployed["state"] == "healthy"
+        assert deployed["repo_head_commit"] == candidate_commit
+        assert deployed["active_commit"] == candidate_commit
+        assert deployed["known_good_commit"] == candidate_commit
+        assert deployed["last_noop_reason"] == ""
+
+        events = store.events_path.read_text(encoding="utf-8")
+        assert "deploy_candidate_started" in events
+        assert "deploy_candidate_succeeded" in events
+        assert "deploy_candidate_noop" not in events
+    finally:
+        supervisor.stop_child()
+
+
+def test_deployer_rollout_promote_uses_active_runtime_commit_not_repo_head(tmp_path: Path) -> None:
+    config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
+    repo_root = config.repo_root
+    marker = tmp_path / "health-marker.txt"
+
+    stable_commit = _commit_health_state(repo_root, mode="ok", message="stable")
+    candidate_commit = _commit_health_state(repo_root, mode="ok", message="candidate")
+    _git(repo_root, "checkout", "--force", stable_commit)
+
+    try:
+        supervisor.start_child()
+        _wait_for_path(marker)
+
+        # Repo HEAD moves, but the active runtime is still serving stable_commit.
+        _git(repo_root, "checkout", "--force", candidate_commit)
+        refreshed = supervisor.refresh_status()
+        assert refreshed["repo_head_commit"] == candidate_commit
+        assert refreshed["active_commit"] == stable_commit
+
+        promoted = rollout.promote_current()
+        assert promoted["state"] == "healthy"
+        assert promoted["repo_head_commit"] == candidate_commit
+        assert promoted["active_commit"] == stable_commit
+        assert promoted["known_good_commit"] == stable_commit
+        assert store.read_known_good()["commit"] == stable_commit
+    finally:
+        supervisor.stop_child()
+
+
 def test_deployer_rollout_failed_candidate_rolls_back_to_known_good(tmp_path: Path) -> None:
     config, store, supervisor, rollout = _make_health_rollout_runtime(tmp_path)
     repo_root = config.repo_root

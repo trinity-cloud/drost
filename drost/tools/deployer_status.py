@@ -34,10 +34,13 @@ class DeployerStatusTool(BaseTool):
         requests = payload.get("requests")
         lines = [
             f"state={payload.get('state') or ''}",
+            f"repo_head_commit={payload.get('repo_head_commit') or ''}",
             f"active_commit={payload.get('active_commit') or ''}",
             f"known_good_commit={payload.get('known_good_commit') or ''}",
+            f"requested_candidate_commit={payload.get('requested_candidate_commit') or ''}",
             f"child_pid={payload.get('child_pid')}",
             f"last_health_ok_at={payload.get('last_health_ok_at') or ''}",
+            f"last_noop_reason={payload.get('last_noop_reason') or ''}",
             f"last_error={payload.get('last_error') or ''}",
             f"active_request_id={payload.get('active_request_id') or ''}",
             f"active_request_type={payload.get('active_request_type') or ''}",

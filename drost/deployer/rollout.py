@@ -31,6 +31,20 @@ class DeployerRolloutManager:
     store: DeployerStateStore
     supervisor: DeployerSupervisor
 
+    def _repo_head_commit(self) -> str:
+        return resolve_head_commit(self.store.config.repo_root)
+
+    @staticmethod
+    def _status_commit(status: dict[str, Any], key: str) -> str:
+        return str(status.get(key) or "").strip()
+
+    def _active_runtime_commit(self, status: dict[str, Any] | None = None) -> str:
+        snapshot = self.supervisor.refresh_status() if status is None else status
+        active_commit = self._status_commit(snapshot, "active_commit")
+        if active_commit:
+            return active_commit
+        return self._repo_head_commit()
+
     def _update_health_fields(
         self,
         status: dict[str, Any],
@@ -117,6 +131,7 @@ class DeployerRolloutManager:
             else max(0.0, float(startup_grace_seconds))
         )
         status = self.store.read_status()
+        status["repo_head_commit"] = self._repo_head_commit()
         self._update_health_fields(status, result, clear_error_on_success=True)
         if canary is not None:
             self._update_canary_fields(status, canary, clear_error_on_success=True)
@@ -145,9 +160,11 @@ class DeployerRolloutManager:
         if not isinstance(pid, int) or pid <= 0:
             raise RuntimeError("cannot promote without a supervised child process")
 
-        commit = resolve_head_commit(self.store.config.repo_root)
+        active_commit = self._active_runtime_commit(status)
+        repo_head_commit = self._repo_head_commit()
         result, canary = self._run_validation(startup_grace_seconds=0.0)
         status = self.store.read_status()
+        status["repo_head_commit"] = repo_head_commit
         self._update_health_fields(status, result, clear_error_on_success=True)
         if canary is not None:
             self._update_canary_fields(status, canary, clear_error_on_success=True)
@@ -160,7 +177,8 @@ class DeployerRolloutManager:
             self.store.write_status(status)
             self.store.append_event(
                 "promote_current_failed",
-                active_commit=commit,
+                active_commit=active_commit,
+                repo_head_commit=repo_head_commit,
                 status_code=result.status_code,
                 error=result.error or (canary.error if canary is not None else ""),
                 canary_label="" if canary is None else canary.label,
@@ -168,43 +186,56 @@ class DeployerRolloutManager:
             return self.store.read_status()
 
         self._write_known_good(
-            commit=commit,
+            commit=active_commit,
             notes="Promoted from active supervised runtime.",
             duration_ms=result.duration_ms,
         )
         status.update(
             {
                 "state": "healthy",
-                "active_commit": commit,
-                "known_good_commit": commit,
+                "active_commit": active_commit,
+                "known_good_commit": active_commit,
                 "last_error": "",
             }
         )
         self.store.write_status(status)
         self.store.append_event(
             "promote_current_succeeded",
-            active_commit=commit,
-                duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
-                status_code=result.status_code,
-                canary_label="" if canary is None else canary.label,
-            )
+            active_commit=active_commit,
+            repo_head_commit=repo_head_commit,
+            duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
+            status_code=result.status_code,
+            canary_label="" if canary is None else canary.label,
+        )
         return self.store.read_status()
 
     def restart_current(self, *, reason: str = "") -> dict[str, Any]:
-        current_commit = resolve_head_commit(self.store.config.repo_root)
-        self._transition_state("processing_request", active_commit=current_commit, last_error="")
+        previous_status = self.supervisor.refresh_status()
+        current_commit = self._active_runtime_commit(previous_status)
+        repo_head_commit = self._repo_head_commit()
+        self._transition_state(
+            "processing_request",
+            repo_head_commit=repo_head_commit,
+            active_commit=current_commit,
+            requested_candidate_commit=repo_head_commit,
+            last_noop_reason="",
+            last_error="",
+        )
         self.store.append_event(
             "restart_started",
             active_commit=current_commit,
+            repo_head_commit=repo_head_commit,
             reason=reason,
         )
         self.supervisor.restart_child()
         result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
         status = self.store.read_status()
+        status["repo_head_commit"] = self._repo_head_commit()
         self._update_health_fields(status, result, clear_error_on_success=False)
         if canary is not None:
             self._update_canary_fields(status, canary, clear_error_on_success=False)
-        status["active_commit"] = current_commit
+        status["active_commit"] = status["repo_head_commit"]
+        status["requested_candidate_commit"] = ""
 
         if result.ok and (canary is None or canary.ok):
             status["state"] = "healthy"
@@ -212,7 +243,8 @@ class DeployerRolloutManager:
             self.store.write_status(status)
             self.store.append_event(
                 "restart_succeeded",
-                active_commit=current_commit,
+                active_commit=status["active_commit"],
+                previous_active_commit=current_commit,
                 duration_ms=result.duration_ms + (int(canary.duration_ms) if canary is not None else 0),
                 status_code=result.status_code,
                 canary_label="" if canary is None else canary.label,
@@ -261,10 +293,13 @@ class DeployerRolloutManager:
 
         self._require_clean_worktree()
         target_commit = resolve_ref(self.store.config.repo_root, target_ref)
-        current_commit = resolve_head_commit(self.store.config.repo_root)
+        current_status = self.supervisor.refresh_status()
+        current_commit = self._active_runtime_commit(current_status)
+        repo_head_commit = self._repo_head_commit()
         if target_commit == current_commit:
             result, canary = self._run_validation(startup_grace_seconds=0.0)
             status = self.store.read_status()
+            status["repo_head_commit"] = repo_head_commit
             self._update_health_fields(status, result, clear_error_on_success=False)
             if canary is not None:
                 self._update_canary_fields(status, canary, clear_error_on_success=False)
@@ -273,7 +308,9 @@ class DeployerRolloutManager:
                     {
                         "state": "healthy",
                         "active_commit": target_commit,
+                        "requested_candidate_commit": "",
                         "known_good_commit": str(known_good.get("commit") or target_commit),
+                        "last_noop_reason": "target_commit_matches_active_runtime",
                         "last_error": reason.strip(),
                     }
                 )
@@ -281,6 +318,7 @@ class DeployerRolloutManager:
                 self.store.append_event(
                     "rollback_noop",
                     target_commit=target_commit,
+                    repo_head_commit=repo_head_commit,
                     reason=reason,
                 )
                 return self.store.read_status()
@@ -289,6 +327,9 @@ class DeployerRolloutManager:
         status.update(
             {
                 "state": "rolling_back",
+                "repo_head_commit": repo_head_commit,
+                "requested_candidate_commit": "",
+                "last_noop_reason": "",
                 "last_error": "",
             }
         )
@@ -305,6 +346,7 @@ class DeployerRolloutManager:
         result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
 
         status = self.store.read_status()
+        status["repo_head_commit"] = self._repo_head_commit()
         self._update_health_fields(status, result, clear_error_on_success=False)
         if canary is not None:
             self._update_canary_fields(status, canary, clear_error_on_success=False)
@@ -341,13 +383,27 @@ class DeployerRolloutManager:
 
     def deploy_candidate(self, candidate_ref: str) -> dict[str, Any]:
         self._require_clean_worktree()
-        current_commit = resolve_head_commit(self.store.config.repo_root)
+        current_status = self.supervisor.refresh_status()
+        current_commit = self._active_runtime_commit(current_status)
+        repo_head_commit = self._repo_head_commit()
         candidate_commit = resolve_ref(self.store.config.repo_root, candidate_ref)
         if candidate_commit == current_commit:
+            status = self.store.read_status()
+            status.update(
+                {
+                    "repo_head_commit": repo_head_commit,
+                    "requested_candidate_commit": "",
+                    "last_noop_reason": "candidate_commit_matches_active_runtime",
+                }
+            )
+            self.store.write_status(status)
             self.store.append_event(
                 "deploy_candidate_noop",
                 candidate_ref=candidate_ref,
                 candidate_commit=candidate_commit,
+                active_commit=current_commit,
+                repo_head_commit=repo_head_commit,
+                reason="candidate_commit_matches_active_runtime",
             )
             return self.healthcheck(startup_grace_seconds=0.0)
         known_good = self.store.read_known_good()
@@ -357,7 +413,10 @@ class DeployerRolloutManager:
         status.update(
             {
                 "state": "deploying",
+                "repo_head_commit": repo_head_commit,
                 "active_commit": current_commit,
+                "requested_candidate_commit": candidate_commit,
+                "last_noop_reason": "",
                 "last_error": "",
             }
         )
@@ -366,6 +425,8 @@ class DeployerRolloutManager:
             "deploy_candidate_started",
             candidate_ref=candidate_ref,
             candidate_commit=candidate_commit,
+            active_commit=current_commit,
+            repo_head_commit=repo_head_commit,
             rollback_ref=rollback_ref,
         )
 
@@ -373,10 +434,12 @@ class DeployerRolloutManager:
         self.supervisor.restart_child()
         result, canary = self._run_validation(startup_grace_seconds=self.store.config.startup_grace_seconds)
         status = self.store.read_status()
+        status["repo_head_commit"] = self._repo_head_commit()
         self._update_health_fields(status, result, clear_error_on_success=False)
         if canary is not None:
             self._update_canary_fields(status, canary, clear_error_on_success=False)
         status["active_commit"] = candidate_commit
+        status["requested_candidate_commit"] = ""
 
         if result.ok and (canary is None or canary.ok):
             self._write_known_good(
@@ -408,6 +471,7 @@ class DeployerRolloutManager:
             "deploy_candidate_failed_validation",
             candidate_ref=candidate_ref,
             candidate_commit=candidate_commit,
+            active_commit=current_commit,
             rollback_ref=rollback_ref,
             status_code=result.status_code,
             error=result.error or (canary.error if canary is not None else ""),

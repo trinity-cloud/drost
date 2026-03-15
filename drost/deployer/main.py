@@ -112,8 +112,10 @@ def _render_status_text(status: dict[str, object]) -> str:
         f"repo_root={status.get('repo_root') or ''}",
         f"workspace_dir={status.get('workspace_dir') or ''}",
         f"state_dir={status.get('state_dir') or ''}",
+        f"repo_head_commit={status.get('repo_head_commit') or ''}",
         f"active_commit={status.get('active_commit') or ''}",
         f"known_good_commit={status.get('known_good_commit') or ''}",
+        f"requested_candidate_commit={status.get('requested_candidate_commit') or ''}",
         f"active_request_id={status.get('active_request_id') or ''}",
         f"active_request_type={status.get('active_request_type') or ''}",
         f"pending_request_ids={status.get('pending_request_ids') or []}",
@@ -126,6 +128,7 @@ def _render_status_text(status: dict[str, object]) -> str:
         f"last_health_status_code={status.get('last_health_status_code')}",
         f"last_health_body={status.get('last_health_body') or ''}",
         f"last_health_ok_at={status.get('last_health_ok_at') or ''}",
+        f"last_noop_reason={status.get('last_noop_reason') or ''}",
         f"last_error={status.get('last_error') or ''}",
         f"updated_at={status.get('updated_at') or ''}",
     ]

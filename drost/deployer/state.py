@@ -90,8 +90,10 @@ class DeployerStateStore:
             "repo_root": str(self.config.repo_root),
             "workspace_dir": str(self.config.workspace_dir),
             "state_dir": str(self.config.state_dir),
+            "repo_head_commit": "",
             "active_commit": "",
             "known_good_commit": "",
+            "requested_candidate_commit": "",
             "active_request_id": "",
             "active_request_type": "",
             "supervisor_pid": None,
@@ -110,6 +112,7 @@ class DeployerStateStore:
             "last_canary_ok_at": "",
             "last_request_id": "",
             "pending_request_ids": [],
+            "last_noop_reason": "",
             "last_error": "",
             "updated_at": _utc_now(),
         }
